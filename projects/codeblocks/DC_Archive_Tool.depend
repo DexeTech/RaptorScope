@@ -1,0 +1,132 @@
+# depslib dependency file v1.0
+1771260141 source:c:\users\corey\downloads\dc_archive_tool\res\dc_archive_tool.rc
+	<windows.h>
+
+1771256644 source:c:\users\corey\downloads\dc_archive_tool\src\core\audio.cpp
+	"core/audio.h"
+	<stdio.h>
+	<string.h>
+	<math.h>
+
+1771254786 c:\users\corey\downloads\dc_archive_tool\include\core\audio.h
+	"types.h"
+
+1771256458 c:\users\corey\downloads\dc_archive_tool\include\core\types.h
+	<stdint.h>
+	<stdint.h>
+	<stddef.h>
+	<stdlib.h>
+	<string.h>
+
+1771254767 source:c:\users\corey\downloads\dc_archive_tool\src\core\color.cpp
+	"core/color.h"
+
+1771254755 c:\users\corey\downloads\dc_archive_tool\include\core\color.h
+	"types.h"
+
+1771254744 source:c:\users\corey\downloads\dc_archive_tool\src\core\lzss.cpp
+	"core/lzss.h"
+
+1771254728 c:\users\corey\downloads\dc_archive_tool\include\core\lzss.h
+	"types.h"
+
+1771254953 source:c:\users\corey\downloads\dc_archive_tool\src\formats\dat.cpp
+	"formats/dat.h"
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+
+1771256463 c:\users\corey\downloads\dc_archive_tool\include\formats\dat.h
+	"core/types.h"
+	<stdlib.h>
+
+1771296414 source:c:\users\corey\downloads\dc_archive_tool\src\formats\mesh.cpp
+	"formats/mesh.h"
+	"core/lzss.h"
+	<stdlib.h>
+	<stdio.h>
+	<string.h>
+	<math.h>
+
+1771290202 c:\users\corey\downloads\dc_archive_tool\include\formats\mesh.h
+	"core/types.h"
+	<stdlib.h>
+
+1771256611 source:c:\users\corey\downloads\dc_archive_tool\src\formats\texture.cpp
+	"formats/texture.h"
+	<string.h>
+	<stdlib.h>
+
+1771256467 c:\users\corey\downloads\dc_archive_tool\include\formats\texture.h
+	"core/types.h"
+	"core/color.h"
+	<stdlib.h>
+
+1771256634 source:c:\users\corey\downloads\dc_archive_tool\src\formats\tim.cpp
+	"formats/tim.h"
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+
+1771256475 c:\users\corey\downloads\dc_archive_tool\include\formats\tim.h
+	"core/types.h"
+	"core/color.h"
+	<stdlib.h>
+
+1771289613 source:c:\users\corey\downloads\dc_archive_tool\src\main.cpp
+	"ui/app.h"
+
+1771297496 c:\users\corey\downloads\dc_archive_tool\include\ui\app.h
+	<windows.h>
+	<commctrl.h>
+	<commdlg.h>
+	<mmsystem.h>
+	<stdlib.h>
+	<stdio.h>
+	"core/types.h"
+
+1771297558 source:c:\users\corey\downloads\dc_archive_tool\src\ui\app.cpp
+	"ui/app.h"
+	"ui/panels.h"
+	"formats/dat.h"
+	"formats/mesh.h"
+	"formats/texture.h"
+	"core/lzss.h"
+	"core/audio.h"
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+	<commctrl.h>
+
+1771297424 c:\users\corey\downloads\dc_archive_tool\include\ui\panels.h
+	"ui/app.h"
+	"formats/dat.h"
+	"formats/mesh.h"
+	"formats/video.h"
+
+1771297538 source:c:\users\corey\downloads\dc_archive_tool\src\ui\panels.cpp
+	"ui/panels.h"
+	"formats/texture.h"
+	"formats/mesh.h"
+	"core/audio.h"
+	"core/lzss.h"
+	"core/color.h"
+	<GL/gl.h>
+	<GL/glu.h>
+	<stdio.h>
+	<stdlib.h>
+	<string.h>
+	<math.h>
+
+1771300463 source:c:\users\corey\downloads\dc_archive_tool\src\formats\video.cpp
+	"formats/video.h"
+	<windows.h>
+	<stdio.h>
+	<string.h>
+	<stdlib.h>
+	<math.h>
+
+1771298422 c:\users\corey\downloads\dc_archive_tool\include\formats\video.h
+	"core/types.h"
+	<windows.h>
+

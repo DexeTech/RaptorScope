@@ -1,0 +1,3325 @@
+/*═══════════════════════════════════════════════════════════════════
+ *  RaptorScope  -  3D Mesh Parsers (Room, Door, EMD)
+ *═══════════════════════════════════════════════════════════════════*/
+#include "formats/mesh.h"
+#include "core/lzss.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#define MAX_COORD 15000
+
+/*─── Color averaging helper ─────────────────────────────────────*/
+static RGBA8 avg_colors(const u8 cols[][3], int n)
+{
+    int sr = 0, sg = 0, sb = 0;
+    for (int i = 0; i < n; i++) {
+        sr += cols[i][0]; sg += cols[i][1]; sb += cols[i][2];
+    }
+    float bst = 1.6f;
+    int r = (int)(sr / (float)n * bst); if (r > 255) r = 255;
+    int g = (int)(sg / (float)n * bst); if (g > 255) g = 255;
+    int b = (int)(sb / (float)n * bst); if (b > 255) b = 255;
+    return RGBA8((u8)r, (u8)g, (u8)b, 255);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Smooth Normal Computation
+ *
+ *  Room meshes have inline vertices per face (no shared vertex pool),
+ *  so vertices at the same spatial position need their face normals
+ *  accumulated and normalized to produce smooth shading.
+ *
+ *  Vertices that already have a non-zero normal (from EMD normal data)
+ *  are left untouched — just normalized.
+ *═══════════════════════════════════════════════════════════════════*/
+void mesh_compute_smooth_normals(Mesh& mesh)
+{
+    if (!mesh.verts || !mesh.tris || mesh.tri_count == 0) return;
+
+    /* Check if any vertex already has a non-zero normal (set by parser).
+       Must check BEFORE computing anything to avoid false positives. */
+    bool has_parsed_normals = false;
+    for (int i = 0; i < mesh.vert_count; i++) {
+        const MeshVert& v = mesh.verts[i];
+        if (v.nx != 0.0f || v.ny != 0.0f || v.nz != 0.0f) {
+            has_parsed_normals = true;
+            break;
+        }
+    }
+
+    if (has_parsed_normals) {
+        /* EMD normals already set by parser — just normalize them */
+        for (int i = 0; i < mesh.vert_count; i++) {
+            MeshVert& v = mesh.verts[i];
+            float len = sqrtf(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
+            if (len > 0.0001f) { v.nx /= len; v.ny /= len; v.nz /= len; }
+        }
+        return;
+    }
+
+    /* Room mesh path: spatial grouping for smooth normals.
+       Room meshes duplicate vertices per face, so we find all vertices
+       at the same spatial position and accumulate face normals across them. */
+
+    /* Pre-compute face normals */
+    int nf = mesh.tri_count;
+    f32* fn = (f32*)calloc(nf * 3, sizeof(f32));
+    if (!fn) return;
+    for (int i = 0; i < nf; i++) {
+        const MeshTri& t = mesh.tris[i];
+        if ((int)t.idx[0] >= mesh.vert_count ||
+            (int)t.idx[1] >= mesh.vert_count ||
+            (int)t.idx[2] >= mesh.vert_count) continue;
+        const MeshVert& v0 = mesh.verts[t.idx[0]];
+        const MeshVert& v1 = mesh.verts[t.idx[1]];
+        const MeshVert& v2 = mesh.verts[t.idx[2]];
+        float ax = v1.x-v0.x, ay = v1.y-v0.y, az = v1.z-v0.z;
+        float bx = v2.x-v0.x, by = v2.y-v0.y, bz = v2.z-v0.z;
+        fn[i*3+0] = ay*bz-az*by;
+        fn[i*3+1] = az*bx-ax*bz;
+        fn[i*3+2] = ax*by-ay*bx;
+    }
+
+    /* For each vertex, find all faces that share its position and accumulate */
+    const float eps = 0.01f;
+    for (int vi = 0; vi < mesh.vert_count; vi++) {
+        MeshVert& v = mesh.verts[vi];
+        float sx = 0, sy = 0, sz = 0;
+        for (int fi = 0; fi < nf; fi++) {
+            const MeshTri& t = mesh.tris[fi];
+            for (int ci = 0; ci < 3; ci++) {
+                if ((int)t.idx[ci] >= mesh.vert_count) continue;
+                const MeshVert& ov = mesh.verts[t.idx[ci]];
+                if (fabsf(ov.x - v.x) < eps &&
+                    fabsf(ov.y - v.y) < eps &&
+                    fabsf(ov.z - v.z) < eps) {
+                    sx += fn[fi*3+0];
+                    sy += fn[fi*3+1];
+                    sz += fn[fi*3+2];
+                    break;  /* only add this face once */
+                }
+            }
+        }
+        float len = sqrtf(sx*sx + sy*sy + sz*sz);
+        if (len > 0.0001f) {
+            v.nx = sx / len; v.ny = sy / len; v.nz = sz / len;
+        }
+    }
+    free(fn);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  RDT Layout Parser  -  deterministic scene structure walk
+ *
+ *  Layout:
+ *    0x00..0x1B   7 x u32 PSX pointers (metadata table refs)
+ *    0x1C..N      Room mesh sections (sequential, self-terminating)
+ *    N..M         EMD character models (contiguous, zero gap)
+ *    M..EOF       Animation tables, RDT metadata
+ *═══════════════════════════════════════════════════════════════════*/
+
+/* Validate that an EMD header at 'off' in 'dec' of 'sz' bytes is legit */
+static bool validate_emd_at(const u8* dec, size_t sz, size_t off, u32 base,
+                            int* out_nv, int* out_nt, int* out_nq, int* out_np,
+                            size_t* out_end)
+{
+    if (off + 24 > sz) return false;
+    u32 ptrs[4];
+    for (int i = 0; i < 4; i++)
+        ptrs[i] = rd_u32(dec + off + i * 4);
+
+    /* All 4 pointers must resolve within the data */
+    u32 t[4];
+    for (int i = 0; i < 4; i++) {
+        if (ptrs[i] < base || ptrs[i] >= base + (u32)sz)
+            return false;
+        t[i] = ptrs[i] - base;
+    }
+    /* Must be ascending: vert < norm < tri < quad */
+    if (!(t[0] < t[1] && t[1] < t[2] && t[2] < t[3]))
+        return false;
+
+    int nv = (int)(t[1] - t[0]) / 8;
+    int nn = (int)(t[2] - t[1]) / 8;
+    if (nv != nn || nv < 10 || nv > 5000) return false;
+
+    if (off + 22 > sz) return false;
+    u16 tt = rd_u16(dec + off + 16);
+    u16 tq = rd_u16(dec + off + 18);
+    u16 np = rd_u16(dec + off + 20);
+    if (tt < 1 || tt > 5000 || tq > 5000) return false;
+    if (np < 1 || np > 50) return false;
+    /* tri_ptr + tri_count*16 must equal quad_ptr */
+    if (t[2] + (u32)tt * 16 != t[3]) return false;
+    /* Part table must fit between header end and vert_ptr */
+    size_t hdr_end = off + 24 + (size_t)np * 20;
+    if (hdr_end > t[0]) return false;
+
+    *out_nv = nv;
+    *out_nt = (int)tt;
+    *out_nq = (int)tq;
+    *out_np = (int)np;
+    *out_end = (size_t)(t[3] + (size_t)tq * 20);
+    return true;
+}
+
+bool parse_rdt_layout(const u8* dec, size_t dec_size, u32 base,
+                      RdtLayout& layout)
+{
+    layout = RdtLayout();  /* reset all fields via constructor */
+    layout.base = base;
+
+    if (dec_size < 0x20) return false;
+
+    /* ─── Phase 0: Check if this looks like an RDT (7-ptr header) ─── */
+    bool has_rdt_header = false;
+    {
+        u32 p0 = rd_u32(dec);
+        u32 p0_off = p0 - base;
+        if (p0_off > 0x40 && p0_off < dec_size) {
+            /* All 7 pointers should resolve within the file */
+            int valid_ptrs = 0;
+            for (int i = 0; i < 7; i++) {
+                layout.hdr_ptrs[i] = rd_u32(dec + i * 4);
+                u32 off = layout.hdr_ptrs[i] - base;
+                if (off < dec_size) valid_ptrs++;
+            }
+            has_rdt_header = (valid_ptrs >= 5);
+        }
+    }
+
+    /* ─── Phase 1: Walk room mesh sections starting at 0x1C ─── */
+    size_t off = has_rdt_header ? 0x1C : 0;
+    layout.section_count = 0;
+    layout.total_room_tris = 0;
+    layout.total_room_quads = 0;
+
+    while (off + 12 <= dec_size && layout.section_count < RDT_MAX_SECTIONS) {
+        u32 p1_raw = rd_u32(dec + off);
+        u32 p2_raw = rd_u32(dec + off + 4);
+        u16 c1 = rd_u16(dec + off + 8);
+        u16 c2 = rd_u16(dec + off + 10);
+
+        /* Validate pointers */
+        if (p1_raw < base || p2_raw < base) break;
+        u32 p1 = p1_raw - base;
+        u32 p2 = p2_raw - base;
+        if (p1 >= dec_size || p2 >= dec_size) break;
+        if (c1 > 5000 || c2 > 5000) break;
+
+        /* Validate data fits */
+        size_t tri_end  = (size_t)p1 + (size_t)c1 * 40;
+        size_t quad_end = (size_t)p2 + (size_t)c2 * 52;
+        if (tri_end > dec_size || quad_end > dec_size) break;
+
+        /* Empty section: skip header only */
+        if (c1 == 0 && c2 == 0) { off += 12; continue; }
+
+        /* Validate the code byte of the first face to confirm GT3/GT4 */
+        if (c1 > 0) {
+            u8 code = dec[p1 + 24 + 7]; /* tail[7] of first tri */
+            if (code != 0x34 && code != 0x30 && code != 0x24) break;
+        } else if (c2 > 0) {
+            u8 code = dec[p2 + 32 + 7]; /* tail[7] of first quad */
+            if (code != 0x3C && code != 0x3E && code != 0x38 && code != 0x2C) break;
+        }
+
+        RdtMeshSection& sec = layout.sections[layout.section_count++];
+        sec.offset = off;
+        sec.tri_count = c1;
+        sec.quad_count = c2;
+        layout.total_room_tris += c1;
+        layout.total_room_quads += c2;
+
+        off = quad_end;
+    }
+
+    layout.room_mesh_end = off;
+
+    /* ─── Phase 2: Walk EMD models contiguously after room mesh ─── */
+    layout.emd_count = 0;
+    size_t emd_scan = layout.room_mesh_end;
+
+    while (emd_scan + 24 <= dec_size && layout.emd_count < RDT_MAX_EMDS) {
+        int nv, nt, nq, np;
+        size_t emd_end;
+        if (validate_emd_at(dec, dec_size, emd_scan, base,
+                            &nv, &nt, &nq, &np, &emd_end)) {
+            RdtEmdEntry& e = layout.emds[layout.emd_count++];
+            e.offset = emd_scan;
+            e.vert_count = nv;
+            e.tri_count = nt;
+            e.quad_count = nq;
+            e.part_count = np;
+            e.data_end = emd_end;
+            emd_scan = emd_end; /* next EMD starts immediately */
+        } else {
+            break; /* no more contiguous EMDs */
+        }
+    }
+
+    layout.emds_end = emd_scan;
+    layout.valid = has_rdt_header || layout.section_count > 0 || layout.emd_count > 0;
+    return layout.valid;
+}
+
+bool parse_rdt_layout_from_entry(const u8* data, size_t size,
+                                 u16 ey, u16 ex, RdtLayout& layout)
+{
+    if (!(ey & 0x8000)) return false;
+
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    if (dec.size < 0x20) return false;
+
+    u32 base = ((u32)(ey & 0x7FFF) << 16) | (u32)ex | 0x80000000u;
+    return parse_rdt_layout(dec.data, dec.size, base, layout);
+}
+
+/*─── Detect room vs object mesh layout ──────────────────────────*/
+static void detect_mesh_layout(const u8* dec, size_t dec_size,
+                               u32 base, size_t& mesh_start, size_t& mesh_end)
+{
+    mesh_start = 0;
+    mesh_end = dec_size;
+    if (dec_size < 16) return;
+
+    u32 p0 = rd_u32(dec);
+    u32 p0_off = p0 - base;
+
+    if (p0_off > 0 && p0_off < dec_size && p0_off > 0x100) {
+        /* Room: 7 metadata ptrs at start, mesh sections after header.
+           Find smallest metadata ptr that's past the header area (0x1C+).
+           Only consider ptrs > 0x40 to avoid false hits on mesh section data. */
+        size_t meta_min = dec_size;
+        for (int si = 0; si < 7; si++) {
+            if ((size_t)si * 4 + 4 > dec_size) break;
+            u32 sp = rd_u32(dec + si * 4) - base;
+            if (sp > 0x40 && sp < meta_min)
+                meta_min = sp;
+        }
+        mesh_start = 0x1C;
+        mesh_end = meta_min;
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Parse Room Mesh  (pre-decompressed)
+ *═══════════════════════════════════════════════════════════════════*/
+bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mesh& mesh,
+                         const u32* exclude_offsets, int n_exclude)
+{
+    if (dec_size < 16) return false;
+
+    /* Temporary dynamic arrays */
+    Array<MeshVert> verts;
+    Array<MeshTri>  tris;
+    verts.reserve(4096);
+    tris.reserve(4096);
+
+    size_t mesh_start, mesh_end;
+    detect_mesh_layout(dec_data, dec_size, base_addr, mesh_start, mesh_end);
+
+    size_t off = mesh_start;
+    int max_sections = 200; /* safety limit */
+    while (off + 12 <= mesh_end && max_sections-- > 0) {
+        /* Check if this section should be excluded */
+        bool skip = false;
+        for (int ei = 0; ei < n_exclude; ei++)
+            if ((u32)off == exclude_offsets[ei]) { skip = true; break; }
+
+        u32 p1 = rd_u32(dec_data + off) - base_addr;
+        u32 p2 = rd_u32(dec_data + off + 4) - base_addr;
+        u16 c1 = rd_u16(dec_data + off + 8);
+        u16 c2 = rd_u16(dec_data + off + 10);
+
+        /* Basic sanity: pointers must be within data */
+        if (p1 >= dec_size || p2 >= dec_size) break;
+        if (c1 > 5000 || c2 > 5000) break;
+
+        /* Validate tri region */
+        size_t tri_end = p1 + (size_t)c1 * 40;
+        size_t quad_end = p2 + (size_t)c2 * 52;
+        if (tri_end > dec_size || quad_end > dec_size) break;
+
+        /* If c1 == 0, tri ptr should equal quad ptr (or be irrelevant) */
+        if (c1 == 0 && c2 == 0) { off += 12; continue; }
+
+        /* Skip excluded sections (still advance past them) */
+        if (skip) { off = quad_end; continue; }
+
+        /* Parse triangles (40 bytes each)  -  use p1 directly */
+        for (int i = 0; i < (int)c1; i++) {
+            size_t o = p1 + (size_t)i * 40;
+            if (o + 40 > dec_size) break;
+
+            s16 vs[3][3];
+            u8  uvs[3][2];
+            bool valid = true;
+            for (int vi = 0; vi < 3; vi++) {
+                vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+                vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+                vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+                u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+                uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+                for (int a = 0; a < 3; a++)
+                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                        valid = false;
+            }
+            if (!valid) continue;
+
+            u16 tp = rd_u16(dec_data + o + 24);
+            u16 cl = rd_u16(dec_data + o + 26);
+            u8 cols[3][3];
+            for (int ci = 0; ci < 3; ci++) {
+                cols[ci][0] = dec_data[o + 28 + ci * 4];
+                cols[ci][1] = dec_data[o + 28 + ci * 4 + 1];
+                cols[ci][2] = dec_data[o + 28 + ci * 4 + 2];
+            }
+
+            u32 bi = (u32)verts.count;
+            for (int vi = 0; vi < 3; vi++) {
+                MeshVert mv = {};
+                mv.x = -(f32)vs[vi][0];
+                mv.y = (f32)(-vs[vi][1]);
+                mv.z = (f32)vs[vi][2];
+                verts.push(mv);
+            }
+            MeshTri t = {};
+            t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
+            t.color = avg_colors(cols, 3);
+            t.tpage = tp; t.clut = cl;
+            t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
+            t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
+            t.uv[2][0] = uvs[1][0]; t.uv[2][1] = uvs[1][1];
+            tris.push(t);
+        }
+
+        /* Parse quads (52 bytes each) */
+        for (int i = 0; i < (int)c2; i++) {
+            size_t o = p2 + (size_t)i * 52;
+            if (o + 52 > dec_size) break;
+
+            s16 vs[4][3];
+            u8  uvs[4][2];
+            bool valid = true;
+            for (int vi = 0; vi < 4; vi++) {
+                vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+                vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+                vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+                u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+                uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+                for (int a = 0; a < 3; a++)
+                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                        valid = false;
+            }
+            if (!valid) continue;
+
+            u16 tp = rd_u16(dec_data + o + 32);
+            u16 cl = rd_u16(dec_data + o + 34);
+            u8 cols[4][3];
+            for (int ci = 0; ci < 4; ci++) {
+                cols[ci][0] = dec_data[o + 36 + ci * 4];
+                cols[ci][1] = dec_data[o + 36 + ci * 4 + 1];
+                cols[ci][2] = dec_data[o + 36 + ci * 4 + 2];
+            }
+
+            u32 bi = (u32)verts.count;
+            RGBA8 c = avg_colors(cols, 4);
+            for (int vi = 0; vi < 4; vi++) {
+                MeshVert mv = {};
+                mv.x = -(f32)vs[vi][0];
+                mv.y = (f32)(-vs[vi][1]);
+                mv.z = (f32)vs[vi][2];
+                verts.push(mv);
+            }
+            /* Quad triangulation: PS1 strip diagonal (v1-v2), reversed for X negate */
+            MeshTri t1 = {};
+            t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;
+            t1.color = c; t1.tpage = tp; t1.clut = cl;
+            t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
+            t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
+            t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
+            tris.push(t1);
+
+            MeshTri t2 = {};
+            t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;
+            t2.color = c; t2.tpage = tp; t2.clut = cl;
+            t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
+            t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
+            t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
+            tris.push(t2);
+        }
+
+        off = quad_end;
+    }
+
+    /* Copy to mesh */
+    mesh.alloc((int)verts.count, (int)tris.count);
+    memcpy(mesh.verts, verts.items, verts.count * sizeof(MeshVert));
+    memcpy(mesh.tris, tris.items, tris.count * sizeof(MeshTri));
+    return mesh.tri_count > 0;
+}
+
+
+bool parse_room_mesh(const u8* data, size_t size, u32 base_addr, Mesh& mesh)
+{
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return parse_room_mesh_dec(dec.data, dec.size, base_addr, mesh);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Apply 0x23 Section Transforms (Instancing)
+ *
+ *  For each xform with non-zero position, re-parse the referenced
+ *  sections from the RDT and append the geometry to the mesh with
+ *  position offset applied. Sections already at origin are already
+ *  in the mesh from parse_room_mesh_dec.
+ *═══════════════════════════════════════════════════════════════════*/
+void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
+                       const RdtSectionXform* xforms, int n_xforms)
+{
+    if (!xforms || n_xforms <= 0) return;
+
+    /* Temporary buffers for new geometry */
+    Array<MeshVert> new_verts;
+    Array<MeshTri>  new_tris;
+    new_verts.reserve(8192);
+    new_tris.reserve(8192);
+
+    /* Metadata region end (smallest header pointer) */
+    size_t meta_min = dec_size;
+    for (int i = 0; i < 7; i++) {
+        if (i * 4 + 4 > (int)dec_size) break;
+        u32 p = rd_u32(dec + i * 4) - base;
+        if (p > 0x40 && p < meta_min) meta_min = p;
+    }
+
+    for (int xi = 0; xi < n_xforms; xi++) {
+        const RdtSectionXform& xf = xforms[xi];
+        if (xf.section_off == 0xFFFFFFFF) continue;
+        if (xf.section_off < 0x1C || xf.section_off >= meta_min) continue;
+
+        /* Position offset (matching parse_room_mesh_dec coordinate system) */
+        f32 ox = -(f32)xf.px;
+        f32 oy = -(f32)xf.py;
+        f32 oz =  (f32)xf.pz;
+
+        /* Y-axis rotation (PSX: 4096 = 360°) */
+        f32 cr = 1.0f, sr = 0.0f;
+        bool has_rot = false;
+        if (xf.ry != 0) {
+            f32 angle = (f32)xf.ry * 6.2831853f / 4096.0f;
+            cr = cosf(angle);
+            sr = sinf(angle);
+            has_rot = true;
+        }
+
+        /* Each 0x23 xform maps to exactly ONE section descriptor.
+           render_mode (byte[3]) controls OT sort order, not section count. */
+        size_t off = xf.section_off;
+        int sec_limit = 1;
+        int sec_done = 0;
+
+        while (off + 12 <= meta_min && sec_done < sec_limit) {
+            u32 p1 = rd_u32(dec + off) - base;
+            u32 p2 = rd_u32(dec + off + 4) - base;
+            u16 c1 = rd_u16(dec + off + 8);
+            u16 c2 = rd_u16(dec + off + 10);
+            if (p1 >= dec_size || p2 >= dec_size) break;
+            if (c1 > 5000 || c2 > 5000) break;
+            size_t tri_end = p1 + (size_t)c1 * 40;
+            size_t quad_end = p2 + (size_t)c2 * 52;
+            if (tri_end > dec_size || quad_end > dec_size) break;
+            if (c1 == 0 && c2 == 0) { off += 12; continue; }
+
+            /* Parse triangles with offset */
+            for (int i = 0; i < (int)c1; i++) {
+                size_t o = p1 + (size_t)i * 40;
+                if (o + 40 > dec_size) break;
+                s16 vs[3][3]; u8 uvs[3][2]; bool valid = true;
+                for (int vi = 0; vi < 3; vi++) {
+                    vs[vi][0] = rd_s16(dec + o + vi*8);
+                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
+                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
+                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
+                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                    uvs[vi][1] = (u8)(uv_raw >> 8);
+                    for (int a = 0; a < 3; a++)
+                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
+                }
+                if (!valid) continue;
+                u16 tp = rd_u16(dec + o + 24);
+                u16 cl = rd_u16(dec + o + 26);
+                u8 cols[3][3];
+                for (int ci = 0; ci < 3; ci++) {
+                    cols[ci][0] = dec[o+28+ci*4]; cols[ci][1] = dec[o+28+ci*4+1]; cols[ci][2] = dec[o+28+ci*4+2];
+                }
+                u32 bi = (u32)new_verts.count;
+                for (int vi = 0; vi < 3; vi++) {
+                    f32 lx = (f32)vs[vi][0];
+                    f32 ly = (f32)vs[vi][1];
+                    f32 lz = (f32)vs[vi][2];
+                    if (has_rot) {
+                        f32 rx2 = cr * lx + sr * lz;
+                        f32 rz2 = -sr * lx + cr * lz;
+                        lx = rx2; lz = rz2;
+                    }
+                    MeshVert mv = {};
+                    mv.x = -lx + ox;
+                    mv.y = -ly + oy;
+                    mv.z =  lz + oz;
+                    new_verts.push(mv);
+                }
+                MeshTri t = {};
+                t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
+                t.color = avg_colors(cols, 3);
+                t.tpage = tp; t.clut = cl;
+                t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
+                t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
+                t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
+                t.src_off = xf.section_off;
+                new_tris.push(t);
+            }
+
+            /* Parse quads with offset */
+            for (int i = 0; i < (int)c2; i++) {
+                size_t o = p2 + (size_t)i * 52;
+                if (o + 52 > dec_size) break;
+                s16 vs[4][3]; u8 uvs[4][2]; bool valid = true;
+                for (int vi = 0; vi < 4; vi++) {
+                    vs[vi][0] = rd_s16(dec + o + vi*8);
+                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
+                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
+                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
+                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                    uvs[vi][1] = (u8)(uv_raw >> 8);
+                    for (int a = 0; a < 3; a++)
+                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
+                }
+                if (!valid) continue;
+                u16 tp = rd_u16(dec + o + 32);
+                u16 cl = rd_u16(dec + o + 34);
+                u8 cols[4][3];
+                for (int ci = 0; ci < 4; ci++) {
+                    cols[ci][0] = dec[o+36+ci*4]; cols[ci][1] = dec[o+36+ci*4+1]; cols[ci][2] = dec[o+36+ci*4+2];
+                }
+                u32 bi = (u32)new_verts.count;
+                RGBA8 c = avg_colors(cols, 4);
+                for (int vi = 0; vi < 4; vi++) {
+                    f32 lx = (f32)vs[vi][0];
+                    f32 ly = (f32)vs[vi][1];
+                    f32 lz = (f32)vs[vi][2];
+                    if (has_rot) {
+                        f32 rx2 = cr * lx + sr * lz;
+                        f32 rz2 = -sr * lx + cr * lz;
+                        lx = rx2; lz = rz2;
+                    }
+                    MeshVert mv = {};
+                    mv.x = -lx + ox;
+                    mv.y = -ly + oy;
+                    mv.z =  lz + oz;
+                    new_verts.push(mv);
+                }
+                MeshTri t1 = {};
+                t1.idx[0]=bi; t1.idx[1]=bi+2; t1.idx[2]=bi+1;
+                t1.color=c; t1.tpage=tp; t1.clut=cl;
+                t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
+                t1.uv[1][0]=uvs[2][0]; t1.uv[1][1]=uvs[2][1];
+                t1.uv[2][0]=uvs[1][0]; t1.uv[2][1]=uvs[1][1];
+                t1.src_off = xf.section_off;
+                new_tris.push(t1);
+                MeshTri t2 = {};
+                t2.idx[0]=bi+1; t2.idx[1]=bi+2; t2.idx[2]=bi+3;
+                t2.color=c; t2.tpage=tp; t2.clut=cl;
+                t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
+                t2.uv[1][0]=uvs[2][0]; t2.uv[1][1]=uvs[2][1];
+                t2.uv[2][0]=uvs[3][0]; t2.uv[2][1]=uvs[3][1];
+                t2.src_off = xf.section_off;
+                new_tris.push(t2);
+            }
+            off = quad_end;
+            sec_done++;
+        }
+    }
+
+    if (new_tris.count == 0) return;
+
+    /* Append instanced geometry to mesh.
+       New tri indices reference new_verts, offset by existing vert count. */
+    int old_vc = mesh.vert_count, old_tc = mesh.tri_count;
+    int total_vc = old_vc + (int)new_verts.count;
+    int total_tc = old_tc + (int)new_tris.count;
+
+    MeshVert* nv = (MeshVert*)realloc(mesh.verts, total_vc * sizeof(MeshVert));
+    MeshTri*  nt = (MeshTri*) realloc(mesh.tris,  total_tc * sizeof(MeshTri));
+    if (!nv || !nt) return; /* OOM */
+
+    mesh.verts = nv;
+    mesh.tris  = nt;
+    memcpy(mesh.verts + old_vc, new_verts.items, new_verts.count * sizeof(MeshVert));
+
+    /* Offset tri indices to account for existing verts */
+    for (int i = 0; i < (int)new_tris.count; i++) {
+        MeshTri t = new_tris.items[i];
+        t.idx[0] += (u32)old_vc;
+        t.idx[1] += (u32)old_vc;
+        t.idx[2] += (u32)old_vc;
+        mesh.tris[old_tc + i] = t;
+    }
+    mesh.vert_count = total_vc;
+    mesh.tri_count  = total_tc;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Parse Door Mesh
+ *═══════════════════════════════════════════════════════════════════*/
+bool parse_door_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mesh& mesh)
+{
+    if (dec_size < 16) return false;
+
+    u32 p0 = rd_u32(dec_data) - base_addr;
+    u32 p1 = rd_u32(dec_data + 4) - base_addr;
+    u32 counts = rd_u32(dec_data + 8);
+    u16 n_tris  = (u16)(counts & 0xFFFF);
+    u16 n_quads = (u16)((counts >> 16) & 0xFFFF);
+
+    Array<MeshVert> verts;
+    Array<MeshTri>  tris;
+    verts.reserve(1024);
+    tris.reserve(1024);
+
+    /* Triangles (40 bytes each) */
+    for (int i = 0; i < n_tris; i++) {
+        size_t o = p0 + (size_t)i * 40;
+        if (o + 40 > dec_size) break;
+
+        s16 vs[3][3]; u8 uvs[3][2]; bool valid = true;
+        for (int vi = 0; vi < 3; vi++) {
+            vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+            vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+            vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+            u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+            uvs[vi][0] = (u8)(uv_raw & 0xFF);
+            uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+            for (int a = 0; a < 3; a++)
+                if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                    valid = false;
+        }
+        if (!valid) continue;
+
+        u16 tp = rd_u16(dec_data + o + 24);
+        u16 cl = rd_u16(dec_data + o + 26);
+        u8 cols[3][3];
+        for (int ci = 0; ci < 3; ci++) {
+            cols[ci][0] = dec_data[o + 28 + ci * 4];
+            cols[ci][1] = dec_data[o + 28 + ci * 4 + 1];
+            cols[ci][2] = dec_data[o + 28 + ci * 4 + 2];
+        }
+        u32 bi = (u32)verts.count;
+        for (int vi = 0; vi < 3; vi++) {
+            MeshVert mv = { -(f32)vs[vi][0], (f32)(-vs[vi][1]), (f32)vs[vi][2] };
+            verts.push(mv);
+        }
+        MeshTri t = {};
+        t.idx[0] = bi; t.idx[1] = bi+1; t.idx[2] = bi+2;
+        t.color = avg_colors(cols, 3); t.tpage = tp; t.clut = cl;
+        for (int vi = 0; vi < 3; vi++) {
+            t.uv[vi][0] = uvs[vi][0]; t.uv[vi][1] = uvs[vi][1];
+        }
+        tris.push(t);
+    }
+
+    /* Quads (52 bytes each) */
+    for (int i = 0; i < n_quads; i++) {
+        size_t o = p1 + (size_t)i * 52;
+        if (o + 52 > dec_size) break;
+
+        s16 vs[4][3]; u8 uvs[4][2]; bool valid = true;
+        for (int vi = 0; vi < 4; vi++) {
+            vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+            vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+            vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+            u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+            uvs[vi][0] = (u8)(uv_raw & 0xFF);
+            uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+            for (int a = 0; a < 3; a++)
+                if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                    valid = false;
+        }
+        if (!valid) continue;
+
+        u16 tp = rd_u16(dec_data + o + 32);
+        u16 cl = rd_u16(dec_data + o + 34);
+        u8 cols[4][3];
+        for (int ci = 0; ci < 4; ci++) {
+            cols[ci][0] = dec_data[o + 36 + ci * 4];
+            cols[ci][1] = dec_data[o + 36 + ci * 4 + 1];
+            cols[ci][2] = dec_data[o + 36 + ci * 4 + 2];
+        }
+        u32 bi = (u32)verts.count;
+        RGBA8 c = avg_colors(cols, 4);
+        for (int vi = 0; vi < 4; vi++) {
+            MeshVert mv = { -(f32)vs[vi][0], (f32)(-vs[vi][1]), (f32)vs[vi][2] };
+            verts.push(mv);
+        }
+        MeshTri t1 = {}, t2 = {};
+        t1.idx[0]=bi; t1.idx[1]=bi+1; t1.idx[2]=bi+2; t1.color=c; t1.tpage=tp; t1.clut=cl;
+        t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
+        t1.uv[1][0]=uvs[1][0]; t1.uv[1][1]=uvs[1][1];
+        t1.uv[2][0]=uvs[2][0]; t1.uv[2][1]=uvs[2][1];
+        tris.push(t1);
+
+        t2.idx[0]=bi+1; t2.idx[1]=bi+3; t2.idx[2]=bi+2; t2.color=c; t2.tpage=tp; t2.clut=cl;
+        t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
+        t2.uv[1][0]=uvs[3][0]; t2.uv[1][1]=uvs[3][1];
+        t2.uv[2][0]=uvs[2][0]; t2.uv[2][1]=uvs[2][1];
+        tris.push(t2);
+    }
+
+    mesh.alloc((int)verts.count, (int)tris.count);
+    memcpy(mesh.verts, verts.items, verts.count * sizeof(MeshVert));
+    memcpy(mesh.tris, tris.items, tris.count * sizeof(MeshTri));
+    return mesh.tri_count > 0;
+}
+
+bool parse_door_mesh(const u8* data, size_t size, u32 base_addr, Mesh& mesh)
+{
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return parse_door_mesh_dec(dec.data, dec.size, base_addr, mesh);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Standalone Character EMD  (p*.dat / h*.dat entry 3)
+ *
+ *  Header:
+ *    [0x00] u32 skeleton_ptr   (PSX addr → offset 0x58 typically)
+ *    [0x04] u32 bone_count     (e.g. 19)
+ *    [0x08] bone_table[bone_count+1] × 4 bytes  {u8 parent, u8 idx, u16 pad}
+ *    ... skeleton data, animation data ...
+ *
+ *  Mesh part at end of blob (found by reverse scan):
+ *    u32 tri_ptr               (PSX addr)
+ *    u32 quad_ptr              (PSX addr)
+ *    u16 tri_count
+ *    u16 quad_count
+ *
+ *  Triangles: 48 bytes each
+ *    3 × {s16 x, s16 y, s16 z, u8 U, u8 V}     = 24 bytes (vertices)
+ *    3 × {s16 nx, s16 ny, s16 nz, u16 tag}      = 24 bytes (normals)
+ *    n[0].tag = tpage, n[1].tag = clut, n[2].tag = 0
+ *
+ *  Quads: 64 bytes each
+ *    4 × {s16 x, s16 y, s16 z, u8 U, u8 V}     = 32 bytes (vertices)
+ *    4 × {s16 nx, s16 ny, s16 nz, u16 tag}      = 32 bytes (normals)
+ *    n[0].tag = tpage, n[1].tag = clut, n[2..3].tag = 0
+ *═══════════════════════════════════════════════════════════════════*/
+bool is_standalone_emd_dec(const u8* dec, size_t dec_size, u32 base)
+{
+    if (dec_size < 0x100) return false;
+
+    /* Check header: skeleton_ptr resolves within blob, bone_count is sane */
+    u32 skel_ptr = rd_u32(dec);
+    u32 skel_off = skel_ptr - base;
+    if (skel_off < 0x20 || skel_off >= dec_size) return false;
+
+    u32 bone_count = rd_u32(dec + 4);
+    if (bone_count < 5 || bone_count > 60) return false;
+
+    /* Bone table entries should fit before skeleton offset */
+    size_t table_end = 8 + ((size_t)bone_count + 1) * 4;
+    if (table_end > skel_off) return false;
+
+    /* Verify bone table: each entry has lo_byte as parent (small value) */
+    int valid_entries = 0;
+    for (u32 i = 0; i < bone_count && i < 30; i++) {
+        u8 parent = dec[8 + i * 4];
+        if (parent < bone_count) valid_entries++;
+    }
+    if (valid_entries < (int)bone_count / 2) return false;
+
+    /* Scan backwards from end for mesh part header: ptr, ptr, u16, u16
+       where ptr2 - ptr1 == tri_count * 48 and data ends at dec_size */
+    for (size_t scan = dec_size - 12; scan > dec_size / 2; scan -= 4) {
+        u32 v0 = rd_u32(dec + scan);
+        u32 v1 = rd_u32(dec + scan + 4);
+        u32 o0 = v0 - base;
+        u32 o1 = v1 - base;
+        if (o0 >= dec_size || o1 >= dec_size || o1 <= o0) continue;
+        u16 tc = rd_u16(dec + scan + 8);
+        u16 qc = rd_u16(dec + scan + 10);
+        if (tc > 200 || qc > 200 || tc + qc == 0) continue;
+        if (o0 + (u32)tc * 48 != o1) continue;
+        if (o1 + (u32)qc * 64 != (u32)dec_size) continue;
+        return true;
+    }
+    return false;
+}
+
+bool parse_standalone_emd_mesh_dec(const u8* dec, size_t dec_size,
+                                   u32 base, Mesh& mesh)
+{
+    if (dec_size < 0x100) return false;
+
+    Array<MeshVert> verts;
+    Array<MeshTri>  tris;
+    verts.reserve(2048);
+    tris.reserve(2048);
+
+    /* Find mesh part header by reverse scan */
+    size_t hdr_off = 0;
+    u32 tri_off = 0, quad_off = 0;
+    u16 tri_count = 0, quad_count = 0;
+    bool found = false;
+
+    for (size_t scan = dec_size - 12; scan > dec_size / 2; scan -= 4) {
+        u32 v0 = rd_u32(dec + scan);
+        u32 v1 = rd_u32(dec + scan + 4);
+        u32 o0 = v0 - base;
+        u32 o1 = v1 - base;
+        if (o0 >= dec_size || o1 >= dec_size || o1 <= o0) continue;
+        u16 tc = rd_u16(dec + scan + 8);
+        u16 qc = rd_u16(dec + scan + 10);
+        if (tc > 200 || qc > 200 || tc + qc == 0) continue;
+        if (o0 + (u32)tc * 48 != o1) continue;
+        if (o1 + (u32)qc * 64 != (u32)dec_size) continue;
+        hdr_off = scan;
+        tri_off = o0; quad_off = o1;
+        tri_count = tc; quad_count = qc;
+        found = true;
+        break;
+    }
+    if (!found) return false;
+
+    /* Parse 48-byte triangles:
+       [0:24]  3 verts × 8  {s16 x, s16 y, s16 z, u8 U, u8 V}
+       [24:32] n0 {s16, s16, s16, u16 tpage}
+       [32:40] n1 {s16, s16, s16, u16 clut}
+       [40:48] n2 {s16, s16, s16, u16 pad} */
+    for (int i = 0; i < (int)tri_count; i++) {
+        size_t o = (size_t)tri_off + (size_t)i * 48;
+        if (o + 48 > dec_size) break;
+
+        s16 vs[3][3];
+        u8  uvs[3][2];
+        bool valid = true;
+        for (int vi = 0; vi < 3; vi++) {
+            vs[vi][0] = rd_s16(dec + o + vi * 8);
+            vs[vi][1] = rd_s16(dec + o + vi * 8 + 2);
+            vs[vi][2] = rd_s16(dec + o + vi * 8 + 4);
+            u16 uv_raw = rd_u16(dec + o + vi * 8 + 6);
+            uvs[vi][0] = (u8)(uv_raw & 0xFF);
+            uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+            for (int a = 0; a < 3; a++)
+                if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                    valid = false;
+        }
+        if (!valid) continue;
+
+        u16 tp = rd_u16(dec + o + 24 + 6);  /* n[0].tag = tpage */
+        u16 cl = rd_u16(dec + o + 32 + 6);  /* n[1].tag = clut  */
+
+        /* Read per-vertex normals (s16 × 3 at offsets 24, 32, 40) */
+        s16 ns[3][3];
+        for (int ni = 0; ni < 3; ni++) {
+            ns[ni][0] = rd_s16(dec + o + 24 + ni * 8);
+            ns[ni][1] = rd_s16(dec + o + 24 + ni * 8 + 2);
+            ns[ni][2] = rd_s16(dec + o + 24 + ni * 8 + 4);
+        }
+
+        u32 bi = (u32)verts.count;
+        for (int vi = 0; vi < 3; vi++) {
+            MeshVert mv = {};
+            mv.x = -(f32)vs[vi][0];
+            mv.y = -(f32)vs[vi][1];
+            mv.z =  (f32)vs[vi][2];
+            mv.nx = -(f32)ns[vi][0];
+            mv.ny = -(f32)ns[vi][1];
+            mv.nz =  (f32)ns[vi][2];
+            verts.push(mv);
+        }
+        MeshTri t = {};
+        t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
+        t.color.r = 128; t.color.g = 128; t.color.b = 128; t.color.a = 255;
+        t.tpage = tp; t.clut = cl;
+        t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
+        t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
+        t.uv[2][0] = uvs[1][0]; t.uv[2][1] = uvs[1][1];
+        tris.push(t);
+    }
+
+    /* Parse 64-byte quads:
+       [0:32]  4 verts × 8
+       [32:40] n0 {.., u16 tpage}
+       [40:48] n1 {.., u16 clut}
+       [48:64] n2, n3 */
+    for (int i = 0; i < (int)quad_count; i++) {
+        size_t o = (size_t)quad_off + (size_t)i * 64;
+        if (o + 64 > dec_size) break;
+
+        s16 vs[4][3];
+        u8  uvs[4][2];
+        bool valid = true;
+        for (int vi = 0; vi < 4; vi++) {
+            vs[vi][0] = rd_s16(dec + o + vi * 8);
+            vs[vi][1] = rd_s16(dec + o + vi * 8 + 2);
+            vs[vi][2] = rd_s16(dec + o + vi * 8 + 4);
+            u16 uv_raw = rd_u16(dec + o + vi * 8 + 6);
+            uvs[vi][0] = (u8)(uv_raw & 0xFF);
+            uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+            for (int a = 0; a < 3; a++)
+                if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                    valid = false;
+        }
+        if (!valid) continue;
+
+        u16 tp = rd_u16(dec + o + 32 + 6);  /* n[0].tag = tpage */
+        u16 cl = rd_u16(dec + o + 40 + 6);  /* n[1].tag = clut  */
+
+        /* Read per-vertex normals (s16 × 3 at offsets 32, 40, 48, 56) */
+        s16 ns[4][3];
+        for (int ni = 0; ni < 4; ni++) {
+            ns[ni][0] = rd_s16(dec + o + 32 + ni * 8);
+            ns[ni][1] = rd_s16(dec + o + 32 + ni * 8 + 2);
+            ns[ni][2] = rd_s16(dec + o + 32 + ni * 8 + 4);
+        }
+
+        RGBA8 c;
+        c.r = 128; c.g = 128; c.b = 128; c.a = 255;
+
+        u32 bi = (u32)verts.count;
+        for (int vi = 0; vi < 4; vi++) {
+            MeshVert mv = {};
+            mv.x = -(f32)vs[vi][0];
+            mv.y = -(f32)vs[vi][1];
+            mv.z =  (f32)vs[vi][2];
+            mv.nx = -(f32)ns[vi][0];
+            mv.ny = -(f32)ns[vi][1];
+            mv.nz =  (f32)ns[vi][2];
+            verts.push(mv);
+        }
+
+        MeshTri t1 = {};
+        t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;
+        t1.color = c; t1.tpage = tp; t1.clut = cl;
+        t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
+        t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
+        t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
+        tris.push(t1);
+
+        MeshTri t2 = {};
+        t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;
+        t2.color = c; t2.tpage = tp; t2.clut = cl;
+        t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
+        t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
+        t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
+        tris.push(t2);
+    }
+
+    if (tris.count == 0) return false;
+
+    /* Copy to output mesh */
+    mesh.vert_count = verts.count;
+    mesh.tri_count  = tris.count;
+    mesh.verts = new MeshVert[verts.count];
+    mesh.tris  = new MeshTri[tris.count];
+    memcpy(mesh.verts, verts.items, sizeof(MeshVert) * verts.count);
+    memcpy(mesh.tris,  tris.items,  sizeof(MeshTri)  * tris.count);
+    mesh_compute_smooth_normals(mesh);
+    return true;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Entry type detection
+ *═══════════════════════════════════════════════════════════════════*/
+bool is_door_mesh_entry_dec(const u8* dec_data, size_t dec_size, u16 ey)
+{
+    if (dec_size < 16 || dec_size > 10000) return false;
+
+    u32 base = (u32)((ey & 0x7FFF) << 16) | 0x80000000u;
+    u32 p0 = rd_u32(dec_data);
+    u32 p1 = rd_u32(dec_data + 4);
+
+    if ((p0 >> 24) != 0x80 || (p1 >> 24) != 0x80) return false;
+    if (p0 == p1) return false;
+
+    u32 off0 = p0 - base, off1 = p1 - base;
+    if (off0 < 12 || off0 >= dec_size || off1 < 12 || off1 > dec_size) return false;
+
+    u32 counts = rd_u32(dec_data + 8);
+    u16 nt = (u16)(counts & 0xFFFF);
+    u16 nq = (u16)((counts >> 16) & 0xFFFF);
+    if (nt > 200 || nq > 200) return false;
+    if (off0 + nt * 40 > dec_size + 4) return false;
+    if (off1 + nq * 52 > dec_size + 4) return false;
+    return (nt + nq) > 0;
+}
+
+bool is_door_mesh_entry(const u8* data, size_t size, u16 ey, u16 ew, u16 eh)
+{
+    (void)ew; (void)eh;
+    if (!(ey & 0x8000)) return false;
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return is_door_mesh_entry_dec(dec.data, dec.size, ey);
+}
+
+bool is_emd_entry(const u8* data, size_t size, u16 ey, u16 ex)
+{
+    RdtLayout layout;
+    if (!parse_rdt_layout_from_entry(data, size, ey, ex, layout))
+        return false;
+    return layout.emd_count > 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Find ALL EMD headers in a decompressed LZSS0 blob.
+ *  Returns count found (up to max_out).
+ *═══════════════════════════════════════════════════════════════════*/
+int find_emd_headers(const u8* data, size_t size, u16 ey, u16 ex,
+                     size_t* out_offsets, int max_out)
+{
+    RdtLayout layout;
+    if (!parse_rdt_layout_from_entry(data, size, ey, ex, layout))
+        return 0;
+
+    int count = layout.emd_count;
+    if (count > max_out) count = max_out;
+    for (int i = 0; i < count; i++)
+        out_offsets[i] = layout.emds[i].offset;
+    return count;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  EMD Character Model Parser
+ *═══════════════════════════════════════════════════════════════════*/
+bool parse_emd_model_dec(const u8* dec_data, size_t dec_size,
+                        u16 ey, u16 ex, EmdModel& model,
+                        int hint_offset)
+{
+    model.valid = false;
+
+    if (dec_size < 200) return false;
+
+    u32 base = ((u32)(ey & 0x7FFF) << 16) | (u32)ex | 0x80000000u;
+
+    /* Find EMD header */
+    size_t hdr_off = 0;
+    int n_verts = 0, total_tris = 0, total_quads = 0, n_parts = 0;
+    (void)total_tris; (void)total_quads;
+    u32 targets[4] = {0};
+    bool found = false;
+
+    /* If hint_offset given, start scan there (for multi-EMD entries) */
+    size_t scan_start = (hint_offset >= 0) ? (size_t)hint_offset : 0;
+
+    for (size_t soff = scan_start; soff + 24 <= dec_size; soff += 4) {
+        u32 ptrs[4];
+        for (int i = 0; i < 4; i++)
+            ptrs[i] = rd_u32(dec_data + soff + i * 4);
+        bool all_valid = true;
+        for (int i = 0; i < 4; i++)
+            if (ptrs[i] < base || ptrs[i] >= base + dec_size)
+                { all_valid = false; break; }
+        if (!all_valid) continue;
+
+        for (int i = 0; i < 4; i++) targets[i] = ptrs[i] - base;
+        if (!(targets[0] < targets[1] && targets[1] < targets[2] && targets[2] < targets[3]))
+            continue;
+
+        int nv = (int)(targets[1] - targets[0]) / 8;
+        int nn = (int)(targets[2] - targets[1]) / 8;
+        if (nv != nn || nv < 10 || nv > 5000) continue;
+
+        if (soff + 22 > dec_size) continue;
+        u16 tt = rd_u16(dec_data + soff + 16);
+        u16 tq = rd_u16(dec_data + soff + 18);
+        u16 np = rd_u16(dec_data + soff + 20);
+        if (tt < 1 || tt > 5000 || tq > 5000) continue;
+        if (np < 1 || np > 50) continue;
+        if (targets[2] + (u32)tt * 16 != targets[3]) continue;
+        size_t he = soff + 24 + (size_t)np * 20;
+        if (he > targets[0]) continue;
+
+        hdr_off = soff; n_verts = nv;
+        total_tris = tt; total_quads = tq; n_parts = np;
+        found = true;
+        break;
+    }
+    if (!found) return false;
+
+    /* Read body parts */
+    struct Part {
+        s16 bx, by, bz; int parent;
+        u32 tri_ptr, quad_ptr; int nt, nq;
+    };
+    Part parts[50];
+    for (int pi = 0; pi < n_parts; pi++) {
+        size_t poff = hdr_off + 24 + (size_t)pi * 20;
+        parts[pi].bx = rd_s16(dec_data + poff);
+        parts[pi].by = rd_s16(dec_data + poff + 2);
+        parts[pi].bz = rd_s16(dec_data + poff + 4);
+        parts[pi].parent = dec_data[poff + 6];
+        if (parts[pi].parent == 0xFF) parts[pi].parent = -1;
+        parts[pi].tri_ptr  = rd_u32(dec_data + poff + 8) - base;
+        parts[pi].quad_ptr = rd_u32(dec_data + poff + 12) - base;
+        parts[pi].nt = rd_u16(dec_data + poff + 16);
+        parts[pi].nq = rd_u16(dec_data + poff + 18);
+    }
+
+    /* Chain bone positions */
+    f32 abs_pos[50][3];
+    for (int pi = 0; pi < n_parts; pi++) {
+        f32 px = (f32)parts[pi].bx, py = (f32)parts[pi].by, pz = (f32)parts[pi].bz;
+        int par = parts[pi].parent;
+        if (par == -1 || par >= n_parts) {
+            abs_pos[pi][0] = px; abs_pos[pi][1] = py; abs_pos[pi][2] = pz;
+        } else {
+            abs_pos[pi][0] = abs_pos[par][0] + px;
+            abs_pos[pi][1] = abs_pos[par][1] + py;
+            abs_pos[pi][2] = abs_pos[par][2] + pz;
+        }
+    }
+
+    /* Read vertex pool */
+    model.pool = (EmdModel::PoolVert*)calloc(n_verts, sizeof(EmdModel::PoolVert));
+    model.pool_count = n_verts;
+    for (int vi = 0; vi < n_verts; vi++) {
+        size_t voff = targets[0] + (size_t)vi * 8;
+        model.pool[vi].x = rd_s16(dec_data + voff);
+        model.pool[vi].y = rd_s16(dec_data + voff + 2);
+        model.pool[vi].z = rd_s16(dec_data + voff + 4);
+        model.pool[vi].bone_idx = rd_u16(dec_data + voff + 6);
+        if (model.pool[vi].bone_idx >= (u16)n_parts)
+            model.pool[vi].bone_idx = 0;
+    }
+
+    /* Transform vertices to world space */
+    f32* V_world = (f32*)calloc(n_verts * 3, sizeof(f32));
+    f32* N_world = (f32*)calloc(n_verts * 3, sizeof(f32));  /* per-vertex normals */
+    for (int vi = 0; vi < n_verts; vi++) {
+        int bi = model.pool[vi].bone_idx;
+        V_world[vi*3]   = (f32)model.pool[vi].x + abs_pos[bi][0];
+        V_world[vi*3+1] = -((f32)model.pool[vi].y + abs_pos[bi][1]);
+        V_world[vi*3+2] = -((f32)model.pool[vi].z + abs_pos[bi][2]);
+        /* Read normal from pool at targets[1] (same stride/count as vertex pool) */
+        size_t noff = targets[1] + (size_t)vi * 8;
+        if (noff + 6 <= dec_size) {
+            f32 rnx = (f32)rd_s16(dec_data + noff);
+            f32 rny = (f32)rd_s16(dec_data + noff + 2);
+            f32 rnz = (f32)rd_s16(dec_data + noff + 4);
+            /* Apply same coordinate transform as vertices (negate Y, negate Z) */
+            N_world[vi*3]   = rnx;
+            N_world[vi*3+1] = -rny;
+            N_world[vi*3+2] = -rnz;
+        }
+    }
+
+    /* Per-part colors */
+    static const u8 pcols[][3] = {
+        {200,100,100},{100,200,100},{100,100,200},{200,200,100},
+        {200,100,200},{100,200,200},{180,180,100},{255,150,80},
+        {150,80,255},{80,255,150},{255,80,150},{150,255,80},
+        {80,150,255},{200,150,150},{150,200,150}
+    };
+
+    /* Detect mirrored parts */
+    int mirror_map[50];
+    for (int i = 0; i < 50; i++) mirror_map[i] = -1;
+    for (int pi = 0; pi < n_parts; pi++) {
+        if (parts[pi].nt + parts[pi].nq > 0) continue;
+        for (int pj = 0; pj < n_parts; pj++) {
+            if (pj == pi || parts[pj].nt + parts[pj].nq == 0) continue;
+            f32 ax = abs_pos[pi][0], ay = abs_pos[pi][1], az = abs_pos[pi][2];
+            f32 bx2 = abs_pos[pj][0], by2 = abs_pos[pj][1], bz2 = abs_pos[pj][2];
+            if (fabsf(ax + bx2) <= 1 && fabsf(ay - by2) <= 1 && fabsf(az - bz2) <= 1) {
+                mirror_map[pi] = pj;
+                break;
+            }
+        }
+    }
+
+    /* Emit faces */
+    Array<MeshVert> out_v; out_v.reserve(8192);
+    Array<MeshTri>  out_t; out_t.reserve(8192);
+    Array<EmdModel::VertSrc> out_vs; out_vs.reserve(8192);
+
+    for (int pi = 0; pi < n_parts; pi++) {
+        RGBA8 color = RGBA8(pcols[pi%15][0], pcols[pi%15][1], pcols[pi%15][2], 255);
+        bool is_mirror = (mirror_map[pi] >= 0);
+        Part& src = is_mirror ? parts[mirror_map[pi]] : parts[pi];
+        if (src.nt + src.nq == 0) continue;
+
+        /* Tri faces (16 bytes each) */
+        for (int fi = 0; fi < src.nt; fi++) {
+            size_t foff = src.tri_ptr + (size_t)fi * 16;
+            if (foff + 16 > dec_size) break;
+            u16 i0 = rd_u16(dec_data + foff);
+            u16 i1 = rd_u16(dec_data + foff + 2);
+            u16 i2 = rd_u16(dec_data + foff + 4);
+            if (i0 >= n_verts || i1 >= n_verts || i2 >= n_verts) continue;
+
+            /* EMD tri (16 bytes):
+               +0: idx0  +2: idx1  +4: idx2
+               +6: u0,v0  +8: u1,v1  +10: CLUT  +12: u2,v2  +14: TPAGE
+               UV-to-vertex mapping: uv0→idx1, uv1→idx2, uv2→idx0 */
+            u8 uv0[2] = { dec_data[foff+6],  dec_data[foff+7]  };
+            u8 uv1[2] = { dec_data[foff+8],  dec_data[foff+9]  };
+            u8 uv2[2] = { dec_data[foff+12], dec_data[foff+13] };
+            u16 tp = rd_u16(dec_data + foff + 14);
+            u16 cl = rd_u16(dec_data + foff + 10);
+
+            u32 bi = (u32)out_v.count;
+            u16 idxs[3] = {i0, i1, i2};
+            for (int vi = 0; vi < 3; vi++) {
+                MeshVert mv = {};
+                EmdModel::VertSrc vs;
+                vs.pool_idx = idxs[vi];
+                vs.is_mirror = is_mirror;
+                vs.dest_bone = pi;
+                if (is_mirror) {
+                    mv.x = V_world[idxs[vi]*3];   /* mirror+coord negates cancel */
+                    mv.nx = N_world[idxs[vi]*3];
+                } else {
+                    mv.x = -V_world[idxs[vi]*3];  /* coord system X negate */
+                    mv.nx = -N_world[idxs[vi]*3];
+                }
+                mv.y = V_world[idxs[vi]*3+1];
+                mv.z = V_world[idxs[vi]*3+2];
+                mv.ny = N_world[idxs[vi]*3+1];
+                mv.nz = N_world[idxs[vi]*3+2];
+                out_v.push(mv);
+                out_vs.push(vs);
+            }
+
+            MeshTri t = {};
+            t.color = color; t.tpage = tp; t.clut = cl;
+            if (is_mirror) {
+                t.idx[0]=bi; t.idx[1]=bi+2; t.idx[2]=bi+1;
+                t.uv[0][0]=uv1[0]; t.uv[0][1]=uv1[1];
+                t.uv[1][0]=uv0[0]; t.uv[1][1]=uv0[1];
+                t.uv[2][0]=uv2[0]; t.uv[2][1]=uv2[1];
+            } else {
+                t.idx[0]=bi; t.idx[1]=bi+1; t.idx[2]=bi+2;
+                t.uv[0][0]=uv1[0]; t.uv[0][1]=uv1[1];
+                t.uv[1][0]=uv2[0]; t.uv[1][1]=uv2[1];
+                t.uv[2][0]=uv0[0]; t.uv[2][1]=uv0[1];
+            }
+            out_t.push(t);
+        }
+
+        /* Quad faces (20 bytes each) */
+        for (int fi = 0; fi < src.nq; fi++) {
+            size_t foff = src.quad_ptr + (size_t)fi * 20;
+            if (foff + 20 > dec_size) break;
+            u16 i0 = rd_u16(dec_data + foff);
+            u16 i1 = rd_u16(dec_data + foff + 2);
+            u16 i2 = rd_u16(dec_data + foff + 4);
+            u16 i3 = rd_u16(dec_data + foff + 6);
+            if (i0>=n_verts || i1>=n_verts || i2>=n_verts || i3>=n_verts) continue;
+
+            u8 uv0[2]={dec_data[foff+8], dec_data[foff+9]};
+            u8 uv1[2]={dec_data[foff+12],dec_data[foff+13]};
+            u8 uv2[2]={dec_data[foff+16],dec_data[foff+17]};
+            u8 uv3[2]={dec_data[foff+18],dec_data[foff+19]};
+            u16 tp = rd_u16(dec_data + foff + 14);
+            u16 cl = rd_u16(dec_data + foff + 10);
+
+            u32 bi = (u32)out_v.count;
+            u16 idxs[4] = {i0, i1, i2, i3};
+            for (int vi = 0; vi < 4; vi++) {
+                MeshVert mv = {};
+                EmdModel::VertSrc vs;
+                vs.pool_idx = idxs[vi];
+                vs.is_mirror = is_mirror;
+                vs.dest_bone = pi;
+                if (is_mirror) {
+                    mv.x = V_world[idxs[vi]*3];   /* mirror+coord negates cancel */
+                    mv.nx = N_world[idxs[vi]*3];
+                } else {
+                    mv.x = -V_world[idxs[vi]*3];  /* coord system X negate */
+                    mv.nx = -N_world[idxs[vi]*3];
+                }
+                mv.y = V_world[idxs[vi]*3+1];
+                mv.z = V_world[idxs[vi]*3+2];
+                mv.ny = N_world[idxs[vi]*3+1];
+                mv.nz = N_world[idxs[vi]*3+2];
+                out_v.push(mv);
+                out_vs.push(vs);
+            }
+
+            MeshTri t1 = {}, t2 = {};
+            t1.color = color; t1.tpage = tp; t1.clut = cl;
+            t2.color = color; t2.tpage = tp; t2.clut = cl;
+
+
+            if (is_mirror) {
+                /* Mirror quad: reversed winding, PS1 strip diagonal (v1-v2) */
+                t1.idx[0]=bi;   t1.idx[1]=bi+2; t1.idx[2]=bi+1;
+                t1.uv[0][0]=uv0[0]; t1.uv[0][1]=uv0[1];
+                t1.uv[1][0]=uv2[0]; t1.uv[1][1]=uv2[1];
+                t1.uv[2][0]=uv1[0]; t1.uv[2][1]=uv1[1];
+
+                t2.idx[0]=bi+1; t2.idx[1]=bi+2; t2.idx[2]=bi+3;
+                t2.uv[0][0]=uv1[0]; t2.uv[0][1]=uv1[1];
+                t2.uv[1][0]=uv2[0]; t2.uv[1][1]=uv2[1];
+                t2.uv[2][0]=uv3[0]; t2.uv[2][1]=uv3[1];
+            } else {
+                /* Standard PS1 strip: T1=(v0,v1,v2) T2=(v1,v3,v2) */
+                t1.idx[0]=bi; t1.idx[1]=bi+1; t1.idx[2]=bi+2;
+                t1.uv[0][0]=uv0[0]; t1.uv[0][1]=uv0[1];
+                t1.uv[1][0]=uv1[0]; t1.uv[1][1]=uv1[1];
+                t1.uv[2][0]=uv2[0]; t1.uv[2][1]=uv2[1];
+
+                t2.idx[0]=bi+1; t2.idx[1]=bi+3; t2.idx[2]=bi+2;
+                t2.uv[0][0]=uv1[0]; t2.uv[0][1]=uv1[1];
+                t2.uv[1][0]=uv3[0]; t2.uv[1][1]=uv3[1];
+                t2.uv[2][0]=uv2[0]; t2.uv[2][1]=uv2[1];
+            }
+            out_t.push(t1);
+            out_t.push(t2);
+        }
+    }
+
+    free(V_world);
+    free(N_world);
+
+    /* Store raw decompressed data for animation playback */
+    model.raw_dec = (u8*)malloc(dec_size);
+    if (model.raw_dec) {
+        memcpy(model.raw_dec, dec_data, dec_size);
+        model.raw_dec_size = dec_size;
+    }
+    model.base_addr = base;
+    model.norm_pool_off = targets[1];  /* offset of normal pool for animation */
+
+    /* Store part info for FK chain */
+    model.parts_info = (EmdModel::PartInfo*)calloc(n_parts, sizeof(EmdModel::PartInfo));
+    model.parts_count = n_parts;
+    for (int pi = 0; pi < n_parts; pi++) {
+        model.parts_info[pi].bx = parts[pi].bx;
+        model.parts_info[pi].by = parts[pi].by;
+        model.parts_info[pi].bz = parts[pi].bz;
+        model.parts_info[pi].parent = parts[pi].parent;
+    }
+
+    /* Store vert_src for animation (per output vertex -> pool vertex mapping) */
+    model.vert_src = (EmdModel::VertSrc*)calloc(out_vs.count, sizeof(EmdModel::VertSrc));
+    model.vert_src_count = (int)out_vs.count;
+    if (model.vert_src && out_vs.count > 0)
+        memcpy(model.vert_src, out_vs.items, out_vs.count * sizeof(EmdModel::VertSrc));
+
+    /* Build skeleton */
+    model.skeleton.bone_count = n_parts;
+    for (int pi = 0; pi < n_parts; pi++) {
+        EmdBone& bone = model.skeleton.bones[pi];
+        bone.bx = parts[pi].bx;
+        bone.by = parts[pi].by;
+        bone.bz = parts[pi].bz;
+        bone.parent = (u8)((parts[pi].parent == -1) ? 0xFF : parts[pi].parent);
+        model.skeleton.abs_pos[pi][0] = -abs_pos[pi][0];
+        model.skeleton.abs_pos[pi][1] = -abs_pos[pi][1];
+        model.skeleton.abs_pos[pi][2] = -abs_pos[pi][2];
+    }
+
+    /* Copy mesh */
+    model.mesh.alloc((int)out_v.count, (int)out_t.count);
+    memcpy(model.mesh.verts, out_v.items, out_v.count * sizeof(MeshVert));
+    memcpy(model.mesh.tris, out_t.items, out_t.count * sizeof(MeshTri));
+    if (model.mesh.tri_count > 0) mesh_compute_smooth_normals(model.mesh);
+    model.valid = true;
+    extract_emd_anims(model);
+    return true;
+}
+
+
+bool parse_emd_model(const u8* entry_data, size_t entry_size,
+                     u16 ey, u16 ex, EmdModel& model,
+                     int hint_offset)
+{
+    Buffer dec;
+    if (!lzss_decompress(entry_data, entry_size, dec)) return false;
+    return parse_emd_model_dec(dec.data, dec.size, ey, ex, model, hint_offset);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  EMD Animation Extraction
+ *═══════════════════════════════════════════════════════════════════*/
+void extract_emd_anims(EmdModel& model)
+{
+    if (!model.raw_dec || model.raw_dec_size < 12) return;
+    const u8* dec = model.raw_dec;
+    size_t dsz = model.raw_dec_size;
+    u32 base = model.base_addr;
+
+    /* ── Build candidate frame sizes ──────────────────────────────
+       The animation bitstream encodes 12-bit rotation triplets for
+       N bones, but N may be LESS than model.parts_count when mirror
+       or empty bones are excluded.  We try every plausible bone count
+       from 1..parts_count and collect the valid frame sizes.  The
+       correct size is then determined per-clip by validating ALL
+       frame headers. */
+    int cand_fsizes[64];
+    int n_cands = 0;
+    for (int nb = 1; nb <= model.parts_count && n_cands < 64; nb++) {
+        int rot_bytes = (nb * 36 + 7) / 8;
+        int fs = 12 + rot_bytes;
+        fs = (fs + 3) & ~3;
+        /* Deduplicate (adjacent bone counts can round to same size) */
+        if (n_cands > 0 && cand_fsizes[n_cands - 1] == fs) continue;
+        cand_fsizes[n_cands++] = fs;
+    }
+
+    Array<EmdAnimClip> clips;
+    clips.reserve(64);
+
+    for (size_t scan = 0; scan + 12 <= dsz; scan += 4) {
+        u32 ptr = rd_u32(dec + scan);
+        if (ptr < base || ptr >= base + dsz) continue;
+        u32 count = rd_u32(dec + scan + 4);
+        if (count < 1 || count > 500) continue;
+
+        u32 target = ptr - base;
+        if (target != scan + 8 + ((size_t)count + 1) * 4) continue;
+
+        /* Try candidate frame sizes (largest first = most bones) and
+           pick the largest where ALL frame headers pass validation. */
+        int best_fs = 0;
+        for (int ci = n_cands - 1; ci >= 0; ci--) {
+            int fs = cand_fsizes[ci];
+            /* All frames must fit within the decompressed buffer */
+            if (target + (size_t)count * (size_t)fs > dsz) continue;
+
+            /* Validate EVERY frame header: bytes 0-5 are s16 root
+               position/rotation values that should be bounded. */
+            bool all_ok = true;
+            for (u32 fi = 0; fi < count; fi++) {
+                size_t foff = target + (size_t)fi * (size_t)fs;
+                if (foff + 6 > dsz) { all_ok = false; break; }
+                s16 h0 = rd_s16(dec + foff);
+                s16 h1 = rd_s16(dec + foff + 2);
+                s16 h2 = rd_s16(dec + foff + 4);
+                if (h0 < -4000 || h0 > 4000 ||
+                    h1 < -4000 || h1 > 4000 ||
+                    h2 < -4000 || h2 > 4000)
+                    { all_ok = false; break; }
+            }
+            if (!all_ok) continue;
+
+            best_fs = fs;
+            break;  /* take largest valid size */
+        }
+        if (best_fs == 0) continue;
+
+        EmdAnimClip c;
+        c.offset = (int)scan;
+        c.frame_data = (int)target;
+        c.frames = (int)count;
+        c.frame_size = best_fs;
+        clips.push(c);
+    }
+
+    if (clips.count > 0) {
+        model.clips = (EmdAnimClip*)calloc(clips.count, sizeof(EmdAnimClip));
+        model.clip_count = (int)clips.count;
+        memcpy(model.clips, clips.items, clips.count * sizeof(EmdAnimClip));
+        model.n_anims = model.clip_count;
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  EMD Animation Frame Computation
+ *
+ *  Verified against game exe (sub_45ED3B, sub_459DB0, sub_5F3680):
+ *   - Root bone rotation from frame header bytes 0-5 (s16 rx, ry, rz)
+ *   - Packed 12-bit bitstream at byte 12+ for bones 1..N-1
+ *   - Bitstream triplet order: rx, rz, ry (NOT rx, ry, rz)
+ *   - Hierarchical FK with parent matrix accumulation
+ *   - Matrix order: M = Rx * Ry * Rz (Z applied first)
+ *═══════════════════════════════════════════════════════════════════*/
+
+/* 3x3 matrix multiply: C = A * B */
+static void mat3x3_mul(const f32* A, const f32* B, f32* C)
+{
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            C[r*3+c] = A[r*3+0]*B[0*3+c]
+                      + A[r*3+1]*B[1*3+c]
+                      + A[r*3+2]*B[2*3+c];
+}
+
+/* Build Rx * Ry * Rz rotation matrix (matches game sub_5F3680) */
+static void build_rot_matrix(f32 rx, f32 ry, f32 rz, f32* m)
+{
+    f32 cx = cosf(rx), sx = sinf(rx);
+    f32 cy = cosf(ry), sy = sinf(ry);
+    f32 cz = cosf(rz), sz = sinf(rz);
+    m[0] = cy*cz;             m[1] = -cy*sz;             m[2] = sy;
+    m[3] = cx*sz + sx*sy*cz;  m[4] = cx*cz - sx*sy*sz;   m[5] = -sx*cy;
+    m[6] = sx*sz - cx*sy*cz;  m[7] = sx*cz + cx*sy*sz;   m[8] = cx*cy;
+}
+
+bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
+{
+    if (!model.valid || !model.raw_dec || !model.clips) return false;
+    if (clip_idx < 0 || clip_idx >= model.clip_count) return false;
+    const EmdAnimClip& clip = model.clips[clip_idx];
+    if (frame_idx < 0) frame_idx = 0;
+    if (frame_idx >= clip.frames) frame_idx = clip.frames - 1;
+
+    const u8* dec = model.raw_dec;
+    size_t dsz = model.raw_dec_size;
+    int n_parts = model.parts_count;
+    if (n_parts < 1 || n_parts > 50) return false;
+
+    int fsize = clip.frame_size;
+    if (fsize < 12) return false;
+
+    size_t foff = (size_t)clip.frame_data + (size_t)frame_idx * (size_t)fsize;
+    if (foff + (size_t)fsize > dsz) return false;
+
+    const f32 TWO_PI = 6.2831853f;
+
+    /* ─── Frame header bytes 0-5: entity world rotation (NOT bone rotation).
+       Bytes 6-11: root velocity / speed metadata.
+       These are written to entity+68/70/72 by sub_45E632 and are separate
+       from per-bone rotation angles at bone+40/42/44.  Not used for FK. ─── */
+
+    f32 bone_rots[50][3];
+    memset(bone_rots, 0, sizeof(bone_rots));
+
+    /* ─── Packed 12-bit rotation bitstream for N animated bones ───
+       The frame_size stored per-clip was determined empirically during
+       extract_emd_anims.  The number of bones encoded in the bitstream
+       may be LESS than model.parts_count (mirror/empty bones excluded).
+       Derive the actual encoded bone count from the rotation data size:
+         rot_bytes = fsize - 12
+         n_anim_bones = rot_bytes * 8 / 36  (each bone = 3 × 12 bits)
+       Bones beyond n_anim_bones keep their bind-pose rotation (0,0,0). */
+    size_t rot_start = foff + 12;
+    int rot_bytes = fsize - 12;
+    if (rot_bytes < 0) rot_bytes = 0;
+    int n_anim_bones = (rot_bytes * 8) / 36;
+    if (n_anim_bones > n_parts) n_anim_bones = n_parts;
+    int max_words = (rot_bytes + 3) / 4;
+    if (max_words > 64) max_words = 64;
+
+    u32 words[64];
+    memset(words, 0, sizeof(words));
+    for (int wi = 0; wi < max_words; wi++) {
+        size_t woff = rot_start + (size_t)wi * 4;
+        words[wi] = (woff + 4 <= dsz) ? rd_u32(dec + woff) : 0;
+    }
+
+    int total_bits = rot_bytes * 8;
+    int bit_offset = 0;
+    for (int bi = 0; bi < n_anim_bones; bi++) {
+        u32 vals[3] = {0, 0, 0};
+        for (int ai = 0; ai < 3; ai++) {
+            u32 val = 0;
+            if (bit_offset + 12 <= total_bits) {
+                int word_idx = bit_offset / 32;
+                int bit_pos  = bit_offset % 32;
+                if (word_idx < max_words) {
+                    if (bit_pos <= 20) {
+                        val = (words[word_idx] >> bit_pos) & 0xFFF;
+                    } else {
+                        int lo_bits = 32 - bit_pos;
+                        u32 lo = (words[word_idx] >> bit_pos) & ((1u << lo_bits) - 1);
+                        int hi_bits = 12 - lo_bits;
+                        u32 hi = (word_idx + 1 < max_words) ?
+                            (words[word_idx + 1] & ((1u << hi_bits) - 1)) : 0;
+                        val = lo | (hi << lo_bits);
+                    }
+                }
+            }
+            vals[ai] = val;
+            bit_offset += 12;
+        }
+        /* Bitstream order is rx, ry, rz (sequential, no swap).
+           When the clip encodes fewer bones than the skeleton has parts
+           (n_anim_bones < n_parts), the rotation values use the opposite
+           angle convention: val represents -angle rather than +angle.
+           Negate by computing (4096 - val) & 0xFFF. */
+        for (int ai = 0; ai < 3; ai++) {
+            u32 v = vals[ai];
+            if (n_anim_bones < n_parts && v != 0)
+                v = (4096 - v) & 0xFFF;
+            bone_rots[bi][ai] = (f32)v * TWO_PI / 4096.0f;
+        }
+    }
+
+    /* ─── Hierarchical FK (matches game sub_459DB0) ───
+       Each bone:
+        1. Build local rotation matrix from bone's angles
+        2. Rotate bone offset by parent's accumulated matrix
+        3. Bone position = parent position + rotated offset
+        4. Accumulated matrix = local_mat * parent_mat             */
+    f32 bone_pos[50][3];
+    f32 bone_mat[50][9];
+
+    for (int bi = 0; bi < n_parts; bi++) {
+        int parent = model.parts_info[bi].parent;
+        f32 bx = (f32)model.parts_info[bi].bx;
+        f32 by = (f32)model.parts_info[bi].by;
+        f32 bz = (f32)model.parts_info[bi].bz;
+
+        f32 local_mat[9];
+        build_rot_matrix(bone_rots[bi][0], bone_rots[bi][1],
+                         bone_rots[bi][2], local_mat);
+
+        if (parent == -1 || parent >= n_parts) {
+            bone_pos[bi][0] = bx;
+            bone_pos[bi][1] = by;
+            bone_pos[bi][2] = bz;
+            memcpy(bone_mat[bi], local_mat, sizeof(f32) * 9);
+        } else {
+            /* Rotate bone offset by parent's accumulated matrix */
+            f32* pm = bone_mat[parent];
+            f32 rbx = pm[0]*bx + pm[1]*by + pm[2]*bz;
+            f32 rby = pm[3]*bx + pm[4]*by + pm[5]*bz;
+            f32 rbz = pm[6]*bx + pm[7]*by + pm[8]*bz;
+
+            bone_pos[bi][0] = bone_pos[parent][0] + rbx;
+            bone_pos[bi][1] = bone_pos[parent][1] + rby;
+            bone_pos[bi][2] = bone_pos[parent][2] + rbz;
+
+            /* Accumulated matrix = parent × local (matches game GTE: sub_5F4EF0) */
+            mat3x3_mul(pm, local_mat, bone_mat[bi]);
+        }
+    }
+
+    /* ─── Transform vertices ─── */
+    if (!model.mesh.verts || !model.vert_src || !model.pool) return false;
+    for (int vi = 0; vi < model.mesh.vert_count && vi < model.vert_src_count; vi++) {
+        const EmdModel::VertSrc& vs = model.vert_src[vi];
+        if (vs.pool_idx < 0 || vs.pool_idx >= model.pool_count) continue;
+        const EmdModel::PoolVert& pv = model.pool[vs.pool_idx];
+        /* For mirrored parts, pool_idx points to the source part's vertex
+           whose bone_idx is the source bone (e.g. left hand).  Use dest_bone
+           which is the actual part index (e.g. right hand) so the mirror
+           vertices follow the correct bone in the FK hierarchy.
+           Local X must also be negated because in the mirror bone's local
+           space the vertex is at (-vx, vy, vz). */
+        int bidx = vs.is_mirror ? vs.dest_bone : (int)pv.bone_idx;
+        if (bidx >= n_parts) bidx = 0;
+
+        f32* wr = bone_mat[bidx];
+        f32* wp = bone_pos[bidx];
+        f32 lx = (f32)pv.x, ly = (f32)pv.y, lz = (f32)pv.z;
+        if (vs.is_mirror) lx = -lx;
+
+        f32 rx2 = wr[0]*lx + wr[1]*ly + wr[2]*lz;
+        f32 ry2 = wr[3]*lx + wr[4]*ly + wr[5]*lz;
+        f32 rz2 = wr[6]*lx + wr[7]*ly + wr[8]*lz;
+
+        f32 wx = -(wp[0] + rx2);
+        f32 wy = -(wp[1] + ry2);
+        f32 wz = -(wp[2] + rz2);
+
+        /* Guard against degenerate values */
+        if (wx != wx || wy != wy || wz != wz) continue;
+        if (wx > 100000.0f || wx < -100000.0f ||
+            wy > 100000.0f || wy < -100000.0f ||
+            wz > 100000.0f || wz < -100000.0f) continue;
+
+        model.mesh.verts[vi].x = wx;
+        model.mesh.verts[vi].y = wy;
+        model.mesh.verts[vi].z = wz;
+
+        /* Transform normal by bone rotation matrix (no translation) */
+        if (vs.pool_idx < model.pool_count) {
+            size_t noff = model.norm_pool_off + (size_t)vs.pool_idx * 8;
+            if (noff + 6 <= model.raw_dec_size) {
+                f32 lnx = (f32)rd_s16(model.raw_dec + noff);
+                f32 lny = (f32)rd_s16(model.raw_dec + noff + 2);
+                f32 lnz = (f32)rd_s16(model.raw_dec + noff + 4);
+                if (vs.is_mirror) lnx = -lnx;
+                f32 rnx = wr[0]*lnx + wr[1]*lny + wr[2]*lnz;
+                f32 rny = wr[3]*lnx + wr[4]*lny + wr[5]*lnz;
+                f32 rnz = wr[6]*lnx + wr[7]*lny + wr[8]*lnz;
+                /* Apply same coordinate transform as vertices */
+                model.mesh.verts[vi].nx = -rnx;
+                model.mesh.verts[vi].ny = -rny;
+                model.mesh.verts[vi].nz = -rnz;
+            }
+        }
+    }
+
+    /* Update skeleton abs_pos for bone visualization */
+    for (int bi = 0; bi < n_parts; bi++) {
+        model.skeleton.abs_pos[bi][0] = -bone_pos[bi][0];
+        model.skeleton.abs_pos[bi][1] = -bone_pos[bi][1];
+        model.skeleton.abs_pos[bi][2] = -bone_pos[bi][2];
+    }
+
+    return true;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  MIPS Code Detection
+ *═══════════════════════════════════════════════════════════════════*/
+bool is_mips_code_dec(const u8* dec_data, size_t dec_size)
+{
+    if (dec_size < 64) return false;
+
+    int real_mips = 0;
+    int nops = 0;
+    int total = 0;
+    for (size_t i = 0; i < 32 && i * 4 + 4 <= dec_size; i++) {
+        u32 instr = rd_u32(dec_data + i * 4);
+        total++;
+        if (instr == 0x00000000) { nops++; continue; }
+        u16 hi = (u16)(instr >> 16);
+        u8 op = (u8)(hi >> 10);
+        (void)op;
+        if (hi == 0x27BD || hi == 0xAFBF || hi == 0xAFB0 ||
+            (hi & 0xFF00) == 0x3C00 ||
+            (hi & 0xFC00) == 0x0C00 ||
+            (hi & 0xFC00) == 0x1000 ||
+            (hi & 0xFC00) == 0x1400 ||
+            hi == 0x03E0 ||
+            hi == 0x0800)
+            real_mips++;
+    }
+    return real_mips >= 3;
+}
+
+bool is_mips_code(const u8* data, size_t size, u16 ey, u16 ex)
+{
+    (void)ex;
+    if (!(ey & 0x8000)) return false;
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return is_mips_code_dec(dec.data, dec.size);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Weapon Data Detection
+ *
+ *  Weapon LZSS0 blobs contain PS1 GPU display list packets
+ *  (pre-built polygon commands) with a skeleton/bone header.
+ *  Characteristics:
+ *  - Starts with zero-padded header (24+ bytes of 0x00)
+ *  - Contains sequential bone parent indices (small u16 values 9-18 etc)
+ *  - Contains PS1 GPU polygon commands (0x20-0x3F command bytes)
+ *  - No valid MIPS prologue instructions
+ *  - No valid mesh section pointers (room/door/EMD style)
+ *═══════════════════════════════════════════════════════════════════*/
+bool is_weapon_data_dec(const u8* dec_data, size_t dec_size)
+{
+    if (dec_size < 256) return false;
+
+    int leading_zeros = 0;
+    for (size_t i = 0; i < 64 && i < dec_size; i++) {
+        if (dec_data[i] == 0) leading_zeros++;
+        else break;
+    }
+    if (leading_zeros < 16) return false;
+
+    int gpu_cmds = 0;
+    for (size_t i = 0; i < dec_size - 3; i += 4) {
+        u8 cmd = dec_data[i + 3];
+        if (cmd >= 0x20 && cmd <= 0x3F) gpu_cmds++;
+    }
+
+    return gpu_cmds >= 15;
+}
+
+bool is_weapon_data(const u8* data, size_t size, u16 ey, u16 ex)
+{
+    (void)ex;
+    if (!(ey & 0x8000)) return false;
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return is_weapon_data_dec(dec.data, dec.size);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  RDT Scene Detection  -  room mesh + instanced sub-objects
+ *
+ *  Structure:
+ *    [0x00]  Inline mesh sections (40-byte tris, 52-byte quads)
+ *    [after] Instance table:
+ *      Record 0 (8 bytes): vert_ptr, normal_ptr (shared vertex pool)
+ *      Record N (20 bytes): tri_face_ptr, quad_face_ptr,
+ *                           tri_count, quad_count,
+ *                           pos_x, pos_y, pos_z, rotation
+ *    [after] Vertex data, normal data, indexed face data
+ *    [after] Metadata (collision, cameras, scripts, etc.)
+ *═══════════════════════════════════════════════════════════════════*/
+bool is_rdt_scene(const u8* data, size_t size, u16 ey, u16 ex)
+{
+    RdtLayout layout;
+    if (!parse_rdt_layout_from_entry(data, size, ey, ex, layout))
+        return false;
+    /* RDT scene = has room mesh sections (with or without EMDs) */
+    return layout.section_count > 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Parse RDT Scene  -  room mesh + instanced sub-objects
+ *═══════════════════════════════════════════════════════════════════*/
+bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
+                        Mesh& mesh,
+                        const u32* exclude_offsets, int n_exclude)
+{
+    if (dec_size < 64) return false;
+
+    u32 base = base_addr;
+
+    Array<MeshVert> verts;
+    Array<MeshTri>  tris;
+    verts.reserve(8192);
+    tris.reserve(8192);
+
+    /* ─── Phase 0: Extract SCD opcode 0x23 section transforms ───
+     *
+     * The RDT header has 7 PSX pointers at offset 0x00.
+     * ptr[5] = SCD bytecode base (script data).
+     * Within the scripts, opcode 0x23 (32 bytes) registers inline mesh
+     * sections as room models with world-space transforms:
+     *
+     *   [0]  u8  opcode (0x23)
+     *   [1]  u8  model_slot
+     *   [8]  u32 section_ptr (PSX addr of section header in this blob)
+     *   [12] s16 pos_x       → model table offset +32
+     *   [14] s16 pos_y       → model table offset +34
+     *   [16] s16 pos_z       → model table offset +36
+     *   [18] s16 rot_x       → model table offset +40
+     *   [20] s16 rot_y       → model table offset +42
+     *   [22] s16 rot_z       → model table offset +44
+     *
+     * Sections with pos=(0,0,0) already have world-space vertex data.
+     * Non-zero positions indicate origin-centered mesh that needs placement.
+     */
+
+    struct ScdTransform {
+        u32 section_off;   /* file offset of section header */
+        s16 px, py, pz;   /* world position */
+        s16 rx, ry, rz;   /* rotation (4096 = 360 deg) */
+        bool alternate;    /* true if conditional variant (same pos as another) */
+    };
+    ScdTransform scd_xforms[64];
+    int n_scd_xforms = 0;
+
+    /* Check RDT header validity */
+    size_t mesh_start = 0;
+    size_t mesh_end = dec_size;
+    bool has_rdt_hdr = false;
+    {
+        u32 p0 = rd_u32(dec_data);
+        u32 p0_off = p0 - base;
+        if (p0_off > 0 && p0_off < dec_size && p0_off > 0x100) {
+            has_rdt_hdr = true;
+            size_t meta_min = dec_size;
+            for (int si = 0; si < 7; si++) {
+                if ((size_t)si * 4 + 4 > dec_size) break;
+                u32 sp = rd_u32(dec_data + si * 4) - base;
+                if (sp > 0x40 && sp < meta_min)
+                    meta_min = sp;
+            }
+            mesh_start = 0x1C;
+            mesh_end = meta_min;
+
+            /* Read ptr[5] = SCD bytecode base */
+            u32 scd_raw = rd_u32(dec_data + 5 * 4);
+            u32 scd_off = scd_raw - base;
+            if (scd_off < dec_size && scd_off > mesh_end) {
+                /* SCD starts with a table of u32 offsets to script entry points.
+                 * Walk each script using correct opcode sizes to avoid false positives.
+                 * Duplicate section transforms are merged by section_off.
+                 * Conditional variant meshes (same position, different section) are
+                 * merged by position — only the first variant is kept. */
+                u32 first_off = rd_u32(dec_data + scd_off);
+                int n_scripts = 0;
+                if (first_off >= 4 && first_off <= 0x1000 && (first_off & 3) == 0)
+                    n_scripts = (int)(first_off / 4);
+                if (n_scripts > 64) n_scripts = 64;
+
+                /* Opcode 0x28 size by type */
+                static const int op28sz[] = {48,40,32,36,44,32,32,52,32,32,32,32};
+                /* Fixed opcode sizes (index = opcode).
+                   0x04=endif(1B), 0x10/0x11=control(1B).
+                   0x0A=return(0=terminal), 0x0C=jump(0=handled separately). */
+                static const u8 opsz[0x70] = {
+                    1, 4, 4, 4, 1, 4, 4, 4, 4, 8, 0, 4, 0, 4, 4, 4,
+                    1, 1, 4, 4, 4, 8, 4, 4, 4, 1, 1, 1, 1, 1, 1, 1,
+                   24, 8, 4,32, 8, 4, 4, 4, 0, 8, 8, 8, 4, 4,20, 4,
+                    4, 4, 4, 4, 4, 8, 8, 8, 4, 4,12, 4, 8,12, 4, 8,
+                   12, 4,20, 8, 8, 8, 8, 4, 4, 4, 4,12,32, 8, 8, 8,
+                    8, 8, 4,12, 4,12,28, 8, 8,20, 8,44, 4, 4,20,12,
+                    4, 4, 8, 8, 4, 4, 4, 8, 8, 4, 8, 4, 4, 4, 4, 4,
+                };
+
+                for (int si = 0; si < n_scripts; si++) {
+                    if (scd_off + (size_t)si * 4 + 4 > dec_size) break;
+                    u32 srel = rd_u32(dec_data + scd_off + si * 4);
+                    size_t pc = scd_off + srel;
+                    if (pc >= dec_size) continue;
+
+                    int steps = 0;
+                    while (pc < dec_size && steps < 2000) {
+                        u8 op = dec_data[pc];
+
+                        /* Relative jump: follow */
+                        if (op == 0x0C) {
+                            if (pc + 4 > dec_size) break;
+                            s16 jump = rd_s16(dec_data + pc + 2);
+                            size_t tgt = (size_t)((int)pc + (int)jump);
+                            if (tgt >= dec_size || tgt < scd_off) break;
+                            pc = tgt; steps++; continue;
+                        }
+
+                        /* Compute advance */
+                        int adv = 0;
+                        if (op == 0x00 || (op >= 0x19 && op <= 0x1F) || op >= 0x70)
+                            adv = 1;
+                        else if (op == 0x05 || op == 0x0F) adv = 4;
+                        else if (op == 0x28 && pc + 3 <= dec_size)
+                            adv = (dec_data[pc+2] < 12) ? op28sz[dec_data[pc+2]] : 32;
+                        else if (op < 0x70) adv = opsz[op];
+                        if (adv <= 0) break;
+
+                        /* Extract 0x23 section transforms */
+                        if (op == 0x23 && pc + 32 <= dec_size) {
+                            u8 slot = dec_data[pc + 1];
+                            if (slot <= 36) {
+                                u32 sec_ptr_raw = rd_u32(dec_data + pc + 8);
+                                u32 sec_off;
+                                if (sec_ptr_raw >= base && (sec_ptr_raw - base) < dec_size)
+                                    sec_off = sec_ptr_raw - base;
+                                else if (sec_ptr_raw < dec_size)
+                                    sec_off = sec_ptr_raw;
+                                else { pc += adv; steps++; continue; }
+
+                                if (sec_off >= mesh_start && sec_off + 12 <= mesh_end) {
+                                    u32 sp1 = rd_u32(dec_data + sec_off) - base;
+                                    u32 sp2 = rd_u32(dec_data + sec_off + 4) - base;
+                                    u16 sc1 = rd_u16(dec_data + sec_off + 8);
+                                    u16 sc2 = rd_u16(dec_data + sec_off + 10);
+                                    if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
+                                        s16 px = rd_s16(dec_data + pc + 12);
+                                        s16 py = rd_s16(dec_data + pc + 14);
+                                        s16 pz = rd_s16(dec_data + pc + 16);
+                                        s16 rx = rd_s16(dec_data + pc + 18);
+                                        s16 ry = rd_s16(dec_data + pc + 20);
+                                        s16 rz = rd_s16(dec_data + pc + 22);
+
+                                        if (n_scd_xforms < 64) {
+                                            /* Dedup by section_off */
+                                            bool dup = false;
+                                            for (int di = 0; di < n_scd_xforms; di++) {
+                                                if (scd_xforms[di].section_off == sec_off) { dup = true; break; }
+                                            }
+                                            if (!dup) {
+                                                ScdTransform& x = scd_xforms[n_scd_xforms++];
+                                                x.section_off = (u32)sec_off;
+                                                x.px = px; x.py = py; x.pz = pz;
+                                                x.rx = rx; x.ry = ry; x.rz = rz;
+                                                x.alternate = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Extract 0x28 type 4 door section pointers.
+                           sub_426DFC positions the section at door zone center. */
+                        if (op == 0x28 && pc + 3 <= dec_size && dec_data[pc + 2] == 4 && pc + 44 <= dec_size) {
+                            u8 mdl_slot = dec_data[pc + 34];
+                            if (mdl_slot != 0xFF) {
+                                u32 dsec_raw = rd_u32(dec_data + pc + 36);
+                                u32 dsec_off = dsec_raw - base;
+                                if (dsec_off >= mesh_start && dsec_off + 12 <= mesh_end) {
+                                    u32 dsp1 = rd_u32(dec_data + dsec_off) - base;
+                                    u32 dsp2 = rd_u32(dec_data + dsec_off + 4) - base;
+                                    u16 dsc1 = rd_u16(dec_data + dsec_off + 8);
+                                    u16 dsc2 = rd_u16(dec_data + dsec_off + 10);
+                                    if (dsp1 < dec_size && dsp2 < dec_size && dsc1 < 5000 && dsc2 < 5000) {
+                                        s16 a0 = rd_s16(dec_data + pc + 4);
+                                        s16 a1 = rd_s16(dec_data + pc + 6);
+                                        s16 a4 = rd_s16(dec_data + pc + 12);
+                                        s16 a5 = rd_s16(dec_data + pc + 14);
+                                        s16 cx = a4 + (s16)((a0 - a4) / 2);
+                                        s16 cz = a5 + (s16)((a1 - a5) / 2);
+                                        if (n_scd_xforms < 64) {
+                                            bool dup = false;
+                                            for (int di = 0; di < n_scd_xforms; di++)
+                                                if (scd_xforms[di].section_off == dsec_off) { dup = true; break; }
+                                            if (!dup) {
+                                                ScdTransform& x = scd_xforms[n_scd_xforms++];
+                                                x.section_off = dsec_off;
+                                                x.px = cx; x.py = 0; x.pz = cz;
+                                                x.rx = 0; x.ry = 0; x.rz = 0;
+                                                x.alternate = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        pc += (size_t)adv;
+                        steps++;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ─── Phase 1: Parse inline room mesh sections ─── */
+    size_t off = mesh_start;
+
+    int max_sections = 200;
+    while (off + 12 <= mesh_end && max_sections-- > 0) {
+        u32 p1 = rd_u32(dec_data + off) - base;
+        u32 p2 = rd_u32(dec_data + off + 4) - base;
+        u16 c1 = rd_u16(dec_data + off + 8);
+        u16 c2 = rd_u16(dec_data + off + 10);
+
+        if (p1 >= dec_size || p2 >= dec_size) break;
+        if (c1 > 5000 || c2 > 5000) break;
+        size_t tri_end  = p1 + (size_t)c1 * 40;
+        size_t quad_end = p2 + (size_t)c2 * 52;
+        if (tri_end > dec_size || quad_end > dec_size) break;
+        if (c1 == 0 && c2 == 0) { off += 12; continue; }
+
+        /* Check if this section should be excluded (rendered via mesh_apply_xforms) */
+        {
+            bool skip = false;
+            for (int ei = 0; ei < n_exclude; ei++)
+                if ((u32)off == exclude_offsets[ei]) { skip = true; break; }
+            if (skip) { off = quad_end; continue; }
+        }
+
+        /* Look up SCD transform for this section */
+        f32 tx = 0, ty = 0, tz = 0;
+        f32 cr = 1.0f, sr = 0.0f;
+        bool has_rot = false;
+        bool is_alt_section = false;
+        for (int xi = 0; xi < n_scd_xforms; xi++) {
+            if (scd_xforms[xi].section_off == (u32)off) {
+                tx = (f32)scd_xforms[xi].px;
+                ty = (f32)scd_xforms[xi].py;
+                tz = (f32)scd_xforms[xi].pz;
+                is_alt_section = scd_xforms[xi].alternate;
+                if (scd_xforms[xi].ry != 0) {
+                    f32 angle = (f32)scd_xforms[xi].ry * 6.2831853f / 4096.0f;
+                    cr = cosf(angle);
+                    sr = sinf(angle);
+                    has_rot = true;
+                }
+                break;
+            }
+        }
+
+        /* Parse inline triangles (40 bytes each) */
+        for (int i = 0; i < (int)c1; i++) {
+            size_t o = p1 + (size_t)i * 40;
+            if (o + 40 > dec_size) break;
+
+            s16 vs[3][3];
+            u8  uvs[3][2];
+            bool valid = true;
+            for (int vi = 0; vi < 3; vi++) {
+                vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+                vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+                vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+                u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+                uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+                for (int a = 0; a < 3; a++)
+                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                        valid = false;
+            }
+            if (!valid) continue;
+
+            u16 tp = rd_u16(dec_data + o + 24);
+            u16 cl = rd_u16(dec_data + o + 26);
+            u8 cols[3][3];
+            for (int ci = 0; ci < 3; ci++) {
+                cols[ci][0] = dec_data[o + 28 + ci * 4];
+                cols[ci][1] = dec_data[o + 28 + ci * 4 + 1];
+                cols[ci][2] = dec_data[o + 28 + ci * 4 + 2];
+            }
+
+            u32 bi = (u32)verts.count;
+            for (int vi = 0; vi < 3; vi++) {
+                f32 lx = (f32)vs[vi][0];
+                f32 ly = (f32)vs[vi][1];
+                f32 lz = (f32)vs[vi][2];
+                if (has_rot) {
+                    f32 rx = cr * lx + sr * lz;
+                    f32 rz = -sr * lx + cr * lz;
+                    lx = rx; lz = rz;
+                }
+                MeshVert mv = {};
+                mv.x = -(lx + tx);
+                mv.y = -(ly + ty);
+                mv.z = (lz + tz);
+                verts.push(mv);
+            }
+            MeshTri t = {};
+            t.alt = is_alt_section ? 1 : 0;
+            t.src_off = (u32)off;
+            t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
+            t.color = avg_colors(cols, 3);
+            t.tpage = tp; t.clut = cl;
+            t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
+            t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
+            t.uv[2][0] = uvs[1][0]; t.uv[2][1] = uvs[1][1];
+            tris.push(t);
+        }
+
+        /* Parse inline quads (52 bytes each) */
+        for (int i = 0; i < (int)c2; i++) {
+            size_t o = p2 + (size_t)i * 52;
+            if (o + 52 > dec_size) break;
+
+            s16 vs[4][3];
+            u8  uvs[4][2];
+            bool valid = true;
+            for (int vi = 0; vi < 4; vi++) {
+                vs[vi][0] = rd_s16(dec_data + o + vi * 8);
+                vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
+                vs[vi][2] = rd_s16(dec_data + o + vi * 8 + 4);
+                u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
+                uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
+                for (int a = 0; a < 3; a++)
+                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
+                        valid = false;
+            }
+            if (!valid) continue;
+
+            u16 tp = rd_u16(dec_data + o + 32);
+            u16 cl = rd_u16(dec_data + o + 34);
+            u8 cols[4][3];
+            for (int ci = 0; ci < 4; ci++) {
+                cols[ci][0] = dec_data[o + 36 + ci * 4];
+                cols[ci][1] = dec_data[o + 36 + ci * 4 + 1];
+                cols[ci][2] = dec_data[o + 36 + ci * 4 + 2];
+            }
+
+            u32 bi = (u32)verts.count;
+            RGBA8 c = avg_colors(cols, 4);
+            for (int vi = 0; vi < 4; vi++) {
+                f32 lx = (f32)vs[vi][0];
+                f32 ly = (f32)vs[vi][1];
+                f32 lz = (f32)vs[vi][2];
+                if (has_rot) {
+                    f32 rx = cr * lx + sr * lz;
+                    f32 rz = -sr * lx + cr * lz;
+                    lx = rx; lz = rz;
+                }
+                MeshVert mv = {};
+                mv.x = -(lx + tx);
+                mv.y = -(ly + ty);
+                mv.z = (lz + tz);
+                verts.push(mv);
+            }
+            MeshTri t1 = {};
+            t1.alt = is_alt_section ? 1 : 0;
+            t1.src_off = (u32)off;
+            t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;  /* reversed for X negate */
+            t1.color = c; t1.tpage = tp; t1.clut = cl;
+            t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
+            t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
+            t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
+            tris.push(t1);
+            MeshTri t2 = {};
+            t2.alt = is_alt_section ? 1 : 0;
+            t2.src_off = (u32)off;
+            t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;  /* reversed */
+            t2.color = c; t2.tpage = tp; t2.clut = cl;
+            t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
+            t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
+            t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
+            tris.push(t2);
+        }
+
+        off = quad_end;
+    }
+
+    int room_verts = verts.count;
+    int room_tris  = tris.count;
+
+    /* ─── Phase 2: DISABLED ───
+     * The instance table after inline sections contains EMD character mesh
+     * data (skeletal body parts with bone-local positions), NOT room geometry.
+     * Including it dumps untransformed body parts at origin as a triangle pile.
+     * Character meshes are placed via SCD opcode 0x20 and need proper skeletal
+     * animation to render correctly. Skip directly to finalize. */
+    goto finalize;
+
+    /* Record 0: shared vertex_ptr + normal_ptr */
+    if (off + 8 > dec_size) goto finalize;
+    {
+        u32 vp_off = rd_u32(dec_data + off) - base;
+        u32 np_off = rd_u32(dec_data + off + 4) - base;
+        if (vp_off >= dec_size || np_off >= dec_size || np_off <= vp_off)
+            goto finalize;
+
+        int n_shared_verts = (int)(np_off - vp_off) / 8;
+        if (n_shared_verts < 4 || n_shared_verts > 10000) goto finalize;
+
+        /* Validate: data at vp_off should look like vertices */
+        {
+            s16 tx = rd_s16(dec_data + vp_off);
+            s16 ty = rd_s16(dec_data + vp_off + 2);
+            if (tx > 5000 || tx < -5000 || ty > 5000 || ty < -5000)
+                goto finalize;
+        }
+
+        /* Read shared vertex pool  -  skip padding entries
+           (some slots contain ASCII text like "Ryuta..." as separators) */
+        Array<MeshVert> shared_verts;
+        shared_verts.reserve(n_shared_verts);
+        for (int i = 0; i < n_shared_verts; i++) {
+            size_t vo = vp_off + (size_t)i * 8;
+            if (vo + 6 > dec_size) break;
+            MeshVert mv = {};
+            s16 sx = rd_s16(dec_data + vo);
+            s16 sy = rd_s16(dec_data + vo + 2);
+            s16 sz = rd_s16(dec_data + vo + 4);
+            mv.x = (f32)sx;
+            mv.y = (f32)(-sy);
+            mv.z = (f32)sz;
+            shared_verts.push(mv);
+        }
+
+        /* Skip record 0 (8 bytes) */
+        size_t inst_off = off + 8;
+
+        /* Skip record 1 if present (24 bytes: full model aggregate).
+           Detect it: same face pointer range as all sub-instances combined.
+           It has 4 extra bytes compared to standard 20-byte records. */
+        if (inst_off + 24 <= dec_size) {
+            u32 r1p1 = rd_u32(dec_data + inst_off);
+            u32 r1p2 = rd_u32(dec_data + inst_off + 4);
+            u32 r1o1 = r1p1 - base;
+            u32 r1o2 = r1p2 - base;
+            if (r1o1 < dec_size && r1o2 < dec_size) {
+                /* Check if next record (at +24) also starts with valid ptrs */
+                if (inst_off + 24 + 8 <= dec_size) {
+                    u32 np1 = rd_u32(dec_data + inst_off + 24) - base;
+                    u32 np2 = rd_u32(dec_data + inst_off + 28) - base;
+                    if (np1 < dec_size && np2 < dec_size) {
+                        /* Record 1 is 24 bytes (aggregate)  -  skip it */
+                        inst_off += 24;
+                    }
+                }
+            }
+        }
+
+        /* Parse instance records (20 bytes each):
+           u32 tri_face_ptr, quad_face_ptr
+           u16 tri_count, quad_count
+           s16 pos_x, pos_y, pos_z, rotation
+           The last record may be truncated (12 bytes: ptrs+counts only)
+           if it abuts the vertex pool. Use origin position for such cases. */
+        int max_instances = 200;
+        while (inst_off + 12 <= dec_size && max_instances-- > 0) {
+            u32 tri_ptr_off  = rd_u32(dec_data + inst_off) - base;
+            u32 quad_ptr_off = rd_u32(dec_data + inst_off + 4) - base;
+
+            /* Stop if pointers aren't valid */
+            if (tri_ptr_off >= dec_size || quad_ptr_off >= dec_size)
+                break;
+
+            u16 tri_count  = rd_u16(dec_data + inst_off + 8);
+            u16 quad_count = rd_u16(dec_data + inst_off + 10);
+
+            /* Position + rotation: available only if full 20-byte record
+               fits before the vertex pool. Otherwise use origin (0,0,0). */
+            s16 pos_x = 0, pos_y = 0, pos_z = 0, rot_raw = 0;
+            if (inst_off + 20 <= vp_off) {
+                pos_x   = rd_s16(dec_data + inst_off + 12);
+                pos_y   = rd_s16(dec_data + inst_off + 14);
+                pos_z   = rd_s16(dec_data + inst_off + 16);
+                rot_raw = rd_s16(dec_data + inst_off + 18);
+            }
+
+            inst_off += (inst_off + 20 <= vp_off) ? 20 : 12;
+
+            if (tri_count == 0 && quad_count == 0) continue;
+            if (tri_count > 5000 || quad_count > 5000) break;
+
+            /* Validate face data ranges */
+            if (tri_ptr_off + (size_t)tri_count * 16 > dec_size) continue;
+            if (quad_ptr_off + (size_t)quad_count * 20 > dec_size) continue;
+
+            /* Offset into the output vertex array for this instance */
+            u32 base_idx = (u32)verts.count;
+
+            /* Precompute Y-axis rotation for this instance */
+            f32 rot_angle = (f32)rot_raw * 6.2831853f / 4096.0f;
+            f32 cr = cosf(rot_angle);
+            f32 sr = sinf(rot_angle);
+
+            /* Copy shared vertices with Y rotation + position offset */
+            for (int i = 0; i < (int)shared_verts.count; i++) {
+                f32 lx = shared_verts[i].x;
+                f32 ly = shared_verts[i].y;
+                f32 lz = shared_verts[i].z;
+                MeshVert mv = {};
+                mv.x = -((cr * lx + sr * lz) + (f32)pos_x);
+                mv.y = ly + (f32)(-pos_y);
+                mv.z = (-sr * lx + cr * lz) + (f32)pos_z;
+                verts.push(mv);
+            }
+
+            /* Parse 16-byte indexed triangles:
+               u16 idx0, idx1, idx2
+               u8  u0, v0
+               u8  u1, v1
+               u16 CLUT
+               u8  u2, v2
+               u16 tpage */
+            for (int i = 0; i < (int)tri_count; i++) {
+                size_t o = tri_ptr_off + (size_t)i * 16;
+                if (o + 16 > dec_size) break;
+
+                u16 i0 = rd_u16(dec_data + o);
+                u16 i1 = rd_u16(dec_data + o + 2);
+                u16 i2 = rd_u16(dec_data + o + 4);
+                if (i0 >= (u16)shared_verts.count ||
+                    i1 >= (u16)shared_verts.count ||
+                    i2 >= (u16)shared_verts.count)
+                    continue;
+
+                /* Skip faces referencing padding/separator verts */
+                const MeshVert& sv0 = shared_verts[i0];
+                const MeshVert& sv1 = shared_verts[i1];
+                const MeshVert& sv2 = shared_verts[i2];
+                if (sv0.x > MAX_COORD || sv0.x < -MAX_COORD ||
+                    sv1.x > MAX_COORD || sv1.x < -MAX_COORD ||
+                    sv2.x > MAX_COORD || sv2.x < -MAX_COORD)
+                    continue;
+
+                MeshTri t = {};
+                t.alt = 0;
+                t.idx[0] = base_idx + i0;
+                t.idx[1] = base_idx + i2;  /* reversed for X negate */
+                t.idx[2] = base_idx + i1;
+                t.uv[0][0] = dec_data[o + 6]; t.uv[0][1] = dec_data[o + 7];
+                t.uv[1][0] = dec_data[o + 12]; t.uv[1][1] = dec_data[o + 13];
+                t.clut     = rd_u16(dec_data + o + 10);
+                t.tpage    = rd_u16(dec_data + o + 14);
+                t.uv[2][0] = dec_data[o + 8]; t.uv[2][1] = dec_data[o + 9];
+                t.color = RGBA8(128, 128, 128, 255);
+                tris.push(t);
+            }
+
+            /* Parse 20-byte indexed quads:
+               u16 idx0, idx1, idx2, idx3
+               u8  u0, v0
+               u16 CLUT
+               u8  u1, v1
+               u16 tpage
+               u8  u2, v2
+               u8  u3, v3 */
+            for (int i = 0; i < (int)quad_count; i++) {
+                size_t o = quad_ptr_off + (size_t)i * 20;
+                if (o + 20 > dec_size) break;
+
+                u16 i0 = rd_u16(dec_data + o);
+                u16 i1 = rd_u16(dec_data + o + 2);
+                u16 i2 = rd_u16(dec_data + o + 4);
+                u16 i3 = rd_u16(dec_data + o + 6);
+                if (i0 >= (u16)shared_verts.count ||
+                    i1 >= (u16)shared_verts.count ||
+                    i2 >= (u16)shared_verts.count ||
+                    i3 >= (u16)shared_verts.count)
+                    continue;
+
+                /* Skip faces referencing padding/separator verts */
+                const MeshVert& sv0 = shared_verts[i0];
+                const MeshVert& sv1 = shared_verts[i1];
+                if (sv0.x > MAX_COORD || sv0.x < -MAX_COORD ||
+                    sv1.x > MAX_COORD || sv1.x < -MAX_COORD)
+                    continue;
+
+                u16 tp = rd_u16(dec_data + o + 14);
+                u16 cl = rd_u16(dec_data + o + 10);
+                RGBA8 col(128, 128, 128, 255);
+
+                /* Quad → 2 triangles, reversed for X negate */
+                MeshTri t1 = {};
+                t1.alt = 0;
+                t1.idx[0] = base_idx + i0;
+                t1.idx[1] = base_idx + i2;  /* reversed */
+                t1.idx[2] = base_idx + i1;
+                t1.color = col; t1.tpage = tp; t1.clut = cl;
+                t1.uv[0][0] = dec_data[o + 8];  t1.uv[0][1] = dec_data[o + 9];
+                t1.uv[1][0] = dec_data[o + 16]; t1.uv[1][1] = dec_data[o + 17];
+                t1.uv[2][0] = dec_data[o + 12]; t1.uv[2][1] = dec_data[o + 13];
+                tris.push(t1);
+
+                MeshTri t2 = {};
+                t2.alt = 0;
+                t2.idx[0] = base_idx + i1;
+                t2.idx[1] = base_idx + i2;  /* reversed */
+                t2.idx[2] = base_idx + i3;
+                t2.color = col; t2.tpage = tp; t2.clut = cl;
+                t2.uv[0][0] = dec_data[o + 12]; t2.uv[0][1] = dec_data[o + 13];
+                t2.uv[1][0] = dec_data[o + 16]; t2.uv[1][1] = dec_data[o + 17];
+                t2.uv[2][0] = dec_data[o + 18]; t2.uv[2][1] = dec_data[o + 19];
+                tris.push(t2);
+            }
+        }
+    }
+
+finalize:
+    if (tris.count == 0) return false;
+
+    /* Copy to output mesh */
+    mesh.alloc(verts.count, tris.count);
+    for (int i = 0; i < (int)verts.count; i++)
+        mesh.verts[i] = verts[i];
+    for (int i = 0; i < (int)tris.count; i++)
+        mesh.tris[i] = tris[i];
+
+    (void)room_verts; (void)room_tris;
+    return true;
+}
+
+
+bool parse_rdt_scene(const u8* data, size_t size, u32 base_addr, Mesh& mesh)
+{
+    Buffer dec;
+    if (!lzss_decompress(data, size, dec)) return false;
+    return parse_rdt_scene_dec(dec.data, dec.size, base_addr, mesh);
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  OBJ Export
+ *═══════════════════════════════════════════════════════════════════*/
+bool export_mesh_obj(const char* path, const Mesh& mesh)
+{
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+
+    fprintf(f, "# RaptorScope - Dino Crisis Mesh Export\n");
+    fprintf(f, "# Vertices: %d  Faces: %d\n\n", mesh.vert_count, mesh.tri_count);
+
+    /* Vertices with positions (transforms already baked into mesh.verts) */
+    for (int i = 0; i < mesh.vert_count; i++)
+        fprintf(f, "v %f %f %f\n", mesh.verts[i].x, mesh.verts[i].y, mesh.verts[i].z);
+
+    fprintf(f, "\n");
+
+    /* Normals */
+    bool has_normals = false;
+    for (int i = 0; i < mesh.vert_count; i++) {
+        const MeshVert& v = mesh.verts[i];
+        if (v.nx != 0 || v.ny != 0 || v.nz != 0) { has_normals = true; break; }
+    }
+    if (has_normals) {
+        for (int i = 0; i < mesh.vert_count; i++)
+            fprintf(f, "vn %f %f %f\n", mesh.verts[i].nx, mesh.verts[i].ny, mesh.verts[i].nz);
+        fprintf(f, "\n");
+    }
+
+    /* Per-face vertex colors (xOBJ/MeshLab extension: "vc R G B" per face) */
+    /* We emit per-face color as a comment, and also write a companion .mtl
+       with per-face materials if desired. For Blender compatibility,
+       embed colors via the unofficial "# vc r g b a" comment per face. */
+    fprintf(f, "# Per-face vertex colors (R G B 0-255):\n");
+    for (int i = 0; i < mesh.tri_count; i++) {
+        const MeshTri& t = mesh.tris[i];
+        if (has_normals)
+            fprintf(f, "f %u//%u %u//%u %u//%u",
+                t.idx[0]+1, t.idx[0]+1, t.idx[1]+1, t.idx[1]+1, t.idx[2]+1, t.idx[2]+1);
+        else
+            fprintf(f, "f %u %u %u", t.idx[0]+1, t.idx[1]+1, t.idx[2]+1);
+        fprintf(f, " # vc %d %d %d\n", t.color.r, t.color.g, t.color.b);
+    }
+
+    fclose(f);
+    return true;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  SMD Export — Valve StudioModel Data
+ *  Supports: bones (hierarchy), bone-weighted vertices, triangles,
+ *  normals, UVs, materials. Skinned meshes export in bind pose
+ *  with bone transforms baked from the EMD skeleton.
+ *═══════════════════════════════════════════════════════════════════*/
+bool export_emd_smd(const char* path, const EmdModel& emd)
+{
+    if (!emd.valid) return false;
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+
+    const Mesh& mesh = emd.mesh;
+    const EmdSkeleton& skel = emd.skeleton;
+
+    fprintf(f, "version 1\n");
+
+    /* ── Bone hierarchy ── */
+    fprintf(f, "nodes\n");
+    for (int i = 0; i < skel.bone_count; i++) {
+        const char* name = get_bone_name(skel.bone_count, i);
+        char fallback[32];
+        if (!name) { _snprintf(fallback, 31, "bone_%02d", i); name = fallback; }
+        int parent = (i == 0) ? -1 : (int)skel.bones[i].parent;
+        fprintf(f, "  %d \"%s\" %d\n", i, name, parent);
+    }
+    fprintf(f, "end\n");
+
+    /* ── Bind pose (frame 0) ── */
+    fprintf(f, "skeleton\n");
+    fprintf(f, "time 0\n");
+    for (int i = 0; i < skel.bone_count; i++) {
+        /* Local offset from parent */
+        float tx = (float)skel.bones[i].bx;
+        float ty = (float)skel.bones[i].by;
+        float tz = (float)skel.bones[i].bz;
+        /* No rotation in bind pose (identity) */
+        fprintf(f, "  %d  %f %f %f  0.000000 0.000000 0.000000\n", i, tx, ty, tz);
+    }
+    fprintf(f, "end\n");
+
+    /* ── Triangles ── */
+    fprintf(f, "triangles\n");
+    for (int i = 0; i < mesh.tri_count; i++) {
+        const MeshTri& t = mesh.tris[i];
+
+        /* Material name from tpage */
+        fprintf(f, "tpage_%02d\n", t.tpage & 0x1F);
+
+        for (int v = 0; v < 3; v++) {
+            int vi = t.idx[v];
+            if (vi >= mesh.vert_count) continue;
+            const MeshVert& mv = mesh.verts[vi];
+
+            /* Determine bone assignment */
+            int bone = 0;
+            if (emd.vert_src && vi < emd.vert_src_count)
+                bone = emd.vert_src[vi].dest_bone;
+            if (bone < 0 || bone >= skel.bone_count) bone = 0;
+
+            /* Position (world space — already transformed by skeleton) */
+            float px = mv.x, py = mv.y, pz = mv.z;
+            float nx = mv.nx, ny = mv.ny, nz = mv.nz;
+            float nlen = sqrtf(nx*nx + ny*ny + nz*nz);
+            if (nlen < 0.001f) { nx = 0; ny = 1; nz = 0; }
+
+            /* UV */
+            float u = t.uv[v][0] / 255.0f;
+            float fv = t.uv[v][1] / 255.0f;
+
+            /* SMD format: parent_bone  px py pz  nx ny nz  u v  [links] */
+            fprintf(f, "  %d  %f %f %f  %f %f %f  %f %f  1  %d 1.000000\n",
+                bone, px, py, pz, nx, ny, nz, u, fv, bone);
+        }
+    }
+    fprintf(f, "end\n");
+
+    fclose(f);
+    return true;
+}
+
+/* Export static mesh as SMD (no bones, single root bone) */
+bool export_mesh_smd(const char* path, const Mesh& mesh)
+{
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+
+    fprintf(f, "version 1\n");
+    fprintf(f, "nodes\n");
+    fprintf(f, "  0 \"root\" -1\n");
+    fprintf(f, "end\n");
+    fprintf(f, "skeleton\n");
+    fprintf(f, "time 0\n");
+    fprintf(f, "  0  0.000000 0.000000 0.000000  0.000000 0.000000 0.000000\n");
+    fprintf(f, "end\n");
+    fprintf(f, "triangles\n");
+    for (int i = 0; i < mesh.tri_count; i++) {
+        const MeshTri& t = mesh.tris[i];
+        fprintf(f, "tpage_%02d\n", t.tpage & 0x1F);
+        for (int v = 0; v < 3; v++) {
+            int vi = t.idx[v];
+            if (vi >= mesh.vert_count) continue;
+            const MeshVert& mv = mesh.verts[vi];
+            float nx = mv.nx, ny = mv.ny, nz = mv.nz;
+            float nlen = sqrtf(nx*nx + ny*ny + nz*nz);
+            if (nlen < 0.001f) { nx = 0; ny = 1; nz = 0; }
+            float u = t.uv[v][0] / 255.0f;
+            float fv = t.uv[v][1] / 255.0f;
+            fprintf(f, "  0  %f %f %f  %f %f %f  %f %f\n",
+                mv.x, mv.y, mv.z, nx, ny, nz, u, fv);
+        }
+    }
+    fprintf(f, "end\n");
+    fclose(f);
+    return true;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Bone Name Lookup (auto-detect skeleton type by bone count)
+ *═══════════════════════════════════════════════════════════════════*/
+static const char* s_human_15[] = {
+    "root","shoulder_L","elbow_L","hand_L","shoulder_R","elbow_R","hand_R",
+    "neck","torso","thigh_L","knee_L","foot_L","thigh_R","knee_R","foot_R"
+};
+static const char* s_compy_7[] = {
+    "root","neck","head","thigh_R","thigh_L","tail_0","tail_1"
+};
+static const char* s_pteranodon_18[] = {
+    "root","neck","head","jaw",
+    "shoulder_L","elbow_L","hand_L","wing_L",
+    "shoulder_R","elbow_R","hand_R","wing_R",
+    "thigh_R","knee_R","foot_R","thigh_L","knee_L","foot_L"
+};
+static const char* s_trex_20[] = {
+    "root","torso","neck","head","jaw","shoulder_R","shoulder_L",
+    "thigh_R","knee_R","foot_R","toes_R",
+    "thigh_L","knee_L","foot_L","toes_L",
+    "tail_0","tail_1","tail_2","tail_3","tail_4"
+};
+static const char* s_raptor_21[] = {
+    "root","torso","neck","head","jaw",
+    "shoulder_R","hand_R","shoulder_L","hand_L",
+    "thigh_R","knee_R","foot_R","toes_R",
+    "tail_0","tail_1","tail_2","tail_3",
+    "thigh_L","knee_L","foot_L","toes_L"
+};
+static const char* s_therizino_22[] = {
+    "root","torso","neck","head","jaw",
+    "shoulder_R","elbow_R","hand_R","shoulder_L","elbow_L","hand_L",
+    "thigh_R","knee_R","foot_R","toes_R",
+    "thigh_L","knee_L","foot_L","toes_L",
+    "tail_0","tail_1","tail_2"
+};
+
+const char* get_bone_name(int bone_count, int bone_idx)
+{
+    const char** tbl = 0;
+    int n = 0;
+    switch (bone_count) {
+        case  7: tbl = s_compy_7;       n =  7; break;
+        case 15: tbl = s_human_15;      n = 15; break;
+        case 18: tbl = s_pteranodon_18; n = 18; break;
+        case 20: tbl = s_trex_20;       n = 20; break;
+        case 21: tbl = s_raptor_21;     n = 21; break;
+        case 22: tbl = s_therizino_22;  n = 22; break;
+    }
+    if (tbl && bone_idx >= 0 && bone_idx < n) return tbl[bone_idx];
+    return 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  parse_rdt_overlay  –  Extract non-mesh spatial data from RDT blob
+ *
+ *  Reads the 7 header pointers and extracts:
+ *    - Floor zones (ptr[6])     → trigger/transition quads
+ *    - Collision rects (ptr[1]) → walkable area rectangles
+ *    - Camera data (ptr[2])     → camera eye/target positions
+ *    - Door zones (ptr[4])      → room transition triggers
+ *    - SCD opcodes (ptr[5])     → model transforms, object spawns,
+ *                                  character placements
+ *═══════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════
+ *  parse_rdt_overlay  –  SCD Script Interpreter + Header Tables
+ *
+ *  Walks the SCD bytecode using the game's actual opcode sizes
+ *  (extracted from DINO.exe dispatch table at VA 0x6576A0).
+ *
+ *  Extracts:
+ *    - Collision rects (ptr[1])     → walkable floor areas
+ *    - Collision/trigger zones (0x28) → interaction quads
+ *    - Model transforms (0x23)      → section positioning
+ *    - Object spawns (0x42)         → dynamic item placement
+ *    - Character placements (0x20)  → EMD enemy/NPC positions
+ *    - Camera setups (0x4C)         → eye/target positions
+ *    - Floor zones (ptr[6])         → trigger/transition quads
+ *═══════════════════════════════════════════════════════════════════*/
+
+/* Opcode 0x28 size lookup by type field (byte[2]) */
+static int scd_op28_size(u8 type) {
+    static const int tbl[] = {48,40,32,36,44,32,32,52,32,32,32,32};
+    return (type < 12) ? tbl[type] : 32;
+}
+
+/* Compute opcode advance and whether it terminates the walk.
+   Returns advance amount in bytes, or 0 if we should stop. */
+static int scd_opcode_advance(const u8* dec, size_t dec_size, size_t pc) {
+    if (pc >= dec_size) return 0;
+    u8 op = dec[pc];
+
+    /* NOP/yield group: advance 1 byte */
+    if (op == 0x00 || (op >= 0x19 && op <= 0x1F) || op >= 0x70)
+        return 1;
+
+    /* Terminators — only true script-end opcodes */
+    if (op == 0x01 || op == 0x0A)
+        return 0;
+
+    /* Control-flow markers (1 byte, not terminals) */
+    if (op == 0x04 || op == 0x10 || op == 0x11)
+        return 1;
+
+    /* Conditional branches: take skip path (advance 4) */
+    if (op == 0x05 || op == 0x0F) return 4;
+
+    /* Relative jump: follow it */
+    if (op == 0x0C) {
+        if (pc + 4 > dec_size) return 0;
+        s16 jump = rd_s16(dec + pc + 2);
+        /* Return negative of current pos to signal absolute target */
+        /* Actually, return the jump offset encoded as special value */
+        return -1;  /* caller handles */
+    }
+
+    /* Variable: 0x28 */
+    if (op == 0x28) {
+        if (pc + 3 > dec_size) return 0;
+        return scd_op28_size(dec[pc + 2]);
+    }
+
+    /* Fixed-size table */
+    static const u8 sizes[0x70] = {
+     /* 0x00 */ 1, 4, 4, 4, 0, 4, 4, 4, 4, 8, 0, 4, 0, 4, 4, 4,
+     /* 0x10 */ 0, 0, 4, 4, 4, 8, 4, 4, 4,  1, 1, 1, 1, 1, 1, 1,
+     /* 0x20 */24, 8, 4,32, 8, 4, 4, 4, 0, 8, 8, 8, 4, 4,20, 4,
+     /* 0x30 */ 4, 4, 4, 4, 4, 8, 8, 8, 4, 4,12, 4, 8,12, 4, 8,
+     /* 0x40 */12, 4,20, 8, 8, 8, 8, 4, 4, 4, 4,12,32, 8, 8, 8,
+     /* 0x50 */ 8, 8, 4,12, 4,12,28, 8, 8,20, 8,44, 4, 4,20,12,
+     /* 0x60 */ 4, 4, 8, 8, 4, 4, 4, 8, 8, 4, 8, 4, 4, 4, 4, 4,
+    };
+    if (op < 0x70) return sizes[op];
+    return 1;  /* 0x70+ handled above */
+}
+
+bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
+                       RdtSceneOverlay& ov)
+{
+    if (dec_size < 32) return false;
+    u32 base = base_addr;
+
+    /* Validate RDT header: 7 PSX pointers */
+    u32 offs[7];
+    for (int i = 0; i < 7; i++) {
+        u32 p = rd_u32(dec + i * 4);
+        if (p < base) return false;
+        offs[i] = p - base;
+        if (offs[i] >= dec_size) return false;
+    }
+
+    /* Determine mesh region end */
+    size_t meta_min = dec_size;
+    for (int i = 0; i < 7; i++)
+        if (offs[i] > 0x40 && offs[i] < meta_min) meta_min = offs[i];
+
+    int found = 0;
+
+    /* ─── Static Room Lights (ptr[0]+36) ───
+     * ptr[0] header: u16 n_bank1, u16 n_bank2, u16 pad, u16 flags,
+     *   u8 ambient_r, u8 ambient_g, u8 ambient_b, ...
+     * At +36: (n_bank1 + n_bank2) × 20-byte light entries.
+     * Each entry (from sub_5F0CE0):
+     *   byte[0]=R, [1]=G, [2]=B, [3]=active
+     *   s16[+4]=X, s16[+6]=Y, s16[+8]=Z, s16[+10]=radius */
+    {
+        size_t p0 = offs[0];
+        if (p0 + 36 <= dec_size) {
+            /* Read ambient from header */
+            ov.ambient_r = dec[p0 + 8];
+            ov.ambient_g = dec[p0 + 9];
+            ov.ambient_b = dec[p0 + 10];
+            int n1 = (int)rd_u16(dec + p0);
+            int n2 = (int)rd_u16(dec + p0 + 2);
+            int total = n1 + n2;
+            if (total > 0 && total <= 8) {
+                for (int li = 0; li < total && ov.n_lights < 8; li++) {
+                    size_t lo = p0 + 36 + (size_t)li * 20;
+                    if (lo + 20 > dec_size) break;
+                    u8 active = dec[lo + 3];
+                    if (!active) continue;
+                    RdtSceneLight& sl = ov.lights[ov.n_lights++];
+                    sl.slot = (u8)li;
+                    sl.r = dec[lo];
+                    sl.g = dec[lo + 1];
+                    sl.b = dec[lo + 2];
+                    sl.px = rd_s16(dec + lo + 4);
+                    sl.py = rd_s16(dec + lo + 6);
+                    sl.pz = rd_s16(dec + lo + 8);
+                    sl.radius = rd_s16(dec + lo + 10);
+                    sl.has_pos = 1;
+                    sl.has_color = 1;
+                }
+                if (ov.n_lights > 0) found++;
+            }
+        }
+    }
+
+    /* ─── Floor Zones (ptr[6]) ─── */
+    {
+        size_t zo = offs[6];
+        if (zo + 4 <= dec_size) {
+            int count = (int)dec[zo];
+            if (count > 0 && count <= 64) {
+                size_t rec = zo + 4;
+                for (int i = 0; i < count && ov.n_zones < 64; i++, rec += 20) {
+                    if (rec + 20 > dec_size) break;
+                    RdtFloorZone& z = ov.zones[ov.n_zones++];
+                    for (int c = 0; c < 4; c++) {
+                        z.x[c] = rd_s16(dec + rec + c * 4);
+                        z.z[c] = rd_s16(dec + rec + c * 4 + 2);
+                    }
+                    z.y               = 0;
+                    z.height          = 0;
+                    z.collision_group = dec[rec + 16];
+                    z.target_index    = dec[rec + 17];
+                    z.flags           = dec[rec + 18];
+                }
+                found++;
+            }
+        }
+    }
+
+    /* ─── Collision Rects (ptr[1]) ───
+     * Fixed 16-entry index table (16 × 8B = 128 bytes).
+     * Each entry: u8 count, u8 flags, u16 rect_offset (relative to entry), u32 extra.
+     * Rect data: 48 bytes each, x(s16) z(s16) w(u16) h(u16) + 40B metadata. */
+    {
+        size_t co = offs[1];
+        size_t co_end = offs[2];  /* section ends at ptr[2] */
+        for (int gi = 0; gi < 16; gi++) {
+            size_t go = co + (size_t)gi * 8;
+            if (go + 8 > co_end) break;
+            int cnt = (int)dec[go];
+            if (cnt == 0) continue;
+            if (cnt > 32) continue;   /* skip bogus, don't break */
+            u16 rect_off = rd_u16(dec + go + 2);
+            size_t rbase = go + rect_off;
+            for (int ri = 0; ri < cnt && ov.n_collisions < 256; ri++) {
+                size_t ro = rbase + (size_t)ri * 48;
+                if (ro + 48 > dec_size) break;
+                if (ro + 8 > co_end) break; /* don't read past section */
+                s16 rx = rd_s16(dec + ro);
+                s16 rz = rd_s16(dec + ro + 2);
+                u16 rw = rd_u16(dec + ro + 4);
+                u16 rh = rd_u16(dec + ro + 6);
+                if (rw == 0 || rh == 0) continue;  /* skip zero-dimension */
+                RdtCollisionRect& cr = ov.collisions[ov.n_collisions++];
+                cr.x = rx;
+                cr.z = rz;
+                cr.w = rw;
+                cr.h = rh;
+                cr.group   = (u8)gi;
+                cr.flags   = dec[ro + 8];
+            }
+        }
+        if (ov.n_collisions > 0) found++;
+    }
+
+    /* ptr[4] is a runtime pointer table (16 × u32 slots) filled by SCD opcode 0x28.
+       The static data here is just uninitialized slot storage — not zone geometry.
+       Door zones come from 0x28 type 4 in the SCD walk below. */
+
+    /* ─── Camera Thread Zones (ptr[3]) ───
+     * u32 count, then count × 68-byte thread descriptors (word_645F58 = 68 for all types).
+     * Each descriptor: byte[0]=type, byte[1]=flags, byte[2]=cam_id, byte[3]=floor_grp,
+     * bytes[4..19] = 4 × (s16 x, s16 z) = camera activation quad.
+     * Remaining 48 bytes = camera params (eye/target, interpolation, etc). */
+    {
+        size_t t3 = offs[3];
+        size_t t3_end = offs[4];
+        if (t3 + 4 <= dec_size) {
+            int thr_count = (int)rd_u32(dec + t3);
+            if (thr_count > 0 && thr_count <= 32) {
+                for (int ti = 0; ti < thr_count && ov.n_cam_threads < 32; ti++) {
+                    size_t td = t3 + 4 + (size_t)ti * 68;
+                    if (td + 68 > dec_size) break;
+                    if (td + 68 > t3_end) break;
+                    RdtSceneOverlay::CamThread& ct = ov.cam_threads[ov.n_cam_threads++];
+                    ct.type = dec[td];
+                    ct.cam_id = dec[td + 2];
+                    for (int c = 0; c < 4; c++) {
+                        ct.x[c] = rd_s16(dec + td + 4 + c * 4);
+                        ct.z[c] = rd_s16(dec + td + 4 + c * 4 + 2);
+                    }
+                }
+                if (ov.n_cam_threads > 0) found++;
+            }
+        }
+    }
+
+    /* ─── Camera Cut Zones (ptr[2]) ───
+     * 16-byte header, then up to 17 camera group descriptors (16 bytes each, indices 0-16).
+     * Each group: byte[0] = zone_count, u32 at +4 = zone_data_offset (rel to ptr[2]+272).
+     * Zone data: 20-byte entries: type(u8), flags(u8), pad(u16), x(s16), z(s16), w(s16), h(s16), ...
+     */
+    {
+        size_t ct = offs[2];
+        if (ct + 16 + 17 * 16 <= dec_size) {
+            for (int g = 0; g < 17; g++) {
+                size_t goff = ct + 16 + (size_t)g * 16;
+                if (goff + 16 > dec_size) break;
+                int zone_count = dec[goff];
+                if (zone_count == 0 || zone_count > 32) continue;
+                u32 zone_reloff = rd_u32(dec + goff + 4);
+                size_t zone_abs = ct + 272 + zone_reloff;
+                for (int z = 0; z < zone_count && ov.n_camcuts < 128; z++) {
+                    size_t zo = zone_abs + (size_t)z * 20;
+                    if (zo + 20 > dec_size) break;
+                    /* Validate: w and h at +8,+10 must be nonzero */
+                    s16 w = rd_s16(dec + zo + 8);
+                    s16 h = rd_s16(dec + zo + 10);
+                    if (w == 0 && h == 0) continue;
+                    RdtCameraCutZone& cc = ov.camcuts[ov.n_camcuts++];
+                    cc.type = dec[zo];
+                    cc.cam_group = (u8)g;
+                    cc.x = rd_s16(dec + zo + 4);
+                    cc.z = rd_s16(dec + zo + 6);
+                    cc.w = w;
+                    cc.h = h;
+                }
+            }
+            if (ov.n_camcuts > 0) found++;
+        }
+    }
+
+    /* ─── SCD Script Walk ───
+     *
+     * The SCD region starts at ptr[5] with an offset table:
+     *   u32[0] = offset to script[0] entry point (relative to scd_base)
+     *   ...
+     *   u32[N-1] = offset to script[N-1]
+     * First u32 / 4 gives the script count (table size = first_offset bytes).
+     * Each script is walked linearly, skipping conditional branches.
+     */
+    {
+        size_t scd_base = offs[5];
+        if (scd_base + 4 > dec_size) goto done;
+
+        u32 first_off = rd_u32(dec + scd_base);
+        if (first_off < 4 || first_off > 0x1000 || (first_off & 3) != 0)
+            goto done;
+
+        int n_scripts = (int)(first_off / 4);
+        if (n_scripts > 64) n_scripts = 64;
+
+        for (int si = 0; si < n_scripts; si++) {
+            u32 script_rel = rd_u32(dec + scd_base + si * 4);
+            size_t pc = scd_base + script_rel;
+            if (pc >= dec_size) continue;
+
+            int steps = 0;
+            while (pc < dec_size && steps < 2000) {
+                u8 op = dec[pc];
+
+                /* Relative jump: compute target and follow */
+                if (op == 0x0C) {
+                    if (pc + 4 > dec_size) break;
+                    s16 jump = rd_s16(dec + pc + 2);
+                    size_t target = (size_t)((int)pc + (int)jump);
+                    if (target >= dec_size || target < scd_base) break;
+                    pc = target;
+                    steps++;
+                    continue;
+                }
+
+                int adv = scd_opcode_advance(dec, dec_size, pc);
+                if (adv <= 0) break;
+
+                /* ─── Extract spatial data from known opcodes ─── */
+
+                /* 0x23: Room model transform (32 bytes) */
+                if (op == 0x23 && pc + 32 <= dec_size && ov.n_xforms < 64) {
+                    u8 slot = dec[pc + 1];
+                    u32 sp_raw = rd_u32(dec + pc + 8);
+                    u32 sec_off;
+                    if (sp_raw >= base && (sp_raw - base) < dec_size)
+                        sec_off = sp_raw - base;
+                    else
+                        sec_off = 0xFFFFFFFF;
+
+                    if (sec_off != 0xFFFFFFFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
+                        u32 sp1 = rd_u32(dec + sec_off) - base;
+                        u32 sp2 = rd_u32(dec + sec_off + 4) - base;
+                        u16 sc1 = rd_u16(dec + sec_off + 8);
+                        u16 sc2 = rd_u16(dec + sec_off + 10);
+                        if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
+                            /* Store ALL 0x23 xforms — no dedup.
+                               Each 0x23 is an independent model slot write.
+                               Conditional branches may write the same slot with
+                               different section/position; we store all because we
+                               don't know which branch executes at runtime.
+                               The exclude list needs every referenced section_off. */
+                            if (ov.n_xforms < 64) {
+                                RdtSectionXform& x = ov.xforms[ov.n_xforms++];
+                                x.section_off   = sec_off;
+                                x.slot           = slot;
+                                x.flags          = dec[pc + 2];
+                                x.render_mode    = dec[pc + 3];
+                                x.ot_depth       = rd_u16(dec + pc + 4);
+                                x.px = rd_s16(dec + pc + 12);
+                                x.py = rd_s16(dec + pc + 14);
+                                x.pz = rd_s16(dec + pc + 16);
+                                x.rx = rd_s16(dec + pc + 18);
+                                x.ry = rd_s16(dec + pc + 20);
+                                x.rz = rd_s16(dec + pc + 22);
+                                found++;
+                            }
+                        }
+                    }
+                }
+
+                /* 0x28: Collision/trigger zone (variable size)
+                   Zone data at +4: 4 × (s16 x, s16 z) = 16 bytes of XZ corners.
+                   Bytes +20..+23 are metadata: type, flags, floor_group, active.
+                   Dedup by slot — conditional branches may rewrite the same slot. */
+                if (op == 0x28 && pc + 20 <= dec_size) {
+                    u8 slot = dec[pc + 1];
+                    u8 typ  = dec[pc + 2];
+                    int sz = scd_op28_size(typ);
+                    if (pc + (size_t)sz <= dec_size && ov.n_zones < 64) {
+                        /* Dedup by slot: first write wins */
+                        bool dup = false;
+                        for (int di = 0; di < ov.n_zones; di++)
+                            if (ov.zones[di].flags == 0x28 &&
+                                ov.zones[di].collision_group == slot) { dup = true; break; }
+                        if (!dup) {
+                            RdtFloorZone& z = ov.zones[ov.n_zones++];
+                            for (int c = 0; c < 4; c++) {
+                                z.x[c] = rd_s16(dec + pc + 4 + c * 4);
+                                z.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
+                            }
+                            z.y = 0;
+                            z.height = 0;
+                            z.collision_group = slot;
+                            z.target_index    = typ;
+                            z.flags           = 0x28;
+                        }
+                        found++;
+                    }
+
+                    /* Type 4 (door): section pointer at opcode+36, model slot at opcode+34.
+                       sub_426DFC positions the section mesh at the door zone center.
+                       Slot 0xFF means no model — skip those. */
+                    if (typ == 4 && pc + 44 <= dec_size) {
+                        u8 mdl_slot = dec[pc + 34];
+                        u32 sec_raw = rd_u32(dec + pc + 36);
+                        u32 sec_off = sec_raw - base;
+                        if (mdl_slot != 0xFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
+                            u32 sp1 = rd_u32(dec + sec_off) - base;
+                            u32 sp2 = rd_u32(dec + sec_off + 4) - base;
+                            u16 sc1 = rd_u16(dec + sec_off + 8);
+                            u16 sc2 = rd_u16(dec + sec_off + 10);
+                            if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
+                                /* Door center = midpoint of corners 0 and 2 */
+                                s16 a0 = rd_s16(dec + pc + 4);
+                                s16 a1 = rd_s16(dec + pc + 6);
+                                s16 a4 = rd_s16(dec + pc + 12);
+                                s16 a5 = rd_s16(dec + pc + 14);
+                                s16 cx = a4 + (s16)((a0 - a4) / 2);
+                                s16 cz = a5 + (s16)((a1 - a5) / 2);
+                                if (ov.n_xforms < 64) {
+                                    RdtSectionXform& x = ov.xforms[ov.n_xforms++];
+                                    x.section_off = sec_off;
+                                    x.slot        = mdl_slot;
+                                    x.flags       = 0;
+                                    x.render_mode = 0;
+                                    x.ot_depth    = 0;
+                                    x.px = cx;
+                                    x.py = 0;
+                                    x.pz = cz;
+                                    x.rx = 0;
+                                    x.ry = 0;
+                                    x.rz = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* 0x42: Entity spawn (20 bytes).
+                   byte[1]=slot, byte[2]=type, byte[3]=anim_set, byte[16]=entity_type.
+                   bytes[4..15] are 3 × u32 PSX pointers (mesh EMD, animation, spawn-table).
+                   The entity's POSITION is not in the opcode — it comes from an external
+                   type table in the exe (sub_429D3B), with random placement within a zone.
+                   We record the slot and type but do NOT generate spatial markers. */
+                if (op == 0x42 && pc + 20 <= dec_size && ov.n_enemies < 32) {
+                    RdtEnemySpawn& es = ov.enemies[ov.n_enemies];
+                    es.type  = dec[pc + 1];
+                    es.id    = dec[pc + 2];
+                    es.flags = dec[pc + 3];
+                    es.px    = rd_s16(dec + pc + 6);
+                    es.py    = rd_s16(dec + pc + 8);
+                    es.pz    = rd_s16(dec + pc + 10);
+                    es.rot_y = rd_s16(dec + pc + 12);
+                    /* Only add if position looks valid (not zero/garbage) */
+                    if (es.px != 0 || es.py != 0 || es.pz != 0) {
+                        ov.n_enemies++;
+                        found++;
+                    }
+                }
+
+                /* 0x3D: Fog/atmosphere effect (12 bytes) */
+                if (op == 0x3D && pc + 12 <= dec_size && ov.n_fog < 8) {
+                    RdtFogParams& fp = ov.fog[ov.n_fog++];
+                    fp.type = dec[pc + 1];
+                    fp.dist_near = rd_s16(dec + pc + 4);
+                    fp.dist_far  = rd_s16(dec + pc + 6);
+                    fp.r = dec[pc + 10];
+                    fp.g = dec[pc + 11];
+                    fp.b = dec[pc + 8];  /* byte order from decompile */
+                }
+
+                /* 0x3C: Dynamic light color (8 bytes) */
+                if (op == 0x3C && pc + 8 <= dec_size && ov.n_light_cols < 64) {
+                    RdtLightColor& lc = ov.light_cols[ov.n_light_cols++];
+                    lc.light_idx = dec[pc + 1];
+                    lc.component = dec[pc + 2];
+                    lc.value     = rd_u16(dec + pc + 4);
+                }
+
+                /* 0x20: EMD character placement (24 bytes) */
+                if (op == 0x20 && pc + 24 <= dec_size && ov.n_chars < 16) {
+                    u32 mptr = rd_u32(dec + pc + 16);
+                    u32 aptr = rd_u32(dec + pc + 20);
+                    if (mptr >= base && aptr >= base) {
+                        RdtCharPlace& cp = ov.chars[ov.n_chars++];
+                        cp.slot     = dec[pc + 1];
+                        cp.flags    = dec[pc + 2];
+                        cp.type     = dec[pc + 3];
+                        cp.anim_set = dec[pc + 4];
+                        cp.px       = rd_s16(dec + pc + 8);
+                        cp.py       = rd_s16(dec + pc + 10);
+                        cp.pz       = rd_s16(dec + pc + 12);
+                        cp.rot_y    = rd_s16(dec + pc + 14);
+                        cp.mesh_ptr = mptr;
+                        cp.anim_ptr = aptr;
+                        found++;
+                    }
+                }
+
+                /* 0x4C: Camera setup (32 bytes) */
+                if (op == 0x4C && pc + 32 <= dec_size && ov.n_cameras < 32) {
+                    s16 v1 = rd_s16(dec + pc + 2);
+                    s16 v2 = rd_s16(dec + pc + 4);
+                    s16 v3 = rd_s16(dec + pc + 6);
+                    s16 v9 = rd_s16(dec + pc + 18);
+                    s16 v10 = rd_s16(dec + pc + 20);
+                    s16 v11 = rd_s16(dec + pc + 22);
+                    RdtCameraEntry& cam = ov.cameras[ov.n_cameras++];
+                    cam.eye_x = v1;
+                    cam.eye_y = v2;
+                    cam.eye_z = v3;
+                    cam.tgt_x = v9;
+                    cam.tgt_y = v10;
+                    cam.tgt_z = v11;
+                    cam.fov   = (u16)rd_s16(dec + pc + 8);
+                    cam.flags = 0;
+                    found++;
+                }
+
+                /* 0x2E: Examine/interact zone (20 bytes)
+                   byte[1]=zone_mask, bytes[4..19]=4 corners (s16 x, s16 z)
+                   Handler stores gs+35=mask, gs+36=ptr to corner data.
+                   Player standing in zone + action button triggers inspect. */
+                if (op == 0x2E && pc + 20 <= dec_size && ov.n_examines < 32) {
+                    u8 mask = dec[pc + 1];
+                    if (mask > 0 && mask < 8) {
+                        RdtExamineZone& ez = ov.examines[ov.n_examines];
+                        ez.mask = mask;
+                        ez.pad  = 0;
+                        bool valid = true;
+                        for (int c = 0; c < 4; c++) {
+                            ez.x[c] = rd_s16(dec + pc + 4 + c * 4);
+                            ez.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
+                            if (ez.x[c] < -30000 || ez.x[c] > 30000 ||
+                                ez.z[c] < -30000 || ez.z[c] > 30000)
+                                valid = false;
+                        }
+                        /* Dedup: skip if identical corners already stored */
+                        bool dup = false;
+                        for (int d = 0; d < ov.n_examines; d++) {
+                            if (ov.examines[d].x[0] == ez.x[0] &&
+                                ov.examines[d].z[0] == ez.z[0] &&
+                                ov.examines[d].x[2] == ez.x[2] &&
+                                ov.examines[d].z[2] == ez.z[2])
+                                { dup = true; break; }
+                        }
+                        if (valid && !dup) { ov.n_examines++; found++; }
+                    }
+                }
+
+                /* 0x3A: Scene light source (12 bytes)
+                   byte[1]=slot, byte[2]=subtype (0=position, 1=color)
+                   type 0: s16 X,Y,Z at bytes [4],[6],[8]
+                   type 1: u8 R,G,B at bytes [4],[6],[8] */
+                if (op == 0x3A && pc + 12 <= dec_size) {
+                    u8 slot = dec[pc + 1];
+                    u8 subtype = dec[pc + 2];
+                    if (slot < 8 && (subtype == 0 || subtype == 1)) {
+                        /* Find or create light entry for this slot */
+                        int li = -1;
+                        for (int d = 0; d < ov.n_lights; d++)
+                            if (ov.lights[d].slot == slot) { li = d; break; }
+                        if (li < 0 && ov.n_lights < 8) {
+                            li = ov.n_lights++;
+                            RdtSceneLight& l = ov.lights[li];
+                            l.slot = slot;
+                            l.px = l.py = l.pz = 0;
+                            l.radius = 800;
+                            l.r = l.g = l.b = 200;
+                            l.has_pos = 0; l.has_color = 0;
+                        }
+                        if (li >= 0) {
+                            RdtSceneLight& l = ov.lights[li];
+                            if (subtype == 0) {
+                                l.px = rd_s16(dec + pc + 4);
+                                l.py = rd_s16(dec + pc + 6);
+                                l.pz = rd_s16(dec + pc + 8);
+                                l.has_pos = 1;
+                            } else {
+                                l.r = dec[pc + 4];
+                                l.g = dec[pc + 6];
+                                l.b = dec[pc + 8];
+                                l.has_color = 1;
+                            }
+                            found++;
+                        }
+                    }
+                }
+
+                /* 0x5B: Item/pickup spawn (44 bytes)
+                   byte[1]=slot, [2]=type, [3]=anim_set
+                   s16[+4]=px, [+6]=py, [+8]=pz, [+10]=rot_y
+                   u32[+12]=mesh_ptr, u32[+16]=anim_ptr */
+                if (op == 0x5B && pc + 44 <= dec_size && ov.n_items < 32) {
+                    RdtItemSpawn& is = ov.items[ov.n_items++];
+                    is.slot     = dec[pc + 1];
+                    is.type     = dec[pc + 2];
+                    is.anim_set = dec[pc + 3];
+                    is.px       = rd_s16(dec + pc + 4);
+                    is.py       = rd_s16(dec + pc + 6);
+                    is.pz       = rd_s16(dec + pc + 8);
+                    is.rot_y    = rd_s16(dec + pc + 10);
+                    is.mesh_ptr = rd_u32(dec + pc + 12);
+                    is.anim_ptr = rd_u32(dec + pc + 16);
+                    found++;
+                }
+
+                pc += (size_t)adv;
+                steps++;
+            }
+        }
+    }
+
+done:
+    return found > 0;
+}

@@ -1,0 +1,25 @@
+[     0 ms] WinMain entered
+[     0 ms] InitCommonControlsEx done
+[   422 ms] App::init done
+onControlsEx
+[     0 ms]   init: LoadThemeApis
+[     0 ms]   init: ApplyTheme
+[     0 ms]   init: CreateFonts
+[     0 ms]   init: register_panel_classes
+[    16 ms]   init: CreateAppMenus + owner-draw
+[    31 ms]   init: CreateWindowExA main
+[    94 ms]   init: Re-ApplyTheme
+[   109 ms]   init: MenuBar created
+[   109 ms]   init: StatusBar created
+[   125 ms]   init: TreeView created
+[   141 ms]   init: PanelArea created
+[   141 ms]   init: HexPanel created
+[   141 ms]   init: ImagePanel created
+[   141 ms]   init: 3DPanel created
+[   141 ms]   init: AudioPanel created
+[   141 ms]   init: PalettePanel created
+[   156 ms]   init: VideoPanel created
+[   156 ms]   init: SavePanel deferred
+[   344 ms]   init: init_gl
+[   422 ms]   init: ShowWindow + UpdateWindow
+[   422 ms]   init: COMPLETE

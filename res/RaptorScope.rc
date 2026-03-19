@@ -1,0 +1,59 @@
+/*═══════════════════════════════════════════════════════════════════
+ *  RaptorScope — Windows Resource Script
+ *═══════════════════════════════════════════════════════════════════*/
+#include <windows.h>
+
+/* Application icon — ID 1 matches MAKEINTRESOURCE(1) in code */
+1 ICON "app.ico"
+
+/* XP visual styles manifest — MSVC embeds via project settings */
+#ifndef MSVC_BUILD
+1 24 "xp_style.manifest"
+#endif
+
+/* About dialog banner (raw premultiplied BGRA, 198x336, bottom-up) */
+100 RCDATA "vban.bin"
+
+/* Version info */
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    2,2,0,0
+ PRODUCTVERSION 2,2,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEOS         VOS__WINDOWS32
+ FILETYPE       VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName",      "DC Modding Community"
+            VALUE "FileDescription",  "Dino Crisis Archive Tool"
+            VALUE "FileVersion",      "2.2.0"
+            VALUE "InternalName",     "RaptorScope"
+            VALUE "OriginalFilename", "RaptorScope.exe"
+            VALUE "ProductName",      "RaptorScope"
+            VALUE "ProductVersion",   "2.2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1252
+    END
+END
+
+/* Menu bar is built programmatically in app.cpp (custom dark menu bar) */
+/* No MENU resource needed — using TrackPopupMenuEx with owner-draw */
+
+/* Accelerator table — ID 101 matches MAKEINTRESOURCE(101) in code */
+101 ACCELERATORS
+BEGIN
+    "O",   1001,  VIRTKEY, CONTROL
+    "S",   1002,  VIRTKEY, CONTROL
+    "I",   2003,  VIRTKEY, CONTROL
+    VK_F5, 3001,  VIRTKEY
+    VK_F6, 3002,  VIRTKEY
+    VK_F7, 3003,  VIRTKEY
+    VK_F8, 3004,  VIRTKEY
+    VK_F9, 3005,  VIRTKEY
+    VK_F4, 3011,  VIRTKEY
+END
