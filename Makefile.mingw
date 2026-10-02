@@ -7,8 +7,8 @@
 CC      = g++
 WINDRES = windres
 
-# Pre-C++11 compatible — no -std= flag needed
-CFLAGS  = -Wall -Wextra -O2 \
+# The upstream UI uses lambdas and aggregate initialization.
+CFLAGS  = -std=c++11 -Wall -Wextra -O2 \
           -Iinclude \
           -DWINVER=0x0501 -D_WIN32_WINNT=0x0501 \
           -MMD -MP

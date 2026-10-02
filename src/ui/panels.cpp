@@ -2966,9 +2966,9 @@ void ViewerPanel3D::set_texture(const u8* rgba, int w, int h) {
         uv_tex_w = 0; uv_tex_h = 0;
     }
 
-    /* Also cache the full atlas for UV editor palette cycling */
+    /* Cache the full atlas for UV editor palette cycling and GLB export. */
     free(uv_atlas_rgba); uv_atlas_rgba = 0;
-    if (total_v_slices > 1) {
+    if (total_v_slices >= 1) {
         size_t asz = (size_t)w * h * 4;
         uv_atlas_rgba = (u8*)malloc(asz);
         if (uv_atlas_rgba) {

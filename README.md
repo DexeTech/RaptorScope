@@ -1,3 +1,7 @@
+# Experimental GLB animation export modification
+
+See [EXPORTING.md](EXPORTING.md) for the new exporter, Windows build instructions, validation, and known limitations. Upstream documentation follows.
+
 <div align="center">
 
 # 🦖 RaptorScope

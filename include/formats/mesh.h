@@ -270,6 +270,18 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx);
 
 /*─── OBJ Export ─────────────────────────────────────────────────*/
 bool export_mesh_obj(const char* path, const Mesh& mesh);
+/* Shared, non-mutating pose decoder; same motion as viewer playback. */
+bool decode_emd_pose(const EmdModel& model, int clip, int frame,
+                     f32 positions[50][3], f32 matrices[50][9], f32 rotations[50][3]);
+/* Optional viewer atlas; pixels are top-down RGBA. */
+struct EmdExportAtlas {
+    const u8* rgba;
+    int width, height, slices, bpp, vram_x, vram_y, clut_x, clut_y;
+    const int* slice_map;
+};
+bool export_emd_glb(const char* path, const EmdModel& model,
+                    const EmdExportAtlas* atlas = 0, f32 fps = 30.0f);
+
 bool export_emd_smd(const char* path, const EmdModel& emd);
 bool export_mesh_smd(const char* path, const Mesh& mesh);
 

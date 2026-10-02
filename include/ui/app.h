@@ -156,6 +156,7 @@ enum {
     IDM_EXPORT_SMD      = 2106,
     IDM_EXPORT_ATLAS    = 2107,
     IDM_EXPORT_COLL     = 2108,
+    IDM_EXPORT_GLB      = 2109,
     IDM_VIEW_HEX        = 3001,
     IDM_VIEW_3D         = 3002,
     IDM_VIEW_IMAGE      = 3003,

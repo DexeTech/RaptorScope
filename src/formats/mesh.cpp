@@ -8,6 +8,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifndef _WIN32
+#define _snprintf snprintf
+#endif
+
 #define MAX_COORD 15000
 
 /*─── Color averaging helper ─────────────────────────────────────*/
@@ -1565,11 +1569,13 @@ static void build_rot_matrix(f32 rx, f32 ry, f32 rz, f32* m)
     m[6] = sx*sz - cx*sy*cz;  m[7] = sx*cz + cx*sy*sz;   m[8] = cx*cy;
 }
 
-bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
+bool decode_emd_pose(const EmdModel& model, int clip_idx, int frame_idx,
+                     f32 bone_pos[50][3], f32 bone_mat[50][9], f32 bone_rots[50][3])
 {
-    if (!model.valid || !model.raw_dec || !model.clips) return false;
+    if (!model.valid || !model.raw_dec || !model.clips || !model.parts_info) return false;
     if (clip_idx < 0 || clip_idx >= model.clip_count) return false;
     const EmdAnimClip& clip = model.clips[clip_idx];
+    if (clip.frames < 1 || clip.frame_data < 0) return false;
     if (frame_idx < 0) frame_idx = 0;
     if (frame_idx >= clip.frames) frame_idx = clip.frames - 1;
 
@@ -1591,8 +1597,7 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
        These are written to entity+68/70/72 by sub_45E632 and are separate
        from per-bone rotation angles at bone+40/42/44.  Not used for FK. ─── */
 
-    f32 bone_rots[50][3];
-    memset(bone_rots, 0, sizeof(bone_rots));
+    memset(bone_rots, 0, sizeof(f32) * 50 * 3);
 
     /* ─── Packed 12-bit rotation bitstream for N animated bones ───
        The frame_size stored per-clip was determined empirically during
@@ -1661,8 +1666,6 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
         2. Rotate bone offset by parent's accumulated matrix
         3. Bone position = parent position + rotated offset
         4. Accumulated matrix = local_mat * parent_mat             */
-    f32 bone_pos[50][3];
-    f32 bone_mat[50][9];
 
     for (int bi = 0; bi < n_parts; bi++) {
         int parent = model.parts_info[bi].parent;
@@ -1674,7 +1677,8 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
         build_rot_matrix(bone_rots[bi][0], bone_rots[bi][1],
                          bone_rots[bi][2], local_mat);
 
-        if (parent == -1 || parent >= n_parts) {
+        if (parent < -1 || parent >= bi) return false;
+        if (parent == -1) {
             bone_pos[bi][0] = bx;
             bone_pos[bi][1] = by;
             bone_pos[bi][2] = bz;
@@ -1694,6 +1698,15 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
             mat3x3_mul(pm, local_mat, bone_mat[bi]);
         }
     }
+
+    return true;
+}
+
+bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
+{
+    f32 bone_pos[50][3], bone_mat[50][9], bone_rots[50][3];
+    if (!decode_emd_pose(model, clip_idx, frame_idx, bone_pos, bone_mat, bone_rots)) return false;
+    int n_parts = model.parts_count;
 
     /* ─── Transform vertices ─── */
     if (!model.mesh.verts || !model.vert_src || !model.pool) return false;
@@ -3323,3 +3336,5 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 done:
     return found > 0;
 }
+
+#include "emd_glb.inc"
