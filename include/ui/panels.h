@@ -59,15 +59,26 @@ struct ImagePanel {
     bool    fitted;         /* true = auto-fit mode (reset on first zoom) */
     int     fit_to_screen;  /* 0 = 100% centered on load, 1 = fit to panel */
 
+    /* Room CLUT mode: decode each texel with the colour depth and CLUT of
+       the faces that sample it (render_texture_by_faces), C toggles it. */
+    bool        face_cluts;          /* user setting */
+    bool        showing_face_cluts;  /* current image was rendered that way */
+    TexFaceUse* face_uses;           /* textured faces of the open archive */
+    int         n_face_uses;
+    bool        face_uses_ready;     /* face_uses collected for this archive */
+
     ImagePanel() : hwnd(0), hBmp(0), img_w(0), img_h(0),
                    bpp(8), pal_row(0), sub_pal(0), max_pal_rows(1),
                    cur_tex(0), cur_pal(0), cur_is_linear(false),
                    zoom(1.0), pan_x(0), pan_y(0),
                    dragging(false), drag_x(0), drag_y(0),
                    drag_pan_x(0), drag_pan_y(0), fitted(true),
-                   fit_to_screen(1) {}
-    ~ImagePanel() { if (hBmp) DeleteObject(hBmp); }
+                   fit_to_screen(1),
+                   face_cluts(true), showing_face_cluts(false),
+                   face_uses(0), n_face_uses(0), face_uses_ready(false) {}
+    ~ImagePanel() { if (hBmp) DeleteObject(hBmp); free(face_uses); }
 
+    void clear_face_usage();               /* call when the archive changes */
     void render_entry(const DatEntry& tex, const DatEntry* pal, bool do_deswizzle = true);
     void render_linear(const DatEntry& tex, const DatEntry* pal);
     void rerender();                           /* re-render with current pal_row */

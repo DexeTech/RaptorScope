@@ -344,9 +344,17 @@ LRESULT CALLBACK HexPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /*═══════════════════════════════════════════════════════════════════
  *  Image Panel
  *═══════════════════════════════════════════════════════════════════*/
+void ImagePanel::clear_face_usage() {
+    free(face_uses);
+    face_uses = 0;
+    n_face_uses = 0;
+    face_uses_ready = false;
+}
+
 void ImagePanel::set_bitmap(const u8* rgba, int w, int h) {
     if (hBmp) { DeleteObject(hBmp); hBmp = 0; }
     img_w = w; img_h = h;
+    showing_face_cluts = false;
     fitted = true;  /* auto-fit on next paint */
     if (!rgba || w <= 0 || h <= 0) return;
     /* Create a DIB section with premultiplied alpha for AlphaBlend */
@@ -388,6 +396,24 @@ void ImagePanel::render_entry(const DatEntry& tex, const DatEntry* pal, bool do_
         if (lzss_decompress(tex.data, tex.size, dec))
             { pix = dec.data; pix_size = dec.size; }
     }
+
+    /* Decode the way the archive's faces sample this texture, if any do */
+    if (face_cluts && do_deswizzle && g_app.archive && !g_app.archive->is_item_bank &&
+        tex.w > 0 && tex.h > 0 && tex.x <= 1024) {
+        if (!face_uses_ready) {
+            n_face_uses = collect_texture_usage(*g_app.archive, &face_uses);
+            face_uses_ready = true;
+        }
+        u8* rgba = 0; int fw = 0, fh = 0;
+        if (render_texture_by_faces(pix, pix_size, tex.x, tex.y, tex.w, tex.h,
+                                    face_uses, n_face_uses, *g_app.archive,
+                                    &rgba, &fw, &fh)) {
+            set_bitmap(rgba, fw, fh); free(rgba);
+            showing_face_cluts = true;
+            return;
+        }
+    }
+
     int vw = tex.w, vh = tex.h;
     if (vw == 0 || vh == 0) { vw = 128; vh = 128; }
     int pw, ph;
@@ -540,11 +566,15 @@ void ImagePanel::paint(HDC hdc, RECT& rc) {
         {
             char info[128];
             int pct = (int)(zoom * 100.0 + 0.5);
-            if (max_pal_rows > 1)
-                _snprintf(info, 127, "%dx%d  %d%%  CLUT %d/%d [Up/Down]",
-                          img_w, img_h, pct, pal_row + 1, max_pal_rows);
+            const char* face_hint = (!face_cluts && n_face_uses > 0) ? "  [C: room CLUTs]" : "";
+            if (showing_face_cluts)
+                _snprintf(info, 127, "%dx%d  %d%%  CLUTs from room faces, unused areas dimmed [C: single CLUT]",
+                          img_w, img_h, pct);
+            else if (max_pal_rows > 1)
+                _snprintf(info, 127, "%dx%d  %d%%  CLUT %d/%d [Up/Down]%s",
+                          img_w, img_h, pct, pal_row + 1, max_pal_rows, face_hint);
             else
-                _snprintf(info, 127, "%dx%d  %d%%", img_w, img_h, pct);
+                _snprintf(info, 127, "%dx%d  %d%%%s", img_w, img_h, pct, face_hint);
             SetBkMode(buf, TRANSPARENT);
             SetTextColor(buf, RGB(0, 0, 0));
             TextOutA(buf, 7, ch - 19, info, (int)strlen(info));
@@ -630,6 +660,15 @@ LRESULT CALLBACK ImagePanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     } break;
 
     case WM_KEYDOWN: {
+        /* C toggles room-face CLUTs; Up/Down picks a single CLUT row, so
+           it leaves room-face mode first. */
+        bool to_single = g_image.showing_face_cluts && (wp == VK_UP || wp == VK_DOWN);
+        if (wp == 'C' || to_single) {
+            g_image.face_cluts = to_single ? false : !g_image.face_cluts;
+            g_app.refresh_selection();
+            InvalidateRect(hwnd, 0, FALSE);
+            return 0;
+        }
         if (g_image.max_pal_rows > 1) {
             if (wp == VK_UP) {
                 if (g_image.pal_row > 0) {

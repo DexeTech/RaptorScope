@@ -4,6 +4,7 @@
 #include "formats/texture.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /*─── VRAM Deswizzle ─────────────────────────────────────────────*/
 /* Row-major block order: for each by, iterate bx (standard PS1 VRAM) */
@@ -259,6 +260,213 @@ void render_texture(const u8* pixels, size_t pix_size,
                         out_rgba, do_deswizzle, pal_row);
             break;
     }
+}
+
+/*─── Render as sampled by faces ─────────────────────────────────*/
+#define TEXUSE_MAX_PALS   16
+#define TEXUSE_DIM_ALPHA  80   /* alpha for texels no face covers */
+
+/* How one texel is decoded: palette entry, row in it, CLUT offset in the
+   row and colour depth.  bpp == 0 means "not set". */
+struct TexelSrc {
+    u8 pal, row, off, bpp;
+};
+
+static inline bool texel_src_eq(const TexelSrc& a, const TexelSrc& b) {
+    return a.pal == b.pal && a.row == b.row && a.off == b.off && a.bpp == b.bpp;
+}
+
+/* Most common source among the set texels of a region (by texel count). */
+static TexelSrc dominant_src(const TexelSrc* src, int stride,
+                             int x0, int y0, int x1, int y1)
+{
+    TexelSrc cand[16]; int cnt[16]; int n = 0;
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            const TexelSrc& s = src[(size_t)y * stride + x];
+            if (!s.bpp) continue;
+            int k = 0;
+            while (k < n && !texel_src_eq(cand[k], s)) k++;
+            if (k == n) {
+                if (n == 16) continue;
+                cand[n] = s; cnt[n] = 0; n++;
+            }
+            cnt[k]++;
+        }
+    }
+    TexelSrc best; memset(&best, 0, sizeof(best));
+    int best_cnt = 0;
+    for (int k = 0; k < n; k++)
+        if (cnt[k] > best_cnt) { best_cnt = cnt[k]; best = cand[k]; }
+    return best;
+}
+
+bool render_texture_by_faces(const u8* pixels, size_t pix_size,
+                             int vram_x, int vram_y, int vram_w, int vram_h,
+                             const TexFaceUse* faces, int n_faces,
+                             const DatArchive& archive,
+                             u8** out_rgba, int* out_w, int* out_h)
+{
+    *out_rgba = 0; *out_w = 0; *out_h = 0;
+    if (!pixels || pix_size == 0 || vram_w <= 0 || vram_h <= 0 || n_faces <= 0)
+        return false;
+
+    /* Palette entries: VRAM position, row count and decoded colours */
+    struct PalRef { int x, y, rows; };
+    PalRef pals[TEXUSE_MAX_PALS]; int n_pals = 0;
+    RGBA8* pal_rgba = (RGBA8*)malloc(TEXUSE_MAX_PALS * 4096 * sizeof(RGBA8));
+    if (!pal_rgba) return false;
+    for (int i = 0; i < archive.count && n_pals < TEXUSE_MAX_PALS; i++) {
+        const DatEntry& e = archive.entries[i];
+        if (e.type != DAT_PALETTE || !e.data || e.size < 32) continue;
+        int rows = (int)(e.size / 512);
+        if (rows < 1) rows = 1;
+        if (rows > 16) rows = 16;
+        pals[n_pals].x = e.x; pals[n_pals].y = e.y; pals[n_pals].rows = rows;
+        parse_palette(e.data, e.size, pal_rgba + (size_t)n_pals * 4096, rows);
+        n_pals++;
+    }
+
+    /* Data can be taller than the header says (deswizzle needs full height) */
+    int byte_w = vram_w * 2;
+    int vh = vram_h;
+    if ((int)(pix_size / byte_w) > vh) vh = (int)(pix_size / byte_w);
+
+    /* Faces that sample this texture through a known palette */
+    struct FaceRef { int fi; TexelSrc src; int page_x, page_y; };
+    FaceRef* refs = (FaceRef*)malloc((size_t)n_faces * sizeof(FaceRef));
+    if (!refs) { free(pal_rgba); return false; }
+    int n_refs = 0;
+    bool any_4bpp = false;
+    for (int fi = 0; fi < n_faces; fi++) {
+        const TexFaceUse& f = faces[fi];
+        int tp = (f.tpage >> 7) & 3;
+        if (tp > 1) continue;                       /* 16bpp: no CLUT */
+        int page_x = (f.tpage & 0xF) * 64;
+        int page_y = ((f.tpage >> 4) & 1) * 256;
+        int page_hw = tp ? 128 : 64;                /* 256 texels wide */
+        if (page_x + page_hw <= vram_x || page_x >= vram_x + vram_w) continue;
+        if (page_y + 256 <= vram_y || page_y >= vram_y + vh) continue;
+
+        int cx = (f.clut & 0x3F) * 16;
+        int cy = (f.clut >> 6) & 0x1FF;
+        int p = 0;
+        while (p < n_pals && !(cy >= pals[p].y && cy < pals[p].y + pals[p].rows &&
+                               cx >= pals[p].x && cx < pals[p].x + 256))
+            p++;
+        if (p == n_pals) continue;
+
+        FaceRef& r = refs[n_refs++];
+        r.fi = fi;
+        r.src.pal = (u8)p;
+        r.src.row = (u8)(cy - pals[p].y);
+        r.src.off = (u8)(cx - pals[p].x);
+        r.src.bpp = (u8)(tp ? 8 : 4);
+        r.page_x = page_x; r.page_y = page_y;
+        if (!tp) any_4bpp = true;
+    }
+    if (n_refs == 0) { free(refs); free(pal_rgba); return false; }
+
+    int ppw = any_4bpp ? 4 : 2;                     /* output px per halfword */
+    int w = vram_w * ppw, h = vh;
+    TexelSrc* src = (TexelSrc*)calloc((size_t)w * h, sizeof(TexelSrc));
+    u8* linear = (u8*)calloc((size_t)byte_w * vh, 1);
+    u8* rgba = (u8*)calloc((size_t)w * h, 4);
+    if (!src || !linear || !rgba) {
+        free(src); free(linear); free(rgba); free(refs); free(pal_rgba);
+        return false;
+    }
+    deswizzle_8bpp(pixels, pix_size, linear, vram_w, vh);
+
+    /* Mark every texel inside each face's UV triangle (texel centres
+       within one texel of the edges, so shared edges are covered). */
+    for (int ri = 0; ri < n_refs; ri++) {
+        const FaceRef& r = refs[ri];
+        const TexFaceUse& f = faces[r.fi];
+        float us[3], vs[3];
+        int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+        for (int k = 0; k < 3; k++) {
+            us[k] = f.uv[k][0]; vs[k] = f.uv[k][1];
+            if (f.uv[k][0] < u0) u0 = f.uv[k][0];
+            if (f.uv[k][0] > u1) u1 = f.uv[k][0];
+            if (f.uv[k][1] < v0) v0 = f.uv[k][1];
+            if (f.uv[k][1] > v1) v1 = f.uv[k][1];
+        }
+        float len[3];
+        bool degenerate = false;
+        for (int k = 0; k < 3; k++) {
+            float dx = us[(k + 1) % 3] - us[k], dy = vs[(k + 1) % 3] - vs[k];
+            len[k] = sqrtf(dx * dx + dy * dy);
+            if (len[k] < 1e-3f) degenerate = true;
+        }
+        if (degenerate) continue;
+
+        int texel_px = (r.src.bpp == 8) ? ppw / 2 : ppw / 4;
+        int x_base = (r.page_x - vram_x) * ppw;
+        for (int v = v0; v <= v1; v++) {
+            int y = r.page_y + v - vram_y;
+            if (y < 0 || y >= h) continue;
+            float qy = v + 0.5f;
+            for (int u = u0; u <= u1; u++) {
+                float qx = u + 0.5f;
+                float d[3];
+                for (int k = 0; k < 3; k++) {
+                    int k2 = (k + 1) % 3;
+                    d[k] = ((us[k2] - us[k]) * (qy - vs[k]) -
+                            (vs[k2] - vs[k]) * (qx - us[k])) / len[k];
+                }
+                bool inside = (d[0] >= -1.0f && d[1] >= -1.0f && d[2] >= -1.0f) ||
+                              (d[0] <=  1.0f && d[1] <=  1.0f && d[2] <=  1.0f);
+                if (!inside) continue;
+                int x0 = x_base + u * texel_px;
+                for (int s = 0; s < texel_px; s++) {
+                    int x = x0 + s;
+                    if (x >= 0 && x < w) src[(size_t)y * w + x] = r.src;
+                }
+            }
+        }
+    }
+
+    /* Fallback for uncovered texels: per 64-halfword x 256-row page cell,
+       then for the whole texture. */
+    TexelSrc whole = dominant_src(src, w, 0, 0, w, h);
+    if (!whole.bpp) {
+        free(src); free(linear); free(rgba); free(refs); free(pal_rgba);
+        return false;
+    }
+    int cell_w = 64 * ppw;
+    int first_cell_x = vram_x - (vram_x % 64);
+    int first_cell_y = vram_y - (vram_y % 256);
+    for (int cy0 = first_cell_y; cy0 < vram_y + h; cy0 += 256) {
+        for (int cx0 = first_cell_x; cx0 < vram_x + vram_w; cx0 += 64) {
+            int x0 = (cx0 - vram_x) * ppw, y0 = cy0 - vram_y;
+            int x1 = x0 + cell_w, y1 = y0 + 256;
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 > w) x1 = w;
+            if (y1 > h) y1 = h;
+            TexelSrc cell = dominant_src(src, w, x0, y0, x1, y1);
+            if (!cell.bpp) cell = whole;
+
+            for (int y = y0; y < y1; y++) {
+                for (int x = x0; x < x1; x++) {
+                    TexelSrc s = src[(size_t)y * w + x];
+                    bool dim = !s.bpp;
+                    if (dim) s = cell;
+                    u8 b = linear[(size_t)y * byte_w + (x * 2) / ppw];
+                    int idx = (s.bpp == 4) ? ((x & 1) ? (b >> 4) : (b & 0xF)) : b;
+                    RGBA8 c = pal_rgba[(size_t)s.pal * 4096 + s.row * 256 + ((s.off + idx) & 0xFF)];
+                    if (dim) c.a = (u8)(c.a * TEXUSE_DIM_ALPHA / 255);
+                    u8* o = rgba + ((size_t)y * w + x) * 4;
+                    o[0] = c.r; o[1] = c.g; o[2] = c.b; o[3] = c.a;
+                }
+            }
+        }
+    }
+
+    free(src); free(linear); free(refs); free(pal_rgba);
+    *out_rgba = rgba; *out_w = w; *out_h = h;
+    return true;
 }
 
 /*─── Linear 8bpp Render (no VRAM block swizzle) ────────────────*/

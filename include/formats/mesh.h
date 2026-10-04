@@ -479,4 +479,17 @@ struct RdtSceneOverlay {
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& overlay);
 
+/*─── Texture usage ──────────────────────────────────────────────*/
+/* How one textured face samples VRAM: page and colour depth (tpage),
+   CLUT position (clut) and the triangle's UVs within the page. */
+struct TexFaceUse {
+    u16 tpage;
+    u16 clut;
+    u8  uv[3][2];
+};
+
+/* Collect the textured faces of every room, character and door mesh in
+   the archive.  *out is malloc'd (caller frees); returns the face count. */
+int collect_texture_usage(const DatArchive& archive, TexFaceUse** out);
+
 #endif /* DC_FORMATS_MESH_H */

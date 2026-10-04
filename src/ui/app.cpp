@@ -949,6 +949,7 @@ void App::close_archive() {
     /* Clear cached pointers before freeing archive data */
     g_image.cur_tex = 0;
     g_image.cur_pal = 0;
+    g_image.clear_face_usage();
     delete archive; archive = 0;
     free(raw_hex_buf); raw_hex_buf = 0; raw_hex_size = 0;
     if (hTree) TreeView_DeleteAllItems(hTree);
@@ -1417,6 +1418,13 @@ int App::selected_entry_idx() {
     tvi.hItem = hSel;
     TreeView_GetItem(hTree, &tvi);
     return (int)tvi.lParam;  /* -1 for category nodes, otherwise entry_idx | (sub<<16) */
+}
+
+static void on_entry_select(int sel_param);
+
+void App::refresh_selection() {
+    int sel = selected_entry_idx();
+    if (sel >= 0) on_entry_select(sel);
 }
 
 /*═══════════════════════════════════════════════════════════════════
@@ -3022,6 +3030,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
                             if (dat_replace_entry(e, fbuf, fsz, compress)) {
                                 g_app.archive->modified = true;
+                                g_image.clear_face_usage();  /* meshes may have changed */
                                 char msg[512];
                                 _snprintf(msg, 511,
                                     "Entry %d replaced: %d bytes%s. Use Save As to write DAT.",

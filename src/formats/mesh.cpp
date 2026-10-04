@@ -3347,4 +3347,70 @@ done:
     return found > 0;
 }
 
+/*═══════════════════════════════════════════════════════════════════
+ *  Texture usage  -  which tpage/CLUT/UVs every textured face samples
+ *═══════════════════════════════════════════════════════════════════*/
+static void add_mesh_usage(const Mesh& mesh, TexFaceUse*& out, int& count, int& cap)
+{
+    for (int i = 0; i < mesh.tri_count; i++) {
+        if (count == cap) {
+            int ncap = cap ? cap * 2 : 1024;
+            TexFaceUse* p = (TexFaceUse*)realloc(out, (size_t)ncap * sizeof(TexFaceUse));
+            if (!p) return;
+            out = p; cap = ncap;
+        }
+        const MeshTri& t = mesh.tris[i];
+        TexFaceUse& u = out[count++];
+        u.tpage = t.tpage;
+        u.clut  = t.clut;
+        memcpy(u.uv, t.uv, sizeof(u.uv));
+    }
+}
+
+int collect_texture_usage(const DatArchive& archive, TexFaceUse** out)
+{
+    TexFaceUse* faces = 0;
+    int count = 0, cap = 0;
+
+    for (int i = 0; i < archive.count; i++) {
+        const DatEntry& e = archive.entries[i];
+        if (!(e.y & 0x8000)) continue;
+        if (e.type != DAT_LZSS0 && !is_raw_rdt_entry(e)) continue;
+
+        Buffer dec;
+        if (!dat_entry_payload(e, dec) || dec.size < 0x20) continue;
+        if (is_mips_code_dec(dec.data, dec.size)) continue;
+        u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+
+        RdtLayout layout;
+        bool has_layout = parse_rdt_layout(dec.data, dec.size, base, layout);
+        if (has_layout && layout.section_count > 0) {
+            Mesh mesh;
+            if (parse_rdt_scene_dec(dec.data, dec.size, base, mesh))
+                add_mesh_usage(mesh, faces, count, cap);
+        }
+        if (has_layout && layout.emd_count > 0) {
+            for (int k = 0; k < layout.emd_count && k < RDT_MAX_EMDS; k++) {
+                EmdModel model;
+                if (parse_emd_model_dec(dec.data, dec.size, e.y, e.x, model,
+                                        (int)layout.emds[k].offset))
+                    add_mesh_usage(model.mesh, faces, count, cap);
+            }
+        }
+        if (!has_layout || (layout.section_count == 0 && layout.emd_count == 0)) {
+            Mesh mesh;
+            if (is_door_mesh_entry_dec(dec.data, dec.size, e.y)) {
+                if (parse_door_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            } else if (is_standalone_emd_dec(dec.data, dec.size, base)) {
+                if (parse_standalone_emd_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            }
+        }
+    }
+
+    *out = faces;
+    return count;
+}
+
 #include "emd_glb.inc"
