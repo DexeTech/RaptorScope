@@ -50,8 +50,8 @@ struct GianTone {
     u8  tone_idx;
     u8  volume;
     u8  pan;
-    u8  pitch;      /* MIDI note number */
-    u8  pitch_fine;
+    u8  pitch;      /* center note: keying it plays the VAG at 44100 Hz */
+    u8  pitch_fine; /* 1/128 semitone added to the center note */
     u8  key_lo, key_hi;
     u16 adsr1, adsr2;
     u8  vag_bank;
@@ -70,6 +70,14 @@ struct GianHeader {
 };
 
 bool parse_gian_header(const u8* data, size_t size, GianHeader& out);
+
+/* Rate (Hz) the SPU plays a tone's VAG at when the tone is keyed at note. */
+f32 gian_tone_rate(const GianTone& tone, int note);
+
+/* Rate the VAG is normally heard at: keyed at the tone's own key (sound
+   effects use one key per tone), or at the key nearest middle C when the
+   tone spans a range of keys. */
+int gian_tone_sample_rate(const GianTone& tone);
 
 /*─── SEQ Music ──────────────────────────────────────────────────*/
 struct SeqNote {

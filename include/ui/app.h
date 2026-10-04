@@ -124,6 +124,7 @@ struct App {
     void set_status(const char* text);
     void switch_panel(int panel_id);
     int  selected_entry_idx();  /* get entry index from current tree selection */
+    void refresh_selection();   /* re-show the selected entry (after a view setting change) */
 };
 
 extern App g_app;

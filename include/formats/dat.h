@@ -87,6 +87,10 @@ bool dat_parse_file(const char* path, DatArchive& archive);
    must keep it alive as long as archive is used). */
 bool dat_parse_memory(u8* raw, size_t raw_size, DatArchive& archive);
 
+/* Entry contents as loaded in memory: LZSS entries (types 7, 8) are
+   decompressed, everything else is copied as-is. */
+bool dat_entry_payload(const DatEntry& entry, Buffer& out);
+
 /* Check if raw data is a Dino Crisis item sprite bank (item.dat). */
 bool dat_is_item_bank(const u8* raw, size_t raw_size);
 

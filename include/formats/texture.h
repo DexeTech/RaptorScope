@@ -7,6 +7,7 @@
 
 #include "core/types.h"
 #include "core/color.h"
+#include "formats/mesh.h"
 #include <stdlib.h>
 
 /*─── VRAM Deswizzle (Capcom PC block-tiled format) ──────────────*/
@@ -70,6 +71,23 @@ void render_linear_8bpp(const u8* pixels, size_t pix_size,
    Returns pixel width and height. */
 void texture_pixel_dims(int vram_w, int vram_h, int bpp,
                         int& out_w, int& out_h);
+
+/*─── Render as sampled by faces ─────────────────────────────────*/
+
+/* Render a texture the way the game's faces sample it: every texel a face
+   covers is decoded with that face's colour depth (4/8bpp) and CLUT, looked
+   up in the archive's palette entries.  Texels no face covers use the most
+   common setting of their texture page and are drawn dimmed.
+   pixels = decompressed, still swizzled texture data at VRAM (vram_x,
+   vram_y) of vram_w x vram_h halfwords.  Output is 4 px per halfword when
+   any 4bpp face samples the texture (8bpp texels doubled), else 2.
+   *out_rgba is malloc'd (caller frees).  Returns false when no face
+   samples this texture through a known palette. */
+bool render_texture_by_faces(const u8* pixels, size_t pix_size,
+                             int vram_x, int vram_y, int vram_w, int vram_h,
+                             const TexFaceUse* faces, int n_faces,
+                             const DatArchive& archive,
+                             u8** out_rgba, int* out_w, int* out_h);
 
 /*─── Background extraction (LZSS0 compressed) ──────────────────*/
 

@@ -174,18 +174,23 @@ bool parse_gian_header(const u8* data, size_t size, GianHeader& out)
 
     int np = out.num_programs;
     if (np > 16) np = 16;
-    int nt = out.num_tones;
-    if (nt > 16) nt = 16;
 
     /* Header: 16 bytes
+         byte 6-7: number of programs
+         byte 8-9: number of tones in all programs
        Programs: 16 slots x 8 bytes = 128 bytes (at offset 16)
          byte 0: num_tones_in_program
          byte 1: volume
          byte 2-3: priority (0xFFFF unused)
          byte 4: pan
          byte 5-7: padding
-       Tones: np * nt * 32 bytes (at offset 144)
-         Standard Sony VH tone layout, 32 bytes each */
+       Tones: np programs x 16 slots x 24 bytes (at offset 144)
+         Sony VH tone layout cut to 24 bytes:
+         byte 2: volume   byte 3: pan
+         byte 4: center note   byte 5: fine (1/128 semitone)
+         byte 6-7: key range
+         byte 16-17: ADSR1   byte 18-19: ADSR2
+         byte 22-23: VAG SPU address / 8 */
 
     for (int p = 0; p < np && p < 16; p++) {
         size_t poff = 16 + (size_t)p * 8;
@@ -201,16 +206,20 @@ bool parse_gian_header(const u8* data, size_t size, GianHeader& out)
     size_t tone_base = 144;
     out.tone_count = 0;
     for (int p = 0; p < np && out.tone_count < 128; p++) {
-        for (int t = 0; t < nt; t++) {
-            size_t toff = tone_base + (size_t)(p * nt + t) * 32;
-            if (toff + 32 > size) break;
+        /* A program's tones fill its first slots; slots past its tone
+           count can hold stale data. A few banks leave the count at 0,
+           so then the first empty slot ends the program. */
+        if (16 + (size_t)p * 8 >= size) break;
+        int nt = data[16 + p * 8];
+        if (nt == 0 || nt > 16) nt = 16;
+        for (int t = 0; t < nt && out.tone_count < 128; t++) {
+            size_t toff = tone_base + (size_t)(p * 16 + t) * 24;
+            if (toff + 24 > size) break;
             u8 vol = data[toff + 2];
             u8 pitch = data[toff + 4];
-            u8 key_lo = data[toff + 6];
             u8 key_hi = data[toff + 7];
-            /* Skip empty tones and SPU address entries (inverted key range) */
-            if ((vol == 0 && pitch == 0 && key_hi == 0) || (key_lo > key_hi && key_hi != 0))
-                continue;
+            if (vol == 0 && pitch == 0 && key_hi == 0)
+                break;
 
             GianTone& tn = out.tones[out.tone_count++];
             tn.program   = (u8)p;
@@ -221,8 +230,8 @@ bool parse_gian_header(const u8* data, size_t size, GianHeader& out)
             tn.pitch_fine= data[toff + 5];
             tn.key_lo    = data[toff + 6];
             tn.key_hi    = key_hi;
-            tn.adsr1     = rd_u16(data + toff + 14);
-            tn.adsr2     = rd_u16(data + toff + 16);
+            tn.adsr1     = rd_u16(data + toff + 16);
+            tn.adsr2     = rd_u16(data + toff + 18);
             u32 spu_raw  = (u32)rd_u16(data + toff + 22) * 8;
             tn.spu_addr  = spu_raw;
 
@@ -257,6 +266,20 @@ bool parse_gian_header(const u8* data, size_t size, GianHeader& out)
 
     out.valid = true;
     return true;
+}
+
+f32 gian_tone_rate(const GianTone& tone, int note)
+{
+    f32 semis = (f32)(note - tone.pitch) + tone.pitch_fine / 128.0f;
+    return 44100.0f * powf(2.0f, semis / 12.0f);
+}
+
+int gian_tone_sample_rate(const GianTone& tone)
+{
+    int note = 60;
+    if (note < tone.key_lo) note = tone.key_lo;
+    if (note > tone.key_hi) note = tone.key_hi;
+    return (int)(gian_tone_rate(tone, note) + 0.5f);
 }
 
 /*─── SEQ header parsing (Capcom/Gian format) ───────────────────*/
@@ -564,9 +587,8 @@ int render_seq_to_stereo(
         s16* pcm = vag_samples[vi].pcm;
         int pcm_len = vag_samples[vi].count;
 
-        /* Pitch ratio */
-        f32 semitone_diff = (f32)rn_note.note - (f32)tone->pitch;
-        f32 pitch_ratio = powf(2.0f, semitone_diff / 12.0f);
+        /* Pitch ratio: VAG samples per output frame */
+        f32 pitch_ratio = gian_tone_rate(*tone, rn_note.note) / (f32)sample_rate;
 
         /* Amplitude */
         f32 amp = (rn_note.vel / 127.0f) * (tone->volume / 127.0f)

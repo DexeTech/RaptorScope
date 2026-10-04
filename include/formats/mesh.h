@@ -5,6 +5,7 @@
 #define DC_FORMATS_MESH_H
 
 #include "core/types.h"
+#include "formats/dat.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -185,6 +186,10 @@ bool parse_rdt_layout(const u8* dec, size_t dec_size, u32 base,
 /* Convenience: decompress + parse layout in one call. */
 bool parse_rdt_layout_from_entry(const u8* data, size_t size,
                                  u16 ey, u16 ex, RdtLayout& layout);
+
+/* Room RDTs are normally LZSS0, but a few rooms (ST50B, ST60E) store theirs
+   uncompressed as a DATA entry.  True for such entries. */
+bool is_raw_rdt_entry(const DatEntry& e);
 
 /* Parse room mesh.  Original API decompresses internally. */
 bool parse_room_mesh(const u8* data, size_t size, u32 base_addr,
@@ -473,5 +478,18 @@ struct RdtSceneOverlay {
 /*─── Parse RDT scene overlay from decompressed blob ────────────*/
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& overlay);
+
+/*─── Texture usage ──────────────────────────────────────────────*/
+/* How one textured face samples VRAM: page and colour depth (tpage),
+   CLUT position (clut) and the triangle's UVs within the page. */
+struct TexFaceUse {
+    u16 tpage;
+    u16 clut;
+    u8  uv[3][2];
+};
+
+/* Collect the textured faces of every room, character and door mesh in
+   the archive.  *out is malloc'd (caller frees); returns the face count. */
+int collect_texture_usage(const DatArchive& archive, TexFaceUse** out);
 
 #endif /* DC_FORMATS_MESH_H */

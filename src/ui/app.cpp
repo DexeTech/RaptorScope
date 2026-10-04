@@ -949,6 +949,7 @@ void App::close_archive() {
     /* Clear cached pointers before freeing archive data */
     g_image.cur_tex = 0;
     g_image.cur_pal = 0;
+    g_image.clear_face_usage();
     delete archive; archive = 0;
     free(raw_hex_buf); raw_hex_buf = 0; raw_hex_size = 0;
     if (hTree) TreeView_DeleteAllItems(hTree);
@@ -987,6 +988,12 @@ enum EntrySubType {
     SUB_WEAPON_DATA,     /* weapon skeleton + GPU display list */
     SUB_STANDALONE_EMD   /* standalone character model (p/h files) */
 };
+
+/* Entry type for display/loading purposes.  Uncompressed room RDTs are
+   shown and loaded through the LZSS0 path, just without decompressing. */
+static u32 effective_entry_type(const DatEntry& e) {
+    return is_raw_rdt_entry(e) ? (u32)DAT_LZSS0 : e.type;
+}
 
 static EntrySubType classify_lzss0(const DatEntry& e);
 static EntrySubType classify_lzss0(const DatEntry& e) {
@@ -1100,7 +1107,7 @@ void App::build_tree() {
     for (int i = 0; i < archive->count; i++) {
         const DatEntry& e = archive->entries[i];
         if (is_real_texture(e)) { nTex++; continue; }
-        switch (e.type) {
+        switch (effective_entry_type(e)) {
         case DAT_TEXTURE: case DAT_LZSS1: case DAT_TEXTURE_LINEAR: nData++; break; /* non-texture LZSS1 → data */
         case DAT_PALETTE: nPal++; break;
         case DAT_SNDH: nSndH++; break;
@@ -1148,7 +1155,7 @@ void App::build_tree() {
     for (int i = 0; i < archive->count; i++) {
         const DatEntry& e = archive->entries[i];
 
-        switch (e.type) {
+        switch (effective_entry_type(e)) {
         case DAT_TEXTURE: case DAT_LZSS1: case DAT_TEXTURE_LINEAR:
             if (is_real_texture(e)) {
                 int tx = e.x / 64;
@@ -1234,12 +1241,18 @@ void App::build_tree() {
             bool has_layout = false;
             EntrySubType st = SUB_COMPRESSED;
 
+            bool raw = (e.type != DAT_LZSS0);  /* uncompressed RDT */
             if (e.y & 0x8000) {
-                if (is_mips_code(e.data, e.size, e.y, e.x)) {
+                if (!raw && is_mips_code(e.data, e.size, e.y, e.x)) {
                     st = SUB_MIPS_CODE;
                 } else {
-                    has_layout = parse_rdt_layout_from_entry(e.data, e.size,
-                                                             e.y, e.x, layout);
+                    if (raw) {
+                        u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+                        has_layout = parse_rdt_layout(e.data, e.size, base, layout);
+                    } else {
+                        has_layout = parse_rdt_layout_from_entry(e.data, e.size,
+                                                                 e.y, e.x, layout);
+                    }
                     if (has_layout) {
                         if (layout.section_count > 0 && layout.emd_count > 0)
                             st = SUB_RDT_SCENE;
@@ -1405,6 +1418,13 @@ int App::selected_entry_idx() {
     tvi.hItem = hSel;
     TreeView_GetItem(hTree, &tvi);
     return (int)tvi.lParam;  /* -1 for category nodes, otherwise entry_idx | (sub<<16) */
+}
+
+static void on_entry_select(int sel_param);
+
+void App::refresh_selection() {
+    int sel = selected_entry_idx();
+    if (sel >= 0) on_entry_select(sel);
 }
 
 /*═══════════════════════════════════════════════════════════════════
@@ -1930,7 +1950,7 @@ static void on_entry_select(int sel_param)
 
     int panel = PANEL_HEX;
 
-    switch (e.type) {
+    switch (effective_entry_type(e)) {
     case DAT_TEXTURE_LINEAR: {
         /* Item bank: CLUT is at the start of the NEXT block (after this
            block's pixel data), not before the current block's pixels.
@@ -2034,13 +2054,21 @@ static void on_entry_select(int sel_param)
 
             /* ── Decompress ONCE, reuse for all parse/detect calls ── */
             Buffer lz_dec;
-            if (!lzss_decompress(e.data, e.size, lz_dec) || lz_dec.size == 0)
+            if (!dat_entry_payload(e, lz_dec) || lz_dec.size == 0)
                 break;
             const u8* dd = lz_dec.data;
             size_t    ds = lz_dec.size;
 
-            /* sub >= 2: specific EMD by ordinal (sub-2) */
-            if (sub >= 2 || sub == 0) {
+            /* sub >= 2: specific EMD by ordinal (sub-2).  sub=0 tries an EMD
+               first only when there is no room mesh, so a room never opens
+               as one of its characters. */
+            bool has_room = false;
+            if (sub == 0) {
+                RdtLayout room_layout;
+                has_room = parse_rdt_layout(dd, ds, base, room_layout) &&
+                           room_layout.section_count > 0;
+            }
+            if (sub >= 2 || (sub == 0 && !has_room)) {
                 int emd_ordinal = (sub >= 2) ? (sub - 2) : 0;
                 int hint = -1;
 
@@ -2149,57 +2177,21 @@ static void on_entry_select(int sel_param)
                 RdtSceneOverlay overlay;
                 bool has_overlay = parse_rdt_overlay(dd, ds, base, overlay);
 
-                /* Build exclude list: ALL sections referenced by ANY xform.
-                   The game renderer doesn't do a sequential walk — it renders
-                   each 0x23 xform slot exactly once. We replicate this by:
-                   1. Sequential walk renders ONLY orphaned sections (no xform)
-                   2. mesh_apply_xforms renders ALL xform instances (zero + non-zero pos)
-                   This way every section appears exactly where its xforms place it. */
-                u32 exclude_secs[128];
-                int n_exclude = 0;
-                if (has_overlay && overlay.n_xforms > 0) {
-                    size_t m_min = ds;
-                    for (int pi = 0; pi < 7 && pi * 4 + 4 <= (int)ds; pi++) {
-                        u32 pp = rd_u32(dd + pi * 4) - base;
-                        if (pp > 0x40 && pp < m_min) m_min = pp;
-                    }
-                    for (int xi = 0; xi < overlay.n_xforms; xi++) {
-                        const RdtSectionXform& xf = overlay.xforms[xi];
-                        if (xf.section_off == 0xFFFFFFFF || xf.section_off < 0x1C) continue;
-                        size_t so = xf.section_off;
-                        int lim = 1;  /* each 0x23 maps to exactly 1 section */
-                        int done = 0;
-                        while (so + 12 <= m_min && done < lim) {
-                            u32 sp1 = rd_u32(dd + so) - base;
-                            u32 sp2 = rd_u32(dd + so + 4) - base;
-                            u16 sc1 = rd_u16(dd + so + 8);
-                            u16 sc2 = rd_u16(dd + so + 10);
-                            if (sp1 >= ds || sp2 >= ds) break;
-                            if (sc1 > 5000 || sc2 > 5000) break;
-                            if (sc1 == 0 && sc2 == 0) { so += 12; continue; }
-                            size_t qe = sp2 + (size_t)sc2 * 52;
-                            if (qe > ds) break;
-                            bool dup = false;
-                            for (int ei = 0; ei < n_exclude; ei++)
-                                if (exclude_secs[ei] == (u32)so) { dup = true; break; }
-                            if (!dup && n_exclude < 128)
-                                exclude_secs[n_exclude++] = (u32)so;
-                            so = qe; done++;
-                        }
-                    }
-                }
-
-                if (parse_rdt_scene_dec(dd, ds, base, mesh,
-                        n_exclude > 0 ? exclude_secs : 0, n_exclude) && mesh.tri_count > 0)
-                    mesh_type = "Room Scene";
-                else if (parse_room_mesh_dec(dd, ds, base, mesh,
-                             n_exclude > 0 ? exclude_secs : 0, n_exclude) && mesh.tri_count > 0)
-                    mesh_type = "Static Mesh";
-                else if (n_exclude > 0 && has_overlay && overlay.n_xforms > 0) {
-                    /* All sections excluded from sequential walk — xforms will build mesh */
+                /* The game draws only the sections its scripts place in model
+                   slots (0x23, item zones); mesh_apply_xforms builds exactly
+                   those.  Other sections are leftovers (unused variants,
+                   objects in local coordinates) and would pile up at the
+                   origin, so the sequential walk is only a fallback for
+                   rooms without placements. */
+                bool placed = has_overlay && overlay.n_xforms > 0;
+                if (placed) {
                     mesh.alloc(0, 0);
                     mesh_type = "Room Scene";
                 }
+                else if (parse_rdt_scene_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+                    mesh_type = "Room Scene";
+                else if (parse_room_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+                    mesh_type = "Static Mesh";
                 else if (parse_standalone_emd_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
                     mesh_type = "Character Mesh";
                 else if (parse_door_mesh_dec(dd, ds, base, mesh))
@@ -2211,10 +2203,33 @@ static void on_entry_select(int sel_param)
                     /* Apply xform instancing FIRST, so all faces are in mesh
                        before we compute max_sub_pal for the texture atlas. */
                     int ov_zones = 0, ov_cols = 0, ov_cams = 0, ov_spawns = 0;
-                    if (has_overlay && overlay.n_xforms > 0) {
+                    if (placed) {
                         mesh_apply_xforms(mesh, dd, ds, base,
                                           overlay.xforms, overlay.n_xforms);
                         mesh_compute_smooth_normals(mesh);
+
+                        /* Sections nothing places (leftovers such as ST103's
+                           unused DDK) go in at their raw coordinates, flagged
+                           alt: the viewer hides them unless H is pressed. */
+                        RdtLayout lay;
+                        if (parse_rdt_layout(dd, ds, base, lay)) {
+                            RdtSectionXform unplaced[RDT_MAX_SECTIONS];
+                            int n_unplaced = 0;
+                            for (int si = 0; si < lay.section_count; si++) {
+                                u32 so = (u32)lay.sections[si].offset;
+                                bool used = false;
+                                for (int xi = 0; xi < overlay.n_xforms && !used; xi++)
+                                    used = overlay.xforms[xi].section_off == so;
+                                if (used) continue;
+                                RdtSectionXform& u = unplaced[n_unplaced++];
+                                memset(&u, 0, sizeof(u));
+                                u.section_off = so;
+                            }
+                            int first_alt = mesh.tri_count;
+                            mesh_apply_xforms(mesh, dd, ds, base, unplaced, n_unplaced);
+                            for (int ti = first_alt; ti < mesh.tri_count; ti++)
+                                mesh.tris[ti].alt = 1;
+                        }
                     }
 
                     /* Detect dominant BPP and collect unique CLUT values from ALL faces.
@@ -3010,6 +3025,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
                             if (dat_replace_entry(e, fbuf, fsz, compress)) {
                                 g_app.archive->modified = true;
+                                g_image.clear_face_usage();  /* meshes may have changed */
                                 char msg[512];
                                 _snprintf(msg, 511,
                                     "Entry %d replaced: %d bytes%s. Use Save As to write DAT.",
@@ -3148,7 +3164,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             "WAV Files (*.wav)\0*.wav\0", "Export WAV", "wav")) {
                             AudioSample& s = g_audio.samples[g_audio.cur_sample];
                             if (s.pcm && s.count > 0)
-                                write_wav_file(path, s.pcm, s.count);
+                                write_wav_file(path, s.pcm, s.count, s.rate);
                         }
                     }
                 }

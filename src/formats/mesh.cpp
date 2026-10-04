@@ -221,13 +221,15 @@ bool parse_rdt_layout(const u8* dec, size_t dec_size, u32 base,
         /* Empty section: skip header only */
         if (c1 == 0 && c2 == 0) { off += 12; continue; }
 
-        /* Validate the code byte of the first face to confirm GT3/GT4 */
+        /* The first face's GPU command must be a polygon of the right shape:
+           0x20-0x3F, bit 3 set for quads.  Any shading, texturing or
+           semi-transparency (e.g. 0x36, ST301) is allowed. */
         if (c1 > 0) {
             u8 code = dec[p1 + 24 + 7]; /* tail[7] of first tri */
-            if (code != 0x34 && code != 0x30 && code != 0x24) break;
+            if ((code & 0xE8) != 0x20) break;
         } else if (c2 > 0) {
             u8 code = dec[p2 + 32 + 7]; /* tail[7] of first quad */
-            if (code != 0x3C && code != 0x3E && code != 0x38 && code != 0x2C) break;
+            if ((code & 0xE8) != 0x28) break;
         }
 
         RdtMeshSection& sec = layout.sections[layout.section_count++];
@@ -280,6 +282,16 @@ bool parse_rdt_layout_from_entry(const u8* data, size_t size,
 
     u32 base = ((u32)(ey & 0x7FFF) << 16) | (u32)ex | 0x80000000u;
     return parse_rdt_layout(dec.data, dec.size, base, layout);
+}
+
+bool is_raw_rdt_entry(const DatEntry& e)
+{
+    if (e.type != DAT_DATA || !(e.y & 0x8000) || !e.data || e.size < 0x20)
+        return false;
+    u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+    RdtLayout layout;
+    return parse_rdt_layout(e.data, e.size, base, layout) &&
+           (layout.section_count > 0 || layout.emd_count > 0);
 }
 
 /*─── Detect room vs object mesh layout ──────────────────────────*/
@@ -361,7 +373,6 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
 
             s16 vs[3][3];
             u8  uvs[3][2];
-            bool valid = true;
             for (int vi = 0; vi < 3; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -369,11 +380,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 24);
             u16 cl = rd_u16(dec_data + o + 26);
@@ -409,7 +416,6 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
 
             s16 vs[4][3];
             u8  uvs[4][2];
-            bool valid = true;
             for (int vi = 0; vi < 4; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -417,11 +423,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 32);
             u16 cl = rd_u16(dec_data + o + 34);
@@ -546,7 +548,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
             for (int i = 0; i < (int)c1; i++) {
                 size_t o = p1 + (size_t)i * 40;
                 if (o + 40 > dec_size) break;
-                s16 vs[3][3]; u8 uvs[3][2]; bool valid = true;
+                s16 vs[3][3]; u8 uvs[3][2];
                 for (int vi = 0; vi < 3; vi++) {
                     vs[vi][0] = rd_s16(dec + o + vi*8);
                     vs[vi][1] = rd_s16(dec + o + vi*8+2);
@@ -554,10 +556,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                     u16 uv_raw = rd_u16(dec + o + vi*8+6);
                     uvs[vi][0] = (u8)(uv_raw & 0xFF);
                     uvs[vi][1] = (u8)(uv_raw >> 8);
-                    for (int a = 0; a < 3; a++)
-                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
                 }
-                if (!valid) continue;
                 u16 tp = rd_u16(dec + o + 24);
                 u16 cl = rd_u16(dec + o + 26);
                 u8 cols[3][3];
@@ -595,7 +594,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
             for (int i = 0; i < (int)c2; i++) {
                 size_t o = p2 + (size_t)i * 52;
                 if (o + 52 > dec_size) break;
-                s16 vs[4][3]; u8 uvs[4][2]; bool valid = true;
+                s16 vs[4][3]; u8 uvs[4][2];
                 for (int vi = 0; vi < 4; vi++) {
                     vs[vi][0] = rd_s16(dec + o + vi*8);
                     vs[vi][1] = rd_s16(dec + o + vi*8+2);
@@ -603,10 +602,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                     u16 uv_raw = rd_u16(dec + o + vi*8+6);
                     uvs[vi][0] = (u8)(uv_raw & 0xFF);
                     uvs[vi][1] = (u8)(uv_raw >> 8);
-                    for (int a = 0; a < 3; a++)
-                        if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD) valid = false;
                 }
-                if (!valid) continue;
                 u16 tp = rd_u16(dec + o + 32);
                 u16 cl = rd_u16(dec + o + 34);
                 u8 cols[4][3];
@@ -2141,7 +2137,6 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
 
             s16 vs[3][3];
             u8  uvs[3][2];
-            bool valid = true;
             for (int vi = 0; vi < 3; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -2149,11 +2144,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 24);
             u16 cl = rd_u16(dec_data + o + 26);
@@ -2199,7 +2190,6 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
 
             s16 vs[4][3];
             u8  uvs[4][2];
-            bool valid = true;
             for (int vi = 0; vi < 4; vi++) {
                 vs[vi][0] = rd_s16(dec_data + o + vi * 8);
                 vs[vi][1] = rd_s16(dec_data + o + vi * 8 + 2);
@@ -2207,11 +2197,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                 u16 uv_raw = rd_u16(dec_data + o + vi * 8 + 6);
                 uvs[vi][0] = (u8)(uv_raw & 0xFF);
                 uvs[vi][1] = (u8)((uv_raw >> 8) & 0xFF);
-                for (int a = 0; a < 3; a++)
-                    if (vs[vi][a] > MAX_COORD || vs[vi][a] < -MAX_COORD)
-                        valid = false;
             }
-            if (!valid) continue;
 
             u16 tp = rd_u16(dec_data + o + 32);
             u16 cl = rd_u16(dec_data + o + 34);
@@ -2814,6 +2800,116 @@ static int scd_opcode_advance(const u8* dec, size_t dec_size, size_t pc) {
     return 1;  /* 0x70+ handled above */
 }
 
+/* Section placements: every 0x23 opcode (model slot = section at a
+   position) and every item pickup zone (0x28 type 4) that shows a model.
+   The linear script walk loses sync on some scripts and misses
+   placements, so scan the whole script area instead.  Opcodes start on
+   4-byte boundaries from the script base, and a candidate only counts
+   when its pointer lands on a valid section header, so false hits are
+   not a concern.  The same section at the same place is kept once.
+
+   Scripts then often adjust a placed model: 0x22 03 <slot> selects model
+   slot <slot> as the work target, then 0x2A sets one of its fields (field
+   3/4/5 = x/y/z, 6/7/8 = rotation; sub_47416C), 0x36 sets x/y/z and 0x37
+   the rotation.  Item models rely on this, e.g. ST302 lifts its DDK onto
+   the desk with y = -950.  The writes up to the next work target are
+   applied to the slot's latest placement; positions beyond +/-30000 are
+   scripts moving a model out of view and are skipped. */
+static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
+                                    size_t scd_base, size_t meta_min,
+                                    RdtSceneOverlay& ov)
+{
+    int slot_xf[256];
+    for (int i = 0; i < 256; i++) slot_xf[i] = -1;
+
+    for (size_t pc = scd_base; pc + 32 <= dec_size && ov.n_xforms < 64; pc += 4) {
+        u8 op = dec[pc];
+        u32 sec_off;
+        RdtSectionXform x;
+        memset(&x, 0, sizeof(x));
+        if (op == 0x22 && dec[pc + 1] == 3 && dec[pc + 3] == 0) {
+            int xi = slot_xf[dec[pc + 2]];
+            size_t q = pc + 4;
+            for (int n = 0; xi >= 0 && n < 32 && q + 8 <= dec_size; n++) {
+                u8 qop = dec[q];
+                if (qop == 0x22) break;              /* new work target */
+                RdtSectionXform& t = ov.xforms[xi];
+                if (qop == 0x2A) {
+                    s16 v = rd_s16(dec + q + 4);
+                    switch (dec[q + 2]) {
+                    case 3: if (v > -30000 && v < 30000) t.px = v; break;
+                    case 4: if (v > -30000 && v < 30000) t.py = v; break;
+                    case 5: if (v > -30000 && v < 30000) t.pz = v; break;
+                    case 6: t.rx = v; break;
+                    case 7: t.ry = v; break;
+                    case 8: t.rz = v; break;
+                    }
+                } else if (qop == 0x36 || qop == 0x37) {
+                    /* 0x36 sets x/y/z (fields 3-5), 0x37 the rotation (6-8) */
+                    s16 a = rd_s16(dec + q + 2), b = rd_s16(dec + q + 4), c = rd_s16(dec + q + 6);
+                    if (qop == 0x37) { t.rx = a; t.ry = b; t.rz = c; }
+                    else if (a > -30000 && a < 30000 && b > -30000 && b < 30000 &&
+                             c > -30000 && c < 30000) { t.px = a; t.py = b; t.pz = c; }
+                }
+                int adv = scd_opcode_advance(dec, dec_size, q);
+                if (adv < 0) adv = 4;                /* 0x0C jump */
+                if (adv == 0) break;                 /* end of script */
+                q += (size_t)adv;
+            }
+            continue;
+        }
+        if (op == 0x23) {
+            sec_off = rd_u32(dec + pc + 8) - base;
+            x.slot        = dec[pc + 1];
+            x.flags       = dec[pc + 2];
+            x.render_mode = dec[pc + 3];
+            x.ot_depth    = rd_u16(dec + pc + 4);
+            x.px = rd_s16(dec + pc + 12);
+            x.py = rd_s16(dec + pc + 14);
+            x.pz = rd_s16(dec + pc + 16);
+            x.rx = rd_s16(dec + pc + 18);
+            x.ry = rd_s16(dec + pc + 20);
+            x.rz = rd_s16(dec + pc + 22);
+        } else if (op == 0x28 && dec[pc + 2] == 4 && pc + 44 <= dec_size &&
+                   dec[pc + 34] != 0xFF) {
+            /* Item pickup zone: model slot at +34, section at +36.  The
+               game (sub_426DFC -> sub_448E3B) puts the model on the floor
+               (y = 0) at the midpoint of zone corners 0 and 2, and spins
+               it about Y while the item has not been picked up. */
+            sec_off = rd_u32(dec + pc + 36) - base;
+            s16 a0 = rd_s16(dec + pc + 4);
+            s16 a1 = rd_s16(dec + pc + 6);
+            s16 a4 = rd_s16(dec + pc + 12);
+            s16 a5 = rd_s16(dec + pc + 14);
+            x.slot = dec[pc + 34];
+            x.px = a4 + (s16)((a0 - a4) / 2);
+            x.pz = a5 + (s16)((a1 - a5) / 2);
+        } else {
+            continue;
+        }
+
+        if (sec_off < 0x1C || sec_off + 12 > meta_min) continue;
+        u32 sp1 = rd_u32(dec + sec_off) - base;
+        u32 sp2 = rd_u32(dec + sec_off + 4) - base;
+        u16 sc1 = rd_u16(dec + sec_off + 8);
+        u16 sc2 = rd_u16(dec + sec_off + 10);
+        if (sp1 >= dec_size || sp2 >= dec_size || sc1 > 5000 || sc2 > 5000) continue;
+        if ((size_t)sp1 + (size_t)sc1 * 40 > dec_size ||
+            (size_t)sp2 + (size_t)sc2 * 52 > dec_size) continue;
+        x.section_off = sec_off;
+
+        int found = -1;
+        for (int i = 0; i < ov.n_xforms && found < 0; i++) {
+            const RdtSectionXform& o = ov.xforms[i];
+            if (o.section_off == x.section_off &&
+                o.px == x.px && o.py == x.py && o.pz == x.pz &&
+                o.rx == x.rx && o.ry == x.ry && o.rz == x.rz) found = i;
+        }
+        if (found < 0) { found = ov.n_xforms; ov.xforms[ov.n_xforms++] = x; }
+        slot_xf[x.slot] = found;
+    }
+}
+
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& ov)
 {
@@ -3013,6 +3109,9 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
      * First u32 / 4 gives the script count (table size = first_offset bytes).
      * Each script is walked linearly, skipping conditional branches.
      */
+    scan_section_placements(dec, dec_size, base, offs[5], meta_min, ov);
+    if (ov.n_xforms > 0) found++;
+
     {
         size_t scd_base = offs[5];
         if (scd_base + 4 > dec_size) goto done;
@@ -3047,48 +3146,9 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                 int adv = scd_opcode_advance(dec, dec_size, pc);
                 if (adv <= 0) break;
 
-                /* ─── Extract spatial data from known opcodes ─── */
-
-                /* 0x23: Room model transform (32 bytes) */
-                if (op == 0x23 && pc + 32 <= dec_size && ov.n_xforms < 64) {
-                    u8 slot = dec[pc + 1];
-                    u32 sp_raw = rd_u32(dec + pc + 8);
-                    u32 sec_off;
-                    if (sp_raw >= base && (sp_raw - base) < dec_size)
-                        sec_off = sp_raw - base;
-                    else
-                        sec_off = 0xFFFFFFFF;
-
-                    if (sec_off != 0xFFFFFFFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
-                        u32 sp1 = rd_u32(dec + sec_off) - base;
-                        u32 sp2 = rd_u32(dec + sec_off + 4) - base;
-                        u16 sc1 = rd_u16(dec + sec_off + 8);
-                        u16 sc2 = rd_u16(dec + sec_off + 10);
-                        if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
-                            /* Store ALL 0x23 xforms — no dedup.
-                               Each 0x23 is an independent model slot write.
-                               Conditional branches may write the same slot with
-                               different section/position; we store all because we
-                               don't know which branch executes at runtime.
-                               The exclude list needs every referenced section_off. */
-                            if (ov.n_xforms < 64) {
-                                RdtSectionXform& x = ov.xforms[ov.n_xforms++];
-                                x.section_off   = sec_off;
-                                x.slot           = slot;
-                                x.flags          = dec[pc + 2];
-                                x.render_mode    = dec[pc + 3];
-                                x.ot_depth       = rd_u16(dec + pc + 4);
-                                x.px = rd_s16(dec + pc + 12);
-                                x.py = rd_s16(dec + pc + 14);
-                                x.pz = rd_s16(dec + pc + 16);
-                                x.rx = rd_s16(dec + pc + 18);
-                                x.ry = rd_s16(dec + pc + 20);
-                                x.rz = rd_s16(dec + pc + 22);
-                                found++;
-                            }
-                        }
-                    }
-                }
+                /* ─── Extract spatial data from known opcodes ───
+                   (0x23 and item-zone section placements are found by
+                   scan_section_placements, not by this walk.) */
 
                 /* 0x28: Collision/trigger zone (variable size)
                    Zone data at +4: 4 × (s16 x, s16 z) = 16 bytes of XZ corners.
@@ -3117,44 +3177,6 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                             z.flags           = 0x28;
                         }
                         found++;
-                    }
-
-                    /* Type 4 (door): section pointer at opcode+36, model slot at opcode+34.
-                       sub_426DFC positions the section mesh at the door zone center.
-                       Slot 0xFF means no model — skip those. */
-                    if (typ == 4 && pc + 44 <= dec_size) {
-                        u8 mdl_slot = dec[pc + 34];
-                        u32 sec_raw = rd_u32(dec + pc + 36);
-                        u32 sec_off = sec_raw - base;
-                        if (mdl_slot != 0xFF && sec_off >= 0x1C && sec_off + 12 <= meta_min) {
-                            u32 sp1 = rd_u32(dec + sec_off) - base;
-                            u32 sp2 = rd_u32(dec + sec_off + 4) - base;
-                            u16 sc1 = rd_u16(dec + sec_off + 8);
-                            u16 sc2 = rd_u16(dec + sec_off + 10);
-                            if (sp1 < dec_size && sp2 < dec_size && sc1 < 5000 && sc2 < 5000) {
-                                /* Door center = midpoint of corners 0 and 2 */
-                                s16 a0 = rd_s16(dec + pc + 4);
-                                s16 a1 = rd_s16(dec + pc + 6);
-                                s16 a4 = rd_s16(dec + pc + 12);
-                                s16 a5 = rd_s16(dec + pc + 14);
-                                s16 cx = a4 + (s16)((a0 - a4) / 2);
-                                s16 cz = a5 + (s16)((a1 - a5) / 2);
-                                if (ov.n_xforms < 64) {
-                                    RdtSectionXform& x = ov.xforms[ov.n_xforms++];
-                                    x.section_off = sec_off;
-                                    x.slot        = mdl_slot;
-                                    x.flags       = 0;
-                                    x.render_mode = 0;
-                                    x.ot_depth    = 0;
-                                    x.px = cx;
-                                    x.py = 0;
-                                    x.pz = cz;
-                                    x.rx = 0;
-                                    x.ry = 0;
-                                    x.rz = 0;
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -3335,6 +3357,72 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 
 done:
     return found > 0;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Texture usage  -  which tpage/CLUT/UVs every textured face samples
+ *═══════════════════════════════════════════════════════════════════*/
+static void add_mesh_usage(const Mesh& mesh, TexFaceUse*& out, int& count, int& cap)
+{
+    for (int i = 0; i < mesh.tri_count; i++) {
+        if (count == cap) {
+            int ncap = cap ? cap * 2 : 1024;
+            TexFaceUse* p = (TexFaceUse*)realloc(out, (size_t)ncap * sizeof(TexFaceUse));
+            if (!p) return;
+            out = p; cap = ncap;
+        }
+        const MeshTri& t = mesh.tris[i];
+        TexFaceUse& u = out[count++];
+        u.tpage = t.tpage;
+        u.clut  = t.clut;
+        memcpy(u.uv, t.uv, sizeof(u.uv));
+    }
+}
+
+int collect_texture_usage(const DatArchive& archive, TexFaceUse** out)
+{
+    TexFaceUse* faces = 0;
+    int count = 0, cap = 0;
+
+    for (int i = 0; i < archive.count; i++) {
+        const DatEntry& e = archive.entries[i];
+        if (!(e.y & 0x8000)) continue;
+        if (e.type != DAT_LZSS0 && !is_raw_rdt_entry(e)) continue;
+
+        Buffer dec;
+        if (!dat_entry_payload(e, dec) || dec.size < 0x20) continue;
+        if (is_mips_code_dec(dec.data, dec.size)) continue;
+        u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+
+        RdtLayout layout;
+        bool has_layout = parse_rdt_layout(dec.data, dec.size, base, layout);
+        if (has_layout && layout.section_count > 0) {
+            Mesh mesh;
+            if (parse_rdt_scene_dec(dec.data, dec.size, base, mesh))
+                add_mesh_usage(mesh, faces, count, cap);
+        }
+        if (has_layout && layout.emd_count > 0) {
+            for (int k = 0; k < layout.emd_count && k < RDT_MAX_EMDS; k++) {
+                EmdModel model;
+                if (parse_emd_model_dec(dec.data, dec.size, e.y, e.x, model,
+                                        (int)layout.emds[k].offset))
+                    add_mesh_usage(model.mesh, faces, count, cap);
+            }
+        }
+        if (!has_layout || (layout.section_count == 0 && layout.emd_count == 0)) {
+            Mesh mesh;
+            if (is_door_mesh_entry_dec(dec.data, dec.size, e.y)) {
+                if (parse_door_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            } else if (is_standalone_emd_dec(dec.data, dec.size, base)) {
+                if (parse_standalone_emd_mesh_dec(dec.data, dec.size, base, mesh))
+                    add_mesh_usage(mesh, faces, count, cap);
+            }
+        }
+    }
+
+    *out = faces;
+    return count;
 }
 
 #include "emd_glb.inc"

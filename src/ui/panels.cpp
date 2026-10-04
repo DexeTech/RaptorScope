@@ -344,9 +344,17 @@ LRESULT CALLBACK HexPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 /*═══════════════════════════════════════════════════════════════════
  *  Image Panel
  *═══════════════════════════════════════════════════════════════════*/
+void ImagePanel::clear_face_usage() {
+    free(face_uses);
+    face_uses = 0;
+    n_face_uses = 0;
+    face_uses_ready = false;
+}
+
 void ImagePanel::set_bitmap(const u8* rgba, int w, int h) {
     if (hBmp) { DeleteObject(hBmp); hBmp = 0; }
     img_w = w; img_h = h;
+    showing_face_cluts = false;
     fitted = true;  /* auto-fit on next paint */
     if (!rgba || w <= 0 || h <= 0) return;
     /* Create a DIB section with premultiplied alpha for AlphaBlend */
@@ -388,6 +396,24 @@ void ImagePanel::render_entry(const DatEntry& tex, const DatEntry* pal, bool do_
         if (lzss_decompress(tex.data, tex.size, dec))
             { pix = dec.data; pix_size = dec.size; }
     }
+
+    /* Decode the way the archive's faces sample this texture, if any do */
+    if (face_cluts && do_deswizzle && g_app.archive && !g_app.archive->is_item_bank &&
+        tex.w > 0 && tex.h > 0 && tex.x <= 1024) {
+        if (!face_uses_ready) {
+            n_face_uses = collect_texture_usage(*g_app.archive, &face_uses);
+            face_uses_ready = true;
+        }
+        u8* rgba = 0; int fw = 0, fh = 0;
+        if (render_texture_by_faces(pix, pix_size, tex.x, tex.y, tex.w, tex.h,
+                                    face_uses, n_face_uses, *g_app.archive,
+                                    &rgba, &fw, &fh)) {
+            set_bitmap(rgba, fw, fh); free(rgba);
+            showing_face_cluts = true;
+            return;
+        }
+    }
+
     int vw = tex.w, vh = tex.h;
     if (vw == 0 || vh == 0) { vw = 128; vh = 128; }
     int pw, ph;
@@ -540,11 +566,15 @@ void ImagePanel::paint(HDC hdc, RECT& rc) {
         {
             char info[128];
             int pct = (int)(zoom * 100.0 + 0.5);
-            if (max_pal_rows > 1)
-                _snprintf(info, 127, "%dx%d  %d%%  CLUT %d/%d [Up/Down]",
-                          img_w, img_h, pct, pal_row + 1, max_pal_rows);
+            const char* face_hint = (!face_cluts && n_face_uses > 0) ? "  [C: room CLUTs]" : "";
+            if (showing_face_cluts)
+                _snprintf(info, 127, "%dx%d  %d%%  CLUTs from room faces, unused areas dimmed [C: single CLUT]",
+                          img_w, img_h, pct);
+            else if (max_pal_rows > 1)
+                _snprintf(info, 127, "%dx%d  %d%%  CLUT %d/%d [Up/Down]%s",
+                          img_w, img_h, pct, pal_row + 1, max_pal_rows, face_hint);
             else
-                _snprintf(info, 127, "%dx%d  %d%%", img_w, img_h, pct);
+                _snprintf(info, 127, "%dx%d  %d%%%s", img_w, img_h, pct, face_hint);
             SetBkMode(buf, TRANSPARENT);
             SetTextColor(buf, RGB(0, 0, 0));
             TextOutA(buf, 7, ch - 19, info, (int)strlen(info));
@@ -630,6 +660,15 @@ LRESULT CALLBACK ImagePanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     } break;
 
     case WM_KEYDOWN: {
+        /* C toggles room-face CLUTs; Up/Down picks a single CLUT row, so
+           it leaves room-face mode first. */
+        bool to_single = g_image.showing_face_cluts && (wp == VK_UP || wp == VK_DOWN);
+        if (wp == 'C' || to_single) {
+            g_image.face_cluts = to_single ? false : !g_image.face_cluts;
+            g_app.refresh_selection();
+            InvalidateRect(hwnd, 0, FALSE);
+            return 0;
+        }
         if (g_image.max_pal_rows > 1) {
             if (wp == VK_UP) {
                 if (g_image.pal_row > 0) {
@@ -860,6 +899,38 @@ void AudioPanel::free_samples() {
     pcm_data = 0; pcm_count = 0;
 }
 
+/* An SNDB is loaded into SPU RAM at the address in its x/y fields, so a
+   Gian tone's VAG starts at (tone SPU address - that address) in the SNDB. */
+static u32 sndb_spu_base(const DatEntry& sndb) {
+    return ((u32)sndb.y << 16) | sndb.x;
+}
+
+/* Archives can hold several SNDH/SNDB pairs: the SNDB's header is the
+   SNDH whose tones point into it. */
+static bool find_sndb_gian(const DatEntry& sndb, GianHeader& out) {
+    if (!g_app.archive) return false;
+    u32 base = sndb_spu_base(sndb);
+    int best = 0;
+    for (int i = 0; i < g_app.archive->count; i++) {
+        const DatEntry& e = g_app.archive->entries[i];
+        if (e.type != DAT_SNDH || !e.data) continue;
+        GianHeader gh;
+        if (!parse_gian_header(e.data, e.size, gh)) continue;
+        int hits = 0;
+        for (int t = 0; t < gh.tone_count; t++)
+            if (gh.tones[t].spu_addr - base < sndb.size) hits++;
+        if (hits > best) { best = hits; out = gh; }
+    }
+    return best > 0;
+}
+
+/* First tone of gh that plays the sample starting at off in the SNDB. */
+static const GianTone* find_sample_tone(const GianHeader& gh, u32 base, int off) {
+    for (int t = 0; t < gh.tone_count; t++)
+        if (gh.tones[t].spu_addr - base == (u32)off) return &gh.tones[t];
+    return 0;
+}
+
 void AudioPanel::decode_sndb(const DatEntry& entry) {
     stop(); free_samples();
     mode = AMODE_SNDB;
@@ -890,9 +961,23 @@ void AudioPanel::decode_sndb(const DatEntry& entry) {
         } else i += 16;
     }
 
+    /* VAGs have no rate of their own: the SPU plays each at the pitch of
+       the tone that keys it. A sound effect's tone has a single key, so
+       its rate is exact. An instrument spans a range of keys and is shown
+       at middle C, and samples no tone uses get the game's most common
+       rate; both are marked as guesses. */
+    GianHeader gh;
+    bool have_gh = find_sndb_gian(entry, gh);
+    u32 base = sndb_spu_base(entry);
+    for (int k = 0; k < num_samples; k++) {
+        AudioSample& s = samples[k];
+        const GianTone* tone = have_gh ? find_sample_tone(gh, base, s.start_off) : 0;
+        s.rate = tone ? gian_tone_sample_rate(*tone) : 11025;
+        s.rate_known = tone && tone->key_lo == tone->key_hi;
+    }
+
     cur_sample = 0; scroll_off = 0;
     if (num_samples > 0) select_sample(0);
-    sample_rate = 22050; channels = 1;
     if (hwnd) InvalidateRect(hwnd, 0, FALSE);
 }
 
@@ -914,6 +999,7 @@ void AudioPanel::decode_snde(const DatEntry& entry) {
     seq_note_count = 0; seq_duration = 0; seq_ch_mask = 0;
     free(seq_pcm); seq_pcm = 0; seq_frames = 0; seq_rendered = false;
     active_snde = &entry;
+    sample_rate = 22050; /* synth output rate */
 
     if (entry.data && entry.size >= 15) {
         parse_seq_header(entry.data, entry.size, seq_hdr);
@@ -932,46 +1018,39 @@ void AudioPanel::render_seq() {
     /* Find SNDH, SNDB, and SNDE in the archive to synthesize */
     if (!g_app.archive || seq_rendered) return;
 
-    const DatEntry* sndh_e = 0;
     const DatEntry* sndb_e = 0;
     const DatEntry* snde_e = active_snde;
 
     for (int i = 0; i < g_app.archive->count; i++) {
         const DatEntry& e = g_app.archive->entries[i];
-        if (e.type == DAT_SNDH && e.data && e.size >= 12 && memcmp(e.data, "Gian", 4) == 0)
-            sndh_e = &e;
         if (e.type == DAT_SNDB && e.data) { sndb_e = &e; }
     }
-    if (!sndh_e || !sndb_e || !snde_e) return;
+    if (!sndb_e || !snde_e) return;
 
-    /* Parse Gian header */
+    /* Gian header whose tones play this SNDB */
     GianHeader gh;
-    if (!parse_gian_header(sndh_e->data, sndh_e->size, gh)) return;
+    if (!find_sndb_gian(*sndb_e, gh)) return;
 
-    /* Split and decode SNDB samples */
-    const int MAX_VAG = 32;
+    /* Decode each tone's VAG into the synth's slot for it (vag_bank) */
+    const int MAX_VAG = 128;
     DecodedSample vag[MAX_VAG];
     memset(vag, 0, sizeof(vag));
     int nvag = 0;
 
-    /* Split SNDB body */
     const u8* sd = sndb_e->data;
-    int sz = (int)sndb_e->size;
-    int sstart = 0, si = 0;
-    while (si < sz - 15 && nvag < MAX_VAG) {
-        if (sd[si + 1] & 1) {
-            int send = si + 16;
-            if (send + 16 <= sz && sd[send + 1] == 7) send += 16;
-            if (send - sstart >= 16) {
-                int blk = send - sstart;
-                int maxp = (blk / 16) * 28 + 64;
-                vag[nvag].pcm = (s16*)malloc(maxp * sizeof(s16));
-                vag[nvag].count = decode_vag(sd, sstart, send, vag[nvag].pcm, maxp);
-                if (vag[nvag].count <= 0) { free(vag[nvag].pcm); vag[nvag].pcm = 0; vag[nvag].count = 0; }
-                nvag++;
-            }
-            sstart = send; si = send;
-        } else si += 16;
+    size_t sz = sndb_e->size;
+    u32 base = sndb_spu_base(*sndb_e);
+    for (int t = 0; t < gh.tone_count; t++) {
+        int vi = gh.tones[t].vag_bank;
+        u32 off = gh.tones[t].spu_addr - base;
+        if (vi >= MAX_VAG || vag[vi].pcm || off >= sz) continue;
+        size_t end = off;
+        while (end + 16 <= sz) { end += 16; if (sd[end - 15] & 1) break; }
+        int maxp = (int)((end - off) / 16) * 28 + 64;
+        vag[vi].pcm = (s16*)malloc(maxp * sizeof(s16));
+        vag[vi].count = decode_vag(sd, off, end, vag[vi].pcm, maxp);
+        if (vag[vi].count <= 0) { free(vag[vi].pcm); vag[vi].pcm = 0; vag[vi].count = 0; }
+        if (vi >= nvag) nvag = vi + 1;
     }
 
     /* Render */
@@ -1006,6 +1085,7 @@ void AudioPanel::select_sample(int idx) {
     cur_sample = idx;
     pcm_data = samples[idx].pcm;
     pcm_count = samples[idx].count;
+    sample_rate = samples[idx].rate;
     channels = 1;
     if (hwnd) InvalidateRect(hwnd, 0, FALSE);
 }
@@ -1334,7 +1414,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
             if (y_off >= ch) break;
             AudioSample& s = samples[si];
             bool sel = (si == cur_sample);
-            f32 dur = (f32)s.count / sample_rate;
+            f32 dur = (f32)s.count / s.rate;
             int rh = (y_off + row_h > ch) ? (ch - y_off) : row_h;
 
             /* Row background */
@@ -1357,7 +1437,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
 
             SelectObject(buf, fSmall);
             SetTextColor(buf, audio_dim());
-            char info[48]; _snprintf(info, 47, "%.2fs  %dblk", dur, (s.end_off - s.start_off) / 16);
+            char info[48]; _snprintf(info, 47, "%.2fs  %d Hz%s", dur, s.rate, s.rate_known ? "" : "?");
             TextOutA(buf, zs(10,z), y_off + rh - zs(14,z), info, (int)strlen(info));
 
             /* Play indicator */
@@ -2060,6 +2140,7 @@ static void build_solid_list(int list_id, const Mesh& mesh,
         u8 cr = (u8)(t.color.r < 128 ? t.color.r * 2 : 255);
         u8 cg = (u8)(t.color.g < 128 ? t.color.g * 2 : 255);
         u8 cb = (u8)(t.color.b < 128 ? t.color.b * 2 : 255);
+        if (t.alt) { cr = 255; cg = 96; cb = 255; }  /* unplaced: magenta tint */
         glColor3ub(cr, cg, cb);
 
         /* PS1 tpage UV mapping */
@@ -2122,6 +2203,7 @@ static void build_wire_list(int list_id, const Mesh& mesh) {
         const MeshTri& t = mesh.tris[i];
         if ((int)t.idx[0] >= mesh.vert_count || (int)t.idx[1] >= mesh.vert_count ||
             (int)t.idx[2] >= mesh.vert_count) continue;
+        if (t.alt) continue;
         glColor3ub(t.color.r, t.color.g, t.color.b);
         for (int e = 0; e < 3; e++) {
             int a = t.idx[e], b = t.idx[(e+1)%3];
@@ -2569,25 +2651,64 @@ static void build_overlay_list(int list_id, const RdtSceneOverlay& ov) {
 }
 
 /* Compute bounding box from face-referenced vertices only */
+/* Frame the camera on the mesh.  Outdoor rooms have sky and sea planes
+   reaching +/-32000 units; framing those would shrink the walkable area to a
+   speck, so faces entirely within FRAME_LIMIT are framed when there are any. */
+#define FRAME_LIMIT 15000.0f
 static void mesh_bounds(const Mesh& mesh, float* cx, float* cy, float* cz, float* dist) {
     float mnx=1e9f, mxx=-1e9f, mny=1e9f, mxy=-1e9f, mnz=1e9f, mxz=-1e9f;
-    for (int i = 0; i < mesh.tri_count; i++) {
-        for (int vi = 0; vi < 3; vi++) {
-            int idx = mesh.tris[i].idx[vi];
-            if (idx < 0 || idx >= mesh.vert_count) continue;
-            const MeshVert& v = mesh.verts[idx];
-            if (v.x < mnx) mnx = v.x;
-            if (v.x > mxx) mxx = v.x;
-            if (v.y < mny) mny = v.y;
-            if (v.y > mxy) mxy = v.y;
-            if (v.z < mnz) mnz = v.z;
-            if (v.z > mxz) mxz = v.z;
+    for (int pass = 0; pass < 2 && mnx > mxx; pass++) {
+        for (int i = 0; i < mesh.tri_count; i++) {
+            if (mesh.tris[i].alt) continue;
+            bool in_frame = true;
+            for (int vi = 0; vi < 3 && pass == 0; vi++) {
+                int idx = mesh.tris[i].idx[vi];
+                if (idx < 0 || idx >= mesh.vert_count) continue;
+                const MeshVert& v = mesh.verts[idx];
+                if (fabsf(v.x) > FRAME_LIMIT || fabsf(v.y) > FRAME_LIMIT ||
+                    fabsf(v.z) > FRAME_LIMIT) in_frame = false;
+            }
+            if (!in_frame) continue;
+            for (int vi = 0; vi < 3; vi++) {
+                int idx = mesh.tris[i].idx[vi];
+                if (idx < 0 || idx >= mesh.vert_count) continue;
+                const MeshVert& v = mesh.verts[idx];
+                if (v.x < mnx) mnx = v.x;
+                if (v.x > mxx) mxx = v.x;
+                if (v.y < mny) mny = v.y;
+                if (v.y > mxy) mxy = v.y;
+                if (v.z < mnz) mnz = v.z;
+                if (v.z > mxz) mxz = v.z;
+            }
         }
     }
+    if (mnx > mxx) { mnx = mxx = mny = mxy = mnz = mxz = 0; }
     *cx = (mnx+mxx)*0.5f; *cy = (mny+mxy)*0.5f; *cz = (mnz+mxz)*0.5f;
     float dx = mxx-mnx, dy = mxy-mny, dz = mxz-mnz;
     *dist = sqrtf(dx*dx+dy*dy+dz*dz) * 1.2f;
     if (*dist < 100) *dist = 100;
+}
+
+/* Distance from the origin to the farthest vertex. */
+static float mesh_reach(const Mesh& mesh) {
+    float r2 = 0;
+    for (int i = 0; i < mesh.vert_count; i++) {
+        const MeshVert& v = mesh.verts[i];
+        float d2 = v.x*v.x + v.y*v.y + v.z*v.z;
+        if (d2 > r2) r2 = d2;
+    }
+    return sqrtf(r2);
+}
+
+/* Far clip for the orbit camera: cam_dist*20 keeps depth precision, but must
+   still reach every vertex, which lies at most cam_dist + |target| + reach
+   from the eye. */
+static double orbit_far_clip(float cam_dist, float tx, float ty, float tz, float reach) {
+    double far_clip = cam_dist * 20.0;
+    if (far_clip < 10000.0) far_clip = 10000.0;
+    double need = cam_dist + sqrt((double)tx*tx + (double)ty*ty + (double)tz*tz) + reach;
+    if (far_clip < need) far_clip = need;
+    return far_clip;
 }
 
 void ViewerPanel3D::set_mesh(const Mesh& mesh) {
@@ -2642,7 +2763,7 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
        subtractive (ABR 2) → gl_sub_id. */
     gl_list_id = glGenLists(1);
     build_solid_list(gl_list_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
-                     num_pal_rows, clut_base_y, true, tex_vram_y, 0,
+                     num_pal_rows, clut_base_y, true, tex_vram_y, 1,
                      num_sub_pals, clut_base_x, 0);
 
     /* Scan for semi-transparent faces */
@@ -2657,7 +2778,7 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     if (has_additive) {
         gl_blend_id = glGenLists(1);
         build_solid_list(gl_blend_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
-                         num_pal_rows, clut_base_y, true, tex_vram_y, 0,
+                         num_pal_rows, clut_base_y, true, tex_vram_y, 1,
                          num_sub_pals, clut_base_x, 1);
     } else {
         gl_blend_id = 0;
@@ -2667,13 +2788,22 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     if (has_subtractive) {
         gl_sub_id = glGenLists(1);
         build_solid_list(gl_sub_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
-                         num_pal_rows, clut_base_y, true, tex_vram_y, 0,
+                         num_pal_rows, clut_base_y, true, tex_vram_y, 1,
                          num_sub_pals, clut_base_x, 2);
     } else {
         gl_sub_id = 0;
     }
 
+    /* Unplaced sections (MeshTri.alt), shown with H */
     gl_alt_id = 0;
+    for (int fi = 0; fi < mesh.tri_count; fi++) {
+        if (!mesh.tris[fi].alt) continue;
+        gl_alt_id = glGenLists(1);
+        build_solid_list(gl_alt_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
+                         num_pal_rows, clut_base_y, true, tex_vram_y, 2,
+                         num_sub_pals, clut_base_x, -1);
+        break;
+    }
     gl_wire_id = glGenLists(1); build_wire_list(gl_wire_id, mesh);
     if (gl_normals_id) { glDeleteLists(gl_normals_id, 1); gl_normals_id = 0; }
     gl_normals_id = glGenLists(1); build_normals_list(gl_normals_id, mesh);
@@ -2724,6 +2854,7 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     }
 
     mesh_bounds(mesh, &cam_x, &cam_y, &cam_z, &cam_dist);
+    scene_reach = mesh_reach(mesh);
     cam_yaw = 180; cam_pitch = 10; cam_upx = 0; cam_upy = 1; cam_upz = 0;
     wglMakeCurrent(0, 0);
     render();
@@ -2841,6 +2972,7 @@ void ViewerPanel3D::set_emd(const EmdModel& emd) {
     }
 
     mesh_bounds(emd.mesh, &cam_x, &cam_y, &cam_z, &cam_dist);
+    scene_reach = mesh_reach(emd.mesh);
     cam_yaw = 180; cam_pitch = 10; cam_upx = 0; cam_upy = 1; cam_upz = 0;
     wglMakeCurrent(0, 0);
     render();
@@ -3191,7 +3323,7 @@ void ViewerPanel3D::anim_select_clip(int clip) {
    but works on VM drivers that choke on compiled lists. */
 static void draw_mesh_immediate(const MeshVert* verts, int nv,
                                 const MeshTri* tris, int nt,
-                                bool flip_normals, bool wire)
+                                bool flip_normals, bool wire, bool show_alt = false)
 {
     if (!verts || !tris || nt == 0) return;
 
@@ -3200,6 +3332,7 @@ static void draw_mesh_immediate(const MeshVert* verts, int nv,
         for (int i = 0; i < nt; i++) {
             const MeshTri& t = tris[i];
             if ((int)t.idx[0] >= nv || (int)t.idx[1] >= nv || (int)t.idx[2] >= nv) continue;
+            if (t.alt) continue;
             for (int e = 0; e < 3; e++) {
                 const MeshVert& va = verts[t.idx[e]];
                 const MeshVert& vb = verts[t.idx[(e+1)%3]];
@@ -3215,6 +3348,7 @@ static void draw_mesh_immediate(const MeshVert* verts, int nv,
     for (int i = 0; i < nt; i++) {
         const MeshTri& t = tris[i];
         if ((int)t.idx[0] >= nv || (int)t.idx[1] >= nv || (int)t.idx[2] >= nv) continue;
+        if (t.alt && !show_alt) continue;
         const MeshVert& v0 = verts[t.idx[0]];
         const MeshVert& v1 = verts[t.idx[1]];
         const MeshVert& v2 = verts[t.idx[2]];
@@ -3229,7 +3363,8 @@ static void draw_mesh_immediate(const MeshVert* verts, int nv,
         if (flip_normals) { fnx = -fnx; fny = -fny; fnz = -fnz; }
         glNormal3f(fnx, fny, fnz);
 
-        glColor3ub(t.color.r, t.color.g, t.color.b);
+        if (t.alt) glColor3ub(255, 96, 255);
+        else       glColor3ub(t.color.r, t.color.g, t.color.b);
         glVertex3f(v0.x, v0.y, v0.z);
         glVertex3f(v1.x, v1.y, v1.z);
         glVertex3f(v2.x, v2.y, v2.z);
@@ -3297,8 +3432,7 @@ void ViewerPanel3D::render() {
         } else {
             near_clip = cam_dist * 0.005;
             if (near_clip < 0.5) near_clip = 0.5;
-            far_clip = cam_dist * 20.0;
-            if (far_clip < 10000.0) far_clip = 10000.0;
+            far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
         }
         gluPerspective(45.0, aspect, near_clip, far_clip);
     }
@@ -3465,7 +3599,7 @@ void ViewerPanel3D::render() {
                 glEnable(GL_ALPHA_TEST);
                 glAlphaFunc(GL_GREATER, 0.01f);
 
-                draw_mesh_immediate(im_verts, im_vert_count, im_tris, im_tri_count, im_flip_normals, false);
+                draw_mesh_immediate(im_verts, im_vert_count, im_tris, im_tri_count, im_flip_normals, false, show_alt_geo);
 
                 glDisable(GL_ALPHA_TEST);
             } else {
@@ -3800,7 +3934,7 @@ void ViewerPanel3D::render() {
             (show_textured && has_texture) ? " [Tex]" : "",
             show_vcolors ? " [VCol]" : "",
             (show_overlay && gl_overlay_id) ? " [Overlay]" : "",
-            (show_alt_geo && gl_alt_id) ? " [Alt]" : "",
+            (show_alt_geo && gl_alt_id) ? " [Unplaced]" : "",
             walk_mode ? (walk_noclip ? " [Noclip]" : (walk_rect >= 0 ? " [Walk:bound]" : " [Walk:free]")) : "",
             show_normals ? " [Normals]" : "",
             clut_base_y, num_pal_rows);
@@ -3859,7 +3993,7 @@ void ViewerPanel3D::render() {
         "WASD:move  Shift:run  Space:jump  P:noclip  LMB:fireball  Mouse:look  ESC/F:exit walk" :
         (anim_model ?
         "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  W:wire  L:light  T:tex  V:vcol  C:cull  B:bones  U:uv  N:normals  Space:play" :
-        "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  Ctrl+LMB:pick  W:wire  L:light  T:tex  V:vcol  C:cull  U:uv  O:overlay  I:roomlit  F:walk  N:normals  R:reset  Esc:deselect");
+        "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  Ctrl+LMB:pick  W:wire  L:light  T:tex  V:vcol  C:cull  U:uv  O:overlay  H:unplaced  I:roomlit  F:walk  N:normals  R:reset  Esc:deselect");
     if (T.isDark) glColor3f(0.38f, 0.40f, 0.48f);
     else          glColor3f(0.40f, 0.40f, 0.45f);
     glRasterPos2i(8, 6);
@@ -4068,8 +4202,7 @@ void ViewerPanel3D::do_pick(int mx, int my) {
     double aspect = (double)w / (double)vh;
     double near_clip = cam_dist * 0.005;
     if (near_clip < 0.5) near_clip = 0.5;
-    double far_clip = cam_dist * 20.0;
-    if (far_clip < 10000.0) far_clip = 10000.0;
+    double far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
     gluPerspective(45.0, aspect, near_clip, far_clip);
 
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
@@ -4095,8 +4228,9 @@ void ViewerPanel3D::do_pick(int mx, int my) {
     for (int i = 0; i < im_tri_count; i++) {
         /* Encode tri index as color: index+1 so 0 = background */
         int id = i + 1;
-        glColor3ub((u8)(id & 0xFF), (u8)((id >> 8) & 0xFF), (u8)((id >> 16) & 0xFF));
         const MeshTri& t = im_tris[i];
+        if (t.alt && !show_alt_geo) continue;
+        glColor3ub((u8)(id & 0xFF), (u8)((id >> 8) & 0xFF), (u8)((id >> 16) & 0xFF));
         for (int vi = 0; vi < 3; vi++) {
             const MeshVert& v = im_verts[t.idx[vi]];
             glVertex3f(v.x, v.y, v.z);
@@ -4707,6 +4841,7 @@ void ViewerPanel3D::on_key(int vk) {
     case 'N': if (!walk_mode) { show_normals = !show_normals; render(); } break;
     case 'C': show_cull = !show_cull; render(); break;
     case 'G': show_grid = !show_grid; render(); break;
+    case 'H': if (gl_alt_id) { show_alt_geo = !show_alt_geo; render(); } break;
     case 'U': show_uv_editor(); break;
     case 'D': break; /* debug dump removed from hotkey — use Export menu */
     case 'R':

@@ -59,15 +59,26 @@ struct ImagePanel {
     bool    fitted;         /* true = auto-fit mode (reset on first zoom) */
     int     fit_to_screen;  /* 0 = 100% centered on load, 1 = fit to panel */
 
+    /* Room CLUT mode: decode each texel with the colour depth and CLUT of
+       the faces that sample it (render_texture_by_faces), C toggles it. */
+    bool        face_cluts;          /* user setting */
+    bool        showing_face_cluts;  /* current image was rendered that way */
+    TexFaceUse* face_uses;           /* textured faces of the open archive */
+    int         n_face_uses;
+    bool        face_uses_ready;     /* face_uses collected for this archive */
+
     ImagePanel() : hwnd(0), hBmp(0), img_w(0), img_h(0),
                    bpp(8), pal_row(0), sub_pal(0), max_pal_rows(1),
                    cur_tex(0), cur_pal(0), cur_is_linear(false),
                    zoom(1.0), pan_x(0), pan_y(0),
                    dragging(false), drag_x(0), drag_y(0),
                    drag_pan_x(0), drag_pan_y(0), fitted(true),
-                   fit_to_screen(1) {}
-    ~ImagePanel() { if (hBmp) DeleteObject(hBmp); }
+                   fit_to_screen(1),
+                   face_cluts(true), showing_face_cluts(false),
+                   face_uses(0), n_face_uses(0), face_uses_ready(false) {}
+    ~ImagePanel() { if (hBmp) DeleteObject(hBmp); free(face_uses); }
 
+    void clear_face_usage();               /* call when the archive changes */
     void render_entry(const DatEntry& tex, const DatEntry* pal, bool do_deswizzle = true);
     void render_linear(const DatEntry& tex, const DatEntry* pal);
     void rerender();                           /* re-render with current pal_row */
@@ -99,6 +110,8 @@ struct AudioSample {
     int     count;      /* number of PCM samples */
     int     start_off;  /* byte offset in SNDB body */
     int     end_off;
+    int     rate;       /* playback rate (Hz) from the bank's Gian tones */
+    bool    rate_known; /* false: rate is a guess (no tone, or an instrument) */
 };
 
 #define MAX_AUDIO_SAMPLES 64
@@ -173,6 +186,7 @@ struct ViewerPanel3D {
     HGLRC   hRC;
     f32     cam_yaw, cam_pitch, cam_dist;
     f32     cam_x, cam_y, cam_z;
+    f32     scene_reach;  /* farthest vertex from the origin (far clip) */
     f32     cam_upx, cam_upy, cam_upz;  /* camera up vector for orbit */
     bool    dragging, panning;
     int     last_mx, last_my;
@@ -181,7 +195,7 @@ struct ViewerPanel3D {
     bool    is_emd;   /* EMD needs CW front face due to Y,Z negate */
     int     gl_list_id, gl_wire_id, gl_bone_id, gl_blend_id, gl_sub_id;
     int     gl_overlay_id;    /* RDT scene overlay (zones, collisions, doors, cameras) */
-    int     gl_alt_id;        /* alternate conditional geometry (SCD variants) */
+    int     gl_alt_id;        /* sections no script places (H) */
     int     gl_normals_id;    /* debug: vertex normal lines */
     int     tri_count, vert_count, bone_count;
 
@@ -193,7 +207,7 @@ struct ViewerPanel3D {
     bool    show_textured;
     bool    show_vcolors;   /* vertex / face colors */
     bool    show_overlay;   /* RDT scene overlay */
-    bool    show_alt_geo;   /* show conditional variant geometry */
+    bool    show_alt_geo;   /* show unplaced sections (H) */
     bool    show_normals;   /* debug: draw vertex normal lines */
     bool    show_cull;      /* backface culling toggle (C key) */
     bool    show_grid;      /* ground grid toggle (G key) */
@@ -328,7 +342,7 @@ struct ViewerPanel3D {
 
     ViewerPanel3D() : hwnd(0), hDC(0), hRC(0),
                       cam_yaw(0), cam_pitch(20), cam_dist(2000),
-                      cam_x(0), cam_y(500), cam_z(0),
+                      cam_x(0), cam_y(500), cam_z(0), scene_reach(0),
                       cam_upx(0), cam_upy(1), cam_upz(0),
                       dragging(false), panning(false),
                       last_mx(0), last_my(0),
