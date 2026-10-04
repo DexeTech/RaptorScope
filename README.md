@@ -41,11 +41,13 @@ The tool reconstructs the PSX GPU rendering pipeline in software — including 4
 - Drag-and-drop file loading
 
 ### 3D Room Viewer
-- **Full room geometry** reconstructed from RDT (Room Data Table) files
+- **Full room geometry** reconstructed from RDT (Room Data Table) files, including the two rooms that store their RDT uncompressed (ST50B, ST60E)
 - **Mixed BPP rendering**: 4bpp and 8bpp textures coexist in a single atlas via 2D sparse sub-palette allocation
-- **SCD script walker**: Parses bytecode to extract section transforms (opcode 0x23), collision zones (0x28), camera cuts (0x4C), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
-- **Mesh instancing**: Sections placed via SCD xform opcodes with position, rotation, and render mode
-- **Door section extraction**: Type-4 zones with embedded geometry positioned at door center
+- **SCD script walker**: Parses bytecode to extract collision zones (0x28), camera cuts (0x4C), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
+- **Scripted placement**: The room is built the way the game builds it — only the sections its scripts place into model slots are drawn. Placements (0x23, and item pickup zones 0x28 type 4) are found by scanning the whole script area, then later script writes to the slot (0x2A, 0x36, 0x37) adjust position and rotation, e.g. lifting items onto desks
+- **Item pickup models**: Type-4 zones (0x28) put their item model at the zone centre, as the game does
+- **Unplaced sections (H key)**: Sections the game stores but never places (unused leftovers, such as an unused DDK in ST103) are hidden by default; **H** shows them tinted magenta at their raw positions
+- **Outdoor scenes**: Sky domes and sea planes out to ±32,000 units are kept; the camera frames the walkable area and the far clip plane reaches the sky
 - **PSX-accurate transparency**: 0x0000 masking, 0x8000 transparent black, STP semi-transparency for 4bpp decals (blood splatters)
 - **PSX vertex color modulation**: 2x scaling to match hardware `(tex * vtx) / 128` behavior
 
@@ -71,7 +73,7 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 | Orange | Zone type 0 (0x28) |
 | Light Blue | Zone type 1 (0x28) |
 | Yellow | Zone types 2/3 (0x28) |
-| Cyan | Door zones type 4 (0x28) |
+| Cyan | Item pickup zones, type 4 (0x28) |
 | Purple | Floor elevation zones (ptr[6]) |
 | Violet | Camera cut zones (ptr[2]) |
 | Teal (dashed) | Examine zones (0x2E) |
@@ -88,14 +90,16 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 
 ### Texture and Palette Viewer
 - 4bpp, 8bpp, and 16bpp texture preview
-- Multi-row CLUT visualization with sub-palette cycling
+- **Face-based decoding** for room textures: each area is decoded with the bit depth and CLUT its faces actually use, so pages that mix 4bpp and 8bpp display correctly (**C** switches to the single-CLUT view)
+- Multi-row CLUT visualization with sub-palette cycling (**Up/Down**)
 - VRAM deswizzle (64x32 block tiling) for raw PS1 texture data
 - UV editor overlay for texture coordinate inspection
 
 ### Audio Player
 - VAG ADPCM decoding with waveform visualization
-- Multi-sample SNDB bank playback
-- SEQ MIDI sequence detection
+- Multi-sample SNDB bank playback at each sample's own rate, derived from the Gian (SNDH) tone that plays it; the rate is shown per sample and used for WAV export
+- SEQ music playback using the bank's instruments at the correct pitch
+- Note: the sound banks inside room files are the original PlayStation samples. The PC game plays its own higher-quality WAVs from `Sound\SE` (and music from `Sound\BGM`), which RaptorScope opens directly
 
 ### Save File Editor
 - Reverse-engineered save file format with inventory editing
@@ -182,7 +186,7 @@ The `.DAT` file begins with a 2048-byte header containing 16-byte entries:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0x00 | 4 | Entry type (0=Data, 1=Texture, 2=Palette, 7=LZSS, 8=LZSS Texture) |
+| 0x00 | 4 | Entry type (0=Data, 1=Texture, 2=Palette, 3=Sound header (Gian), 4=Sound bank (VAG), 5=Sequence, 7=LZSS, 8=LZSS Texture) |
 | 0x04 | 4 | Compressed/raw size in bytes |
 | 0x08 | 2 | VRAM X position (halfwords) |
 | 0x0A | 2 | VRAM Y position |
@@ -193,7 +197,7 @@ Entry data follows at 2048-byte aligned offsets after the header.
 
 ### RDT Room Format
 
-Type 7 entries decompress via LZSS to an RDT structure:
+Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store theirs uncompressed as a type 0 entry):
 
 - **Header**: 7 PSX pointers (base `0x80100000`) to data sections
 - **ptr[0]**: Static room lights + ambient RGB
@@ -202,7 +206,7 @@ Type 7 entries decompress via LZSS to an RDT structure:
 - **ptr[3]**: Camera thread zones
 - **ptr[5]**: SCD bytecode (room initialization scripts)
 - **ptr[6]**: Floor elevation zones
-- **Mesh sections**: Starting at offset 0x1C, sequential 12-byte headers (tri_ptr, quad_ptr, tri_count, quad_count)
+- **Mesh sections**: Starting at offset 0x1C, sequential 12-byte headers (tri_ptr, quad_ptr, tri_count, quad_count). Sections are only drawn where a script places them; some rooms carry unused leftovers
 
 ### SCD Bytecode
 
@@ -210,7 +214,9 @@ The room initialization script (ptr[5]) uses a multi-threaded virtual machine:
 
 - **Thread table**: Array of u32 offsets from SCD base
 - **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (examine trigger), 0x3A (scene light), 0x42 (entity spawn), 0x4C (camera entry), 0x5B (item pickup)
-- **Opcode 0x23** (32 bytes): Places a mesh section at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe via dispatch table at VA `0x00657698`
+- **Opcode 0x23** (32 bytes): Places a mesh section into a model slot at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe; the opcode dispatch table starts at VA `0x006576A0` (the two words before it are 0 and 1)
+- **Opcode 0x28 type 4** (44 bytes): Item pickup zone. Its model (slot at +34, section at +36) is placed on the floor at the zone centre (`sub_426DFC` → `sub_448E3B`) and spins while the item is there
+- **Work target**: 0x22 03 `<slot>` selects a model slot; 0x2A sets one of its fields (3/4/5 = x/y/z, 6/7/8 = rotation, via `sub_47416C`), 0x36 sets x/y/z and 0x37 the rotation
 - **Control flow**: 0x0C (unconditional jump), 0x01/0x0A (thread terminate), conditional branches
 
 ### PSX Transparency Rules
@@ -249,6 +255,7 @@ The tool composites all archive textures into a single OpenGL atlas using 2D spa
 | **V** | Toggle vertex colors |
 | **C** | Toggle backface culling |
 | **O** | Toggle overlay visualization |
+| **H** | Show/hide unplaced (unused) room sections |
 | **I** | Toggle room scene lights |
 | **N** | Toggle vertex normal display |
 | **G** | Toggle ground grid |
@@ -289,6 +296,8 @@ The tool composites all archive textures into a single OpenGL atlas using 2D spa
 > - PSX GPU emulation logic (CLUT indexing, STP transparency, VRAM deswizzling, vertex color modulation)
 > - 2D sparse texture atlas architecture
 > - This README and all documentation
+>
+> Later fixes (uncompressed rooms, face-based texture decoding, VAG playback rates, scripted room placement and outdoor geometry) were made with Claude Opus 5.5 via Claude Code, using the same workflow.
 
 ## Acknowledgments
 

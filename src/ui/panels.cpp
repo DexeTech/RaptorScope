@@ -4007,7 +4007,7 @@ void ViewerPanel3D::render() {
             { 1.0f, 0.4f, 0.1f, "Orange = Zone type 0 (0x28)" },
             { 0.2f, 0.7f, 1.0f, "LtBlue = Zone type 1 (0x28)" },
             { 0.9f, 0.9f, 0.2f, "Yellow = Zone type 2/3 (0x28)" },
-            { 0.0f, 0.9f, 0.9f, "Cyan   = Zone type 4 door (0x28)" },
+            { 0.0f, 0.9f, 0.9f, "Cyan   = Zone type 4 item (0x28)" },
             { 1.0f, 1.0f, 0.0f, "Yellow = Floor zone" },
             { 0.6f, 0.3f, 0.85f,"Violet = Camera cut zone" },
             { 0.2f, 0.85f, 0.7f,"Teal   = Examine zone (0x2E)" },
