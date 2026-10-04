@@ -2809,10 +2809,12 @@ static int scd_opcode_advance(const u8* dec, size_t dec_size, size_t pc) {
    not a concern.  The same section at the same place is kept once.
 
    Scripts then often adjust a placed model: 0x22 03 <slot> selects model
-   slot <slot>, and each 0x2A that follows sets one of its fields (field
-   3/4/5 = x/y/z, 6/7/8 = rotation; sub_47416C).  Item models rely on this,
-   e.g. ST302 lifts its DDK from the floor onto the desk with y = -950.
-   These are applied to the slot's latest placement. */
+   slot <slot> as the work target, then 0x2A sets one of its fields (field
+   3/4/5 = x/y/z, 6/7/8 = rotation; sub_47416C), 0x36 sets x/y/z and 0x37
+   the rotation.  Item models rely on this, e.g. ST302 lifts its DDK onto
+   the desk with y = -950.  The writes up to the next work target are
+   applied to the slot's latest placement; positions beyond +/-30000 are
+   scripts moving a model out of view and are skipped. */
 static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
                                     size_t scd_base, size_t meta_min,
                                     RdtSceneOverlay& ov)
@@ -2825,19 +2827,34 @@ static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
         u32 sec_off;
         RdtSectionXform x;
         memset(&x, 0, sizeof(x));
-        if (op == 0x22 && dec[pc + 1] == 3) {
+        if (op == 0x22 && dec[pc + 1] == 3 && dec[pc + 3] == 0) {
             int xi = slot_xf[dec[pc + 2]];
-            for (size_t q = pc + 4; xi >= 0 && q + 8 <= dec_size && dec[q] == 0x2A; q += 8) {
+            size_t q = pc + 4;
+            for (int n = 0; xi >= 0 && n < 32 && q + 8 <= dec_size; n++) {
+                u8 qop = dec[q];
+                if (qop == 0x22) break;              /* new work target */
                 RdtSectionXform& t = ov.xforms[xi];
-                s16 v = rd_s16(dec + q + 4);
-                switch (dec[q + 2]) {
-                case 3: t.px = v; break;
-                case 4: t.py = v; break;
-                case 5: t.pz = v; break;
-                case 6: t.rx = v; break;
-                case 7: t.ry = v; break;
-                case 8: t.rz = v; break;
+                if (qop == 0x2A) {
+                    s16 v = rd_s16(dec + q + 4);
+                    switch (dec[q + 2]) {
+                    case 3: if (v > -30000 && v < 30000) t.px = v; break;
+                    case 4: if (v > -30000 && v < 30000) t.py = v; break;
+                    case 5: if (v > -30000 && v < 30000) t.pz = v; break;
+                    case 6: t.rx = v; break;
+                    case 7: t.ry = v; break;
+                    case 8: t.rz = v; break;
+                    }
+                } else if (qop == 0x36 || qop == 0x37) {
+                    /* 0x36 sets x/y/z (fields 3-5), 0x37 the rotation (6-8) */
+                    s16 a = rd_s16(dec + q + 2), b = rd_s16(dec + q + 4), c = rd_s16(dec + q + 6);
+                    if (qop == 0x37) { t.rx = a; t.ry = b; t.rz = c; }
+                    else if (a > -30000 && a < 30000 && b > -30000 && b < 30000 &&
+                             c > -30000 && c < 30000) { t.px = a; t.py = b; t.pz = c; }
                 }
+                int adv = scd_opcode_advance(dec, dec_size, q);
+                if (adv < 0) adv = 4;                /* 0x0C jump */
+                if (adv == 0) break;                 /* end of script */
+                q += (size_t)adv;
             }
             continue;
         }
