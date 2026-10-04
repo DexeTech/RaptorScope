@@ -988,6 +988,12 @@ enum EntrySubType {
     SUB_STANDALONE_EMD   /* standalone character model (p/h files) */
 };
 
+/* Entry type for display/loading purposes.  Uncompressed room RDTs are
+   shown and loaded through the LZSS0 path, just without decompressing. */
+static u32 effective_entry_type(const DatEntry& e) {
+    return is_raw_rdt_entry(e) ? (u32)DAT_LZSS0 : e.type;
+}
+
 static EntrySubType classify_lzss0(const DatEntry& e);
 static EntrySubType classify_lzss0(const DatEntry& e) {
     if (!(e.y & 0x8000)) return SUB_COMPRESSED;
@@ -1100,7 +1106,7 @@ void App::build_tree() {
     for (int i = 0; i < archive->count; i++) {
         const DatEntry& e = archive->entries[i];
         if (is_real_texture(e)) { nTex++; continue; }
-        switch (e.type) {
+        switch (effective_entry_type(e)) {
         case DAT_TEXTURE: case DAT_LZSS1: case DAT_TEXTURE_LINEAR: nData++; break; /* non-texture LZSS1 → data */
         case DAT_PALETTE: nPal++; break;
         case DAT_SNDH: nSndH++; break;
@@ -1148,7 +1154,7 @@ void App::build_tree() {
     for (int i = 0; i < archive->count; i++) {
         const DatEntry& e = archive->entries[i];
 
-        switch (e.type) {
+        switch (effective_entry_type(e)) {
         case DAT_TEXTURE: case DAT_LZSS1: case DAT_TEXTURE_LINEAR:
             if (is_real_texture(e)) {
                 int tx = e.x / 64;
@@ -1234,12 +1240,18 @@ void App::build_tree() {
             bool has_layout = false;
             EntrySubType st = SUB_COMPRESSED;
 
+            bool raw = (e.type != DAT_LZSS0);  /* uncompressed RDT */
             if (e.y & 0x8000) {
-                if (is_mips_code(e.data, e.size, e.y, e.x)) {
+                if (!raw && is_mips_code(e.data, e.size, e.y, e.x)) {
                     st = SUB_MIPS_CODE;
                 } else {
-                    has_layout = parse_rdt_layout_from_entry(e.data, e.size,
-                                                             e.y, e.x, layout);
+                    if (raw) {
+                        u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+                        has_layout = parse_rdt_layout(e.data, e.size, base, layout);
+                    } else {
+                        has_layout = parse_rdt_layout_from_entry(e.data, e.size,
+                                                                 e.y, e.x, layout);
+                    }
                     if (has_layout) {
                         if (layout.section_count > 0 && layout.emd_count > 0)
                             st = SUB_RDT_SCENE;
@@ -1930,7 +1942,7 @@ static void on_entry_select(int sel_param)
 
     int panel = PANEL_HEX;
 
-    switch (e.type) {
+    switch (effective_entry_type(e)) {
     case DAT_TEXTURE_LINEAR: {
         /* Item bank: CLUT is at the start of the NEXT block (after this
            block's pixel data), not before the current block's pixels.
@@ -2034,7 +2046,7 @@ static void on_entry_select(int sel_param)
 
             /* ── Decompress ONCE, reuse for all parse/detect calls ── */
             Buffer lz_dec;
-            if (!lzss_decompress(e.data, e.size, lz_dec) || lz_dec.size == 0)
+            if (!dat_entry_payload(e, lz_dec) || lz_dec.size == 0)
                 break;
             const u8* dd = lz_dec.data;
             size_t    ds = lz_dec.size;

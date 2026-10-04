@@ -135,6 +135,16 @@ bool dat_parse_memory(u8* raw, size_t raw_size, DatArchive& archive)
     return true;
 }
 
+/*─── Entry payload ─────────────────────────────────────────────*/
+bool dat_entry_payload(const DatEntry& entry, Buffer& out)
+{
+    if (entry.type == DAT_LZSS0 || entry.type == DAT_LZSS1)
+        return lzss_decompress(entry.data, entry.size, out);
+    out.clear();
+    if (entry.data && entry.size > 0) out.append(entry.data, entry.size);
+    return out.size > 0;
+}
+
 /*─── Build .dat file bytes ──────────────────────────────────────*/
 u8* dat_build(const DatEntry* entries, int count, size_t& out_size)
 {

@@ -282,6 +282,16 @@ bool parse_rdt_layout_from_entry(const u8* data, size_t size,
     return parse_rdt_layout(dec.data, dec.size, base, layout);
 }
 
+bool is_raw_rdt_entry(const DatEntry& e)
+{
+    if (e.type != DAT_DATA || !(e.y & 0x8000) || !e.data || e.size < 0x20)
+        return false;
+    u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+    RdtLayout layout;
+    return parse_rdt_layout(e.data, e.size, base, layout) &&
+           (layout.section_count > 0 || layout.emd_count > 0);
+}
+
 /*─── Detect room vs object mesh layout ──────────────────────────*/
 static void detect_mesh_layout(const u8* dec, size_t dec_size,
                                u32 base, size_t& mesh_start, size_t& mesh_end)
