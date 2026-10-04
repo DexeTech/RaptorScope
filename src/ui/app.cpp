@@ -2207,6 +2207,29 @@ static void on_entry_select(int sel_param)
                         mesh_apply_xforms(mesh, dd, ds, base,
                                           overlay.xforms, overlay.n_xforms);
                         mesh_compute_smooth_normals(mesh);
+
+                        /* Sections nothing places (leftovers such as ST103's
+                           unused DDK) go in at their raw coordinates, flagged
+                           alt: the viewer hides them unless H is pressed. */
+                        RdtLayout lay;
+                        if (parse_rdt_layout(dd, ds, base, lay)) {
+                            RdtSectionXform unplaced[RDT_MAX_SECTIONS];
+                            int n_unplaced = 0;
+                            for (int si = 0; si < lay.section_count; si++) {
+                                u32 so = (u32)lay.sections[si].offset;
+                                bool used = false;
+                                for (int xi = 0; xi < overlay.n_xforms && !used; xi++)
+                                    used = overlay.xforms[xi].section_off == so;
+                                if (used) continue;
+                                RdtSectionXform& u = unplaced[n_unplaced++];
+                                memset(&u, 0, sizeof(u));
+                                u.section_off = so;
+                            }
+                            int first_alt = mesh.tri_count;
+                            mesh_apply_xforms(mesh, dd, ds, base, unplaced, n_unplaced);
+                            for (int ti = first_alt; ti < mesh.tri_count; ti++)
+                                mesh.tris[ti].alt = 1;
+                        }
                     }
 
                     /* Detect dominant BPP and collect unique CLUT values from ALL faces.

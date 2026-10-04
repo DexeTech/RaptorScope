@@ -195,7 +195,7 @@ struct ViewerPanel3D {
     bool    is_emd;   /* EMD needs CW front face due to Y,Z negate */
     int     gl_list_id, gl_wire_id, gl_bone_id, gl_blend_id, gl_sub_id;
     int     gl_overlay_id;    /* RDT scene overlay (zones, collisions, doors, cameras) */
-    int     gl_alt_id;        /* alternate conditional geometry (SCD variants) */
+    int     gl_alt_id;        /* sections no script places (H) */
     int     gl_normals_id;    /* debug: vertex normal lines */
     int     tri_count, vert_count, bone_count;
 
@@ -207,7 +207,7 @@ struct ViewerPanel3D {
     bool    show_textured;
     bool    show_vcolors;   /* vertex / face colors */
     bool    show_overlay;   /* RDT scene overlay */
-    bool    show_alt_geo;   /* show conditional variant geometry */
+    bool    show_alt_geo;   /* show unplaced sections (H) */
     bool    show_normals;   /* debug: draw vertex normal lines */
     bool    show_cull;      /* backface culling toggle (C key) */
     bool    show_grid;      /* ground grid toggle (G key) */
