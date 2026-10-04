@@ -110,6 +110,8 @@ struct AudioSample {
     int     count;      /* number of PCM samples */
     int     start_off;  /* byte offset in SNDB body */
     int     end_off;
+    int     rate;       /* playback rate (Hz) from the bank's Gian tones */
+    bool    rate_known; /* false: rate is a guess (no tone, or an instrument) */
 };
 
 #define MAX_AUDIO_SAMPLES 64

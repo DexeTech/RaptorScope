@@ -3169,7 +3169,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             "WAV Files (*.wav)\0*.wav\0", "Export WAV", "wav")) {
                             AudioSample& s = g_audio.samples[g_audio.cur_sample];
                             if (s.pcm && s.count > 0)
-                                write_wav_file(path, s.pcm, s.count);
+                                write_wav_file(path, s.pcm, s.count, s.rate);
                         }
                     }
                 }

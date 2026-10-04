@@ -899,6 +899,38 @@ void AudioPanel::free_samples() {
     pcm_data = 0; pcm_count = 0;
 }
 
+/* An SNDB is loaded into SPU RAM at the address in its x/y fields, so a
+   Gian tone's VAG starts at (tone SPU address - that address) in the SNDB. */
+static u32 sndb_spu_base(const DatEntry& sndb) {
+    return ((u32)sndb.y << 16) | sndb.x;
+}
+
+/* Archives can hold several SNDH/SNDB pairs: the SNDB's header is the
+   SNDH whose tones point into it. */
+static bool find_sndb_gian(const DatEntry& sndb, GianHeader& out) {
+    if (!g_app.archive) return false;
+    u32 base = sndb_spu_base(sndb);
+    int best = 0;
+    for (int i = 0; i < g_app.archive->count; i++) {
+        const DatEntry& e = g_app.archive->entries[i];
+        if (e.type != DAT_SNDH || !e.data) continue;
+        GianHeader gh;
+        if (!parse_gian_header(e.data, e.size, gh)) continue;
+        int hits = 0;
+        for (int t = 0; t < gh.tone_count; t++)
+            if (gh.tones[t].spu_addr - base < sndb.size) hits++;
+        if (hits > best) { best = hits; out = gh; }
+    }
+    return best > 0;
+}
+
+/* First tone of gh that plays the sample starting at off in the SNDB. */
+static const GianTone* find_sample_tone(const GianHeader& gh, u32 base, int off) {
+    for (int t = 0; t < gh.tone_count; t++)
+        if (gh.tones[t].spu_addr - base == (u32)off) return &gh.tones[t];
+    return 0;
+}
+
 void AudioPanel::decode_sndb(const DatEntry& entry) {
     stop(); free_samples();
     mode = AMODE_SNDB;
@@ -929,9 +961,23 @@ void AudioPanel::decode_sndb(const DatEntry& entry) {
         } else i += 16;
     }
 
+    /* VAGs have no rate of their own: the SPU plays each at the pitch of
+       the tone that keys it. A sound effect's tone has a single key, so
+       its rate is exact. An instrument spans a range of keys and is shown
+       at middle C, and samples no tone uses get the game's most common
+       rate; both are marked as guesses. */
+    GianHeader gh;
+    bool have_gh = find_sndb_gian(entry, gh);
+    u32 base = sndb_spu_base(entry);
+    for (int k = 0; k < num_samples; k++) {
+        AudioSample& s = samples[k];
+        const GianTone* tone = have_gh ? find_sample_tone(gh, base, s.start_off) : 0;
+        s.rate = tone ? gian_tone_sample_rate(*tone) : 11025;
+        s.rate_known = tone && tone->key_lo == tone->key_hi;
+    }
+
     cur_sample = 0; scroll_off = 0;
     if (num_samples > 0) select_sample(0);
-    sample_rate = 22050; channels = 1;
     if (hwnd) InvalidateRect(hwnd, 0, FALSE);
 }
 
@@ -953,6 +999,7 @@ void AudioPanel::decode_snde(const DatEntry& entry) {
     seq_note_count = 0; seq_duration = 0; seq_ch_mask = 0;
     free(seq_pcm); seq_pcm = 0; seq_frames = 0; seq_rendered = false;
     active_snde = &entry;
+    sample_rate = 22050; /* synth output rate */
 
     if (entry.data && entry.size >= 15) {
         parse_seq_header(entry.data, entry.size, seq_hdr);
@@ -971,46 +1018,39 @@ void AudioPanel::render_seq() {
     /* Find SNDH, SNDB, and SNDE in the archive to synthesize */
     if (!g_app.archive || seq_rendered) return;
 
-    const DatEntry* sndh_e = 0;
     const DatEntry* sndb_e = 0;
     const DatEntry* snde_e = active_snde;
 
     for (int i = 0; i < g_app.archive->count; i++) {
         const DatEntry& e = g_app.archive->entries[i];
-        if (e.type == DAT_SNDH && e.data && e.size >= 12 && memcmp(e.data, "Gian", 4) == 0)
-            sndh_e = &e;
         if (e.type == DAT_SNDB && e.data) { sndb_e = &e; }
     }
-    if (!sndh_e || !sndb_e || !snde_e) return;
+    if (!sndb_e || !snde_e) return;
 
-    /* Parse Gian header */
+    /* Gian header whose tones play this SNDB */
     GianHeader gh;
-    if (!parse_gian_header(sndh_e->data, sndh_e->size, gh)) return;
+    if (!find_sndb_gian(*sndb_e, gh)) return;
 
-    /* Split and decode SNDB samples */
-    const int MAX_VAG = 32;
+    /* Decode each tone's VAG into the synth's slot for it (vag_bank) */
+    const int MAX_VAG = 128;
     DecodedSample vag[MAX_VAG];
     memset(vag, 0, sizeof(vag));
     int nvag = 0;
 
-    /* Split SNDB body */
     const u8* sd = sndb_e->data;
-    int sz = (int)sndb_e->size;
-    int sstart = 0, si = 0;
-    while (si < sz - 15 && nvag < MAX_VAG) {
-        if (sd[si + 1] & 1) {
-            int send = si + 16;
-            if (send + 16 <= sz && sd[send + 1] == 7) send += 16;
-            if (send - sstart >= 16) {
-                int blk = send - sstart;
-                int maxp = (blk / 16) * 28 + 64;
-                vag[nvag].pcm = (s16*)malloc(maxp * sizeof(s16));
-                vag[nvag].count = decode_vag(sd, sstart, send, vag[nvag].pcm, maxp);
-                if (vag[nvag].count <= 0) { free(vag[nvag].pcm); vag[nvag].pcm = 0; vag[nvag].count = 0; }
-                nvag++;
-            }
-            sstart = send; si = send;
-        } else si += 16;
+    size_t sz = sndb_e->size;
+    u32 base = sndb_spu_base(*sndb_e);
+    for (int t = 0; t < gh.tone_count; t++) {
+        int vi = gh.tones[t].vag_bank;
+        u32 off = gh.tones[t].spu_addr - base;
+        if (vi >= MAX_VAG || vag[vi].pcm || off >= sz) continue;
+        size_t end = off;
+        while (end + 16 <= sz) { end += 16; if (sd[end - 15] & 1) break; }
+        int maxp = (int)((end - off) / 16) * 28 + 64;
+        vag[vi].pcm = (s16*)malloc(maxp * sizeof(s16));
+        vag[vi].count = decode_vag(sd, off, end, vag[vi].pcm, maxp);
+        if (vag[vi].count <= 0) { free(vag[vi].pcm); vag[vi].pcm = 0; vag[vi].count = 0; }
+        if (vi >= nvag) nvag = vi + 1;
     }
 
     /* Render */
@@ -1045,6 +1085,7 @@ void AudioPanel::select_sample(int idx) {
     cur_sample = idx;
     pcm_data = samples[idx].pcm;
     pcm_count = samples[idx].count;
+    sample_rate = samples[idx].rate;
     channels = 1;
     if (hwnd) InvalidateRect(hwnd, 0, FALSE);
 }
@@ -1373,7 +1414,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
             if (y_off >= ch) break;
             AudioSample& s = samples[si];
             bool sel = (si == cur_sample);
-            f32 dur = (f32)s.count / sample_rate;
+            f32 dur = (f32)s.count / s.rate;
             int rh = (y_off + row_h > ch) ? (ch - y_off) : row_h;
 
             /* Row background */
@@ -1396,7 +1437,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
 
             SelectObject(buf, fSmall);
             SetTextColor(buf, audio_dim());
-            char info[48]; _snprintf(info, 47, "%.2fs  %dblk", dur, (s.end_off - s.start_off) / 16);
+            char info[48]; _snprintf(info, 47, "%.2fs  %d Hz%s", dur, s.rate, s.rate_known ? "" : "?");
             TextOutA(buf, zs(10,z), y_off + rh - zs(14,z), info, (int)strlen(info));
 
             /* Play indicator */
