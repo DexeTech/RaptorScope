@@ -2059,8 +2059,16 @@ static void on_entry_select(int sel_param)
             const u8* dd = lz_dec.data;
             size_t    ds = lz_dec.size;
 
-            /* sub >= 2: specific EMD by ordinal (sub-2) */
-            if (sub >= 2 || sub == 0) {
+            /* sub >= 2: specific EMD by ordinal (sub-2).  sub=0 tries an EMD
+               first only when there is no room mesh, so a room never opens
+               as one of its characters. */
+            bool has_room = false;
+            if (sub == 0) {
+                RdtLayout room_layout;
+                has_room = parse_rdt_layout(dd, ds, base, room_layout) &&
+                           room_layout.section_count > 0;
+            }
+            if (sub >= 2 || (sub == 0 && !has_room)) {
                 int emd_ordinal = (sub >= 2) ? (sub - 2) : 0;
                 int hint = -1;
 
@@ -2169,57 +2177,21 @@ static void on_entry_select(int sel_param)
                 RdtSceneOverlay overlay;
                 bool has_overlay = parse_rdt_overlay(dd, ds, base, overlay);
 
-                /* Build exclude list: ALL sections referenced by ANY xform.
-                   The game renderer doesn't do a sequential walk — it renders
-                   each 0x23 xform slot exactly once. We replicate this by:
-                   1. Sequential walk renders ONLY orphaned sections (no xform)
-                   2. mesh_apply_xforms renders ALL xform instances (zero + non-zero pos)
-                   This way every section appears exactly where its xforms place it. */
-                u32 exclude_secs[128];
-                int n_exclude = 0;
-                if (has_overlay && overlay.n_xforms > 0) {
-                    size_t m_min = ds;
-                    for (int pi = 0; pi < 7 && pi * 4 + 4 <= (int)ds; pi++) {
-                        u32 pp = rd_u32(dd + pi * 4) - base;
-                        if (pp > 0x40 && pp < m_min) m_min = pp;
-                    }
-                    for (int xi = 0; xi < overlay.n_xforms; xi++) {
-                        const RdtSectionXform& xf = overlay.xforms[xi];
-                        if (xf.section_off == 0xFFFFFFFF || xf.section_off < 0x1C) continue;
-                        size_t so = xf.section_off;
-                        int lim = 1;  /* each 0x23 maps to exactly 1 section */
-                        int done = 0;
-                        while (so + 12 <= m_min && done < lim) {
-                            u32 sp1 = rd_u32(dd + so) - base;
-                            u32 sp2 = rd_u32(dd + so + 4) - base;
-                            u16 sc1 = rd_u16(dd + so + 8);
-                            u16 sc2 = rd_u16(dd + so + 10);
-                            if (sp1 >= ds || sp2 >= ds) break;
-                            if (sc1 > 5000 || sc2 > 5000) break;
-                            if (sc1 == 0 && sc2 == 0) { so += 12; continue; }
-                            size_t qe = sp2 + (size_t)sc2 * 52;
-                            if (qe > ds) break;
-                            bool dup = false;
-                            for (int ei = 0; ei < n_exclude; ei++)
-                                if (exclude_secs[ei] == (u32)so) { dup = true; break; }
-                            if (!dup && n_exclude < 128)
-                                exclude_secs[n_exclude++] = (u32)so;
-                            so = qe; done++;
-                        }
-                    }
-                }
-
-                if (parse_rdt_scene_dec(dd, ds, base, mesh,
-                        n_exclude > 0 ? exclude_secs : 0, n_exclude) && mesh.tri_count > 0)
-                    mesh_type = "Room Scene";
-                else if (parse_room_mesh_dec(dd, ds, base, mesh,
-                             n_exclude > 0 ? exclude_secs : 0, n_exclude) && mesh.tri_count > 0)
-                    mesh_type = "Static Mesh";
-                else if (n_exclude > 0 && has_overlay && overlay.n_xforms > 0) {
-                    /* All sections excluded from sequential walk — xforms will build mesh */
+                /* The game draws only the sections its scripts place in model
+                   slots (0x23, item zones); mesh_apply_xforms builds exactly
+                   those.  Other sections are leftovers (unused variants,
+                   objects in local coordinates) and would pile up at the
+                   origin, so the sequential walk is only a fallback for
+                   rooms without placements. */
+                bool placed = has_overlay && overlay.n_xforms > 0;
+                if (placed) {
                     mesh.alloc(0, 0);
                     mesh_type = "Room Scene";
                 }
+                else if (parse_rdt_scene_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+                    mesh_type = "Room Scene";
+                else if (parse_room_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+                    mesh_type = "Static Mesh";
                 else if (parse_standalone_emd_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
                     mesh_type = "Character Mesh";
                 else if (parse_door_mesh_dec(dd, ds, base, mesh))
@@ -2231,7 +2203,7 @@ static void on_entry_select(int sel_param)
                     /* Apply xform instancing FIRST, so all faces are in mesh
                        before we compute max_sub_pal for the texture atlas. */
                     int ov_zones = 0, ov_cols = 0, ov_cams = 0, ov_spawns = 0;
-                    if (has_overlay && overlay.n_xforms > 0) {
+                    if (placed) {
                         mesh_apply_xforms(mesh, dd, ds, base,
                                           overlay.xforms, overlay.n_xforms);
                         mesh_compute_smooth_normals(mesh);

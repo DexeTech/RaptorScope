@@ -2649,25 +2649,63 @@ static void build_overlay_list(int list_id, const RdtSceneOverlay& ov) {
 }
 
 /* Compute bounding box from face-referenced vertices only */
+/* Frame the camera on the mesh.  Outdoor rooms have sky and sea planes
+   reaching +/-32000 units; framing those would shrink the walkable area to a
+   speck, so faces entirely within FRAME_LIMIT are framed when there are any. */
+#define FRAME_LIMIT 15000.0f
 static void mesh_bounds(const Mesh& mesh, float* cx, float* cy, float* cz, float* dist) {
     float mnx=1e9f, mxx=-1e9f, mny=1e9f, mxy=-1e9f, mnz=1e9f, mxz=-1e9f;
-    for (int i = 0; i < mesh.tri_count; i++) {
-        for (int vi = 0; vi < 3; vi++) {
-            int idx = mesh.tris[i].idx[vi];
-            if (idx < 0 || idx >= mesh.vert_count) continue;
-            const MeshVert& v = mesh.verts[idx];
-            if (v.x < mnx) mnx = v.x;
-            if (v.x > mxx) mxx = v.x;
-            if (v.y < mny) mny = v.y;
-            if (v.y > mxy) mxy = v.y;
-            if (v.z < mnz) mnz = v.z;
-            if (v.z > mxz) mxz = v.z;
+    for (int pass = 0; pass < 2 && mnx > mxx; pass++) {
+        for (int i = 0; i < mesh.tri_count; i++) {
+            bool in_frame = true;
+            for (int vi = 0; vi < 3 && pass == 0; vi++) {
+                int idx = mesh.tris[i].idx[vi];
+                if (idx < 0 || idx >= mesh.vert_count) continue;
+                const MeshVert& v = mesh.verts[idx];
+                if (fabsf(v.x) > FRAME_LIMIT || fabsf(v.y) > FRAME_LIMIT ||
+                    fabsf(v.z) > FRAME_LIMIT) in_frame = false;
+            }
+            if (!in_frame) continue;
+            for (int vi = 0; vi < 3; vi++) {
+                int idx = mesh.tris[i].idx[vi];
+                if (idx < 0 || idx >= mesh.vert_count) continue;
+                const MeshVert& v = mesh.verts[idx];
+                if (v.x < mnx) mnx = v.x;
+                if (v.x > mxx) mxx = v.x;
+                if (v.y < mny) mny = v.y;
+                if (v.y > mxy) mxy = v.y;
+                if (v.z < mnz) mnz = v.z;
+                if (v.z > mxz) mxz = v.z;
+            }
         }
     }
+    if (mnx > mxx) { mnx = mxx = mny = mxy = mnz = mxz = 0; }
     *cx = (mnx+mxx)*0.5f; *cy = (mny+mxy)*0.5f; *cz = (mnz+mxz)*0.5f;
     float dx = mxx-mnx, dy = mxy-mny, dz = mxz-mnz;
     *dist = sqrtf(dx*dx+dy*dy+dz*dz) * 1.2f;
     if (*dist < 100) *dist = 100;
+}
+
+/* Distance from the origin to the farthest vertex. */
+static float mesh_reach(const Mesh& mesh) {
+    float r2 = 0;
+    for (int i = 0; i < mesh.vert_count; i++) {
+        const MeshVert& v = mesh.verts[i];
+        float d2 = v.x*v.x + v.y*v.y + v.z*v.z;
+        if (d2 > r2) r2 = d2;
+    }
+    return sqrtf(r2);
+}
+
+/* Far clip for the orbit camera: cam_dist*20 keeps depth precision, but must
+   still reach every vertex, which lies at most cam_dist + |target| + reach
+   from the eye. */
+static double orbit_far_clip(float cam_dist, float tx, float ty, float tz, float reach) {
+    double far_clip = cam_dist * 20.0;
+    if (far_clip < 10000.0) far_clip = 10000.0;
+    double need = cam_dist + sqrt((double)tx*tx + (double)ty*ty + (double)tz*tz) + reach;
+    if (far_clip < need) far_clip = need;
+    return far_clip;
 }
 
 void ViewerPanel3D::set_mesh(const Mesh& mesh) {
@@ -2804,6 +2842,7 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     }
 
     mesh_bounds(mesh, &cam_x, &cam_y, &cam_z, &cam_dist);
+    scene_reach = mesh_reach(mesh);
     cam_yaw = 180; cam_pitch = 10; cam_upx = 0; cam_upy = 1; cam_upz = 0;
     wglMakeCurrent(0, 0);
     render();
@@ -2921,6 +2960,7 @@ void ViewerPanel3D::set_emd(const EmdModel& emd) {
     }
 
     mesh_bounds(emd.mesh, &cam_x, &cam_y, &cam_z, &cam_dist);
+    scene_reach = mesh_reach(emd.mesh);
     cam_yaw = 180; cam_pitch = 10; cam_upx = 0; cam_upy = 1; cam_upz = 0;
     wglMakeCurrent(0, 0);
     render();
@@ -3377,8 +3417,7 @@ void ViewerPanel3D::render() {
         } else {
             near_clip = cam_dist * 0.005;
             if (near_clip < 0.5) near_clip = 0.5;
-            far_clip = cam_dist * 20.0;
-            if (far_clip < 10000.0) far_clip = 10000.0;
+            far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
         }
         gluPerspective(45.0, aspect, near_clip, far_clip);
     }
@@ -4148,8 +4187,7 @@ void ViewerPanel3D::do_pick(int mx, int my) {
     double aspect = (double)w / (double)vh;
     double near_clip = cam_dist * 0.005;
     if (near_clip < 0.5) near_clip = 0.5;
-    double far_clip = cam_dist * 20.0;
-    if (far_clip < 10000.0) far_clip = 10000.0;
+    double far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
     gluPerspective(45.0, aspect, near_clip, far_clip);
 
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();

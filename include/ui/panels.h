@@ -186,6 +186,7 @@ struct ViewerPanel3D {
     HGLRC   hRC;
     f32     cam_yaw, cam_pitch, cam_dist;
     f32     cam_x, cam_y, cam_z;
+    f32     scene_reach;  /* farthest vertex from the origin (far clip) */
     f32     cam_upx, cam_upy, cam_upz;  /* camera up vector for orbit */
     bool    dragging, panning;
     int     last_mx, last_my;
@@ -341,7 +342,7 @@ struct ViewerPanel3D {
 
     ViewerPanel3D() : hwnd(0), hDC(0), hRC(0),
                       cam_yaw(0), cam_pitch(20), cam_dist(2000),
-                      cam_x(0), cam_y(500), cam_z(0),
+                      cam_x(0), cam_y(500), cam_z(0), scene_reach(0),
                       cam_upx(0), cam_upy(1), cam_upz(0),
                       dragging(false), panning(false),
                       last_mx(0), last_my(0),
