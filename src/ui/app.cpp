@@ -269,7 +269,7 @@ void CreateAppMenus(void)
 
     hExport = CreatePopupMenu();
     AppendMenuA(hExport, MF_STRING, IDM_EXPORT_OBJ, "Export as &OBJ (3D Mesh)...");
-    AppendMenuA(hExport, MF_STRING, IDM_EXPORT_GLB, "Export &GLB (Model + Animations)...");
+    AppendMenuA(hExport, MF_STRING, IDM_EXPORT_GLB, "Export &GLB (Character + Animations, or Room)...");
     AppendMenuA(hExport, MF_STRING, IDM_EXPORT_SMD, "Export as &SMD (Skeletal Mesh)...");
     AppendMenuA(hExport, MF_STRING, IDM_EXPORT_WAV, "Export as &WAV (Audio)...");
     AppendMenuA(hExport, MF_STRING, IDM_EXPORT_PNG, "Export as &PNG (Image)...");
@@ -3061,12 +3061,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
         } break;
         case IDM_EXPORT_GLB: {
-            if (!g_emd_model || !g_emd_model->valid || !g_viewer3d.is_emd) {
-                MessageBoxA(hwnd, "Open a character model in the 3D viewer first.", "Export GLB", MB_OK | MB_ICONINFORMATION);
+            bool is_char = g_emd_model && g_emd_model->valid && g_viewer3d.is_emd;
+            bool is_room = !g_viewer3d.is_emd && g_viewer3d.has_mesh &&
+                           g_viewer3d.im_tris && g_viewer3d.im_tri_count > 0;
+            if (!is_char && !is_room) {
+                MessageBoxA(hwnd, "Open a character model or a room in the 3D viewer first.", "Export GLB", MB_OK | MB_ICONINFORMATION);
                 break;
             }
             char path[MAX_PATH];
-            if (!ui_save_file(hwnd, path, MAX_PATH, "GLB Files (*.glb)\0*.glb\0", "Export GLB (30 fps)", "glb")) break;
+            if (!ui_save_file(hwnd, path, MAX_PATH, "GLB Files (*.glb)\0*.glb\0",
+                              is_char ? "Export GLB (30 fps)" : "Export Room GLB", "glb")) break;
             EmdExportAtlas a;
             a.rgba = g_viewer3d.has_texture ? g_viewer3d.uv_atlas_rgba : 0;
             a.width = g_viewer3d.uv_atlas_w; a.height = g_viewer3d.uv_atlas_h;
@@ -3075,6 +3079,30 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             a.vram_x = g_viewer3d.tex_vram_x; a.vram_y = g_viewer3d.tex_vram_y;
             a.clut_x = g_viewer3d.clut_base_x; a.clut_y = g_viewer3d.clut_base_y;
             a.slice_map = g_viewer3d.slice_map;
+            if (is_room) {
+                /* name the root node after the DAT file */
+                char name[64] = "DC1_Room";
+                if (g_app.archive) {
+                    const char* fn = g_app.archive->filename.buf;
+                    const char* b = strrchr(fn, '\\');
+                    const char* b2 = strrchr(fn, '/');
+                    if (b2 > b) b = b2;
+                    b = b ? b + 1 : fn;
+                    if (*b) {
+                        _snprintf(name, sizeof(name) - 1, "%s", b);
+                        name[sizeof(name) - 1] = 0;
+                        char* dot = strrchr(name, '.');
+                        if (dot) *dot = 0;
+                    }
+                }
+                bool ok = export_room_glb(path, g_viewer3d.im_verts, g_viewer3d.im_vert_count,
+                                          g_viewer3d.im_tris, g_viewer3d.im_tri_count,
+                                          a.rgba ? &a : 0, name);
+                MessageBoxA(hwnd, ok ? "Room GLB exported, one object per section. Import it in Blender with File > Import > glTF 2.0. Unplaced sections (H) are not included."
+                                     : "Export failed. The room mesh or its texture atlas could not be exported.",
+                            "Export GLB", MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONERROR));
+                break;
+            }
             bool ok = export_emd_glb(path, *g_emd_model, a.rgba ? &a : 0);
             MessageBoxA(hwnd, ok ? "GLB exported. Import it in Blender with File > Import > glTF 2.0. Clips use 30 fps to match the viewer; original timing and entity movement metadata are not known."
                                 : "Export failed. The model, hierarchy, atlas, or a detected animation clip could not be exported.",

@@ -110,7 +110,7 @@ Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the 
 
 ### Additional Features
 - **Dark theme**: Automatic Windows 10/11 dark mode detection with dark title bar
-- **Export formats**: OBJ, SMD (Source engine), GLB (Models & Animations) BMP texture export
+- **Export formats**: OBJ, SMD (Source engine), GLB (characters with animations, and textured rooms), BMP texture export
 - **Hex viewer**: Raw binary inspection of any archive entry with offset display
 - **Software renderer fallback**: GDI Generic compatibility for VMs without GPU acceleration
 - **F11 render mode cycling**: Normal / VM GPU / Software rendering

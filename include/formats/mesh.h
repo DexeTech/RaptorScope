@@ -286,6 +286,11 @@ struct EmdExportAtlas {
 };
 bool export_emd_glb(const char* path, const EmdModel& model,
                     const EmdExportAtlas* atlas = 0, f32 fps = 30.0f);
+/* Static room mesh as shown in the viewer: one node per section, textured
+   from the atlas when given.  Faces flagged alt are skipped. */
+bool export_room_glb(const char* path, const MeshVert* verts, int vert_count,
+                     const MeshTri* tris, int tri_count,
+                     const EmdExportAtlas* atlas = 0, const char* name = 0);
 
 bool export_emd_smd(const char* path, const EmdModel& emd);
 bool export_mesh_smd(const char* path, const Mesh& mesh);
