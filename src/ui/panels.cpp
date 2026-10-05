@@ -2396,7 +2396,7 @@ static void build_overlay_list(int list_id, const RdtSceneOverlay& ov) {
         }
     }
 
-    /* ─── Cameras (0x4C): blue eye → red target ─── */
+    /* ─── Cameras (0x4C, 0x2E): blue eye → red target ─── */
     if (ov.n_cameras > 0) {
         glPointSize(10.0f);
         glBegin(GL_POINTS);
@@ -2474,33 +2474,6 @@ static void build_overlay_list(int list_id, const RdtSceneOverlay& ov) {
             glVertex3f(x0, fy + 10.0f, z1);
             glEnd();
         }
-    }
-
-    /* ─── Examine/interact zones (0x2E): teal dashed outlines ─── */
-    if (ov.n_examines > 0) {
-        glLineWidth(2.0f);
-        glEnable(GL_LINE_STIPPLE);
-        glLineStipple(2, 0xAAAA);
-        glColor3f(0.2f, 0.85f, 0.7f);
-        for (int i = 0; i < ov.n_examines; i++) {
-            const RdtExamineZone& ez = ov.examines[i];
-            glBegin(GL_LINE_LOOP);
-            for (int c = 0; c < 4; c++)
-                glVertex3f(-(f32)ez.x[c], fy + 5.0f, (f32)ez.z[c]);
-            glEnd();
-            /* Center marker dot */
-            f32 cx = 0, cz = 0;
-            for (int c = 0; c < 4; c++) { cx += -(f32)ez.x[c]; cz += (f32)ez.z[c]; }
-            cx *= 0.25f; cz *= 0.25f;
-            glDisable(GL_LINE_STIPPLE);
-            glPointSize(6.0f);
-            glBegin(GL_POINTS);
-            glVertex3f(cx, fy + 5.0f, cz);
-            glEnd();
-            glEnable(GL_LINE_STIPPLE);
-        }
-        glDisable(GL_LINE_STIPPLE);
-        glPointSize(1.0f);
     }
 
     /* ─── Scene lights (0x3A): colored octahedron wireframes ─── */
@@ -4010,7 +3983,6 @@ void ViewerPanel3D::render() {
             { 0.0f, 0.9f, 0.9f, "Cyan   = Zone type 4 item (0x28)" },
             { 1.0f, 1.0f, 0.0f, "Yellow = Floor zone" },
             { 0.6f, 0.3f, 0.85f,"Violet = Camera cut zone" },
-            { 0.2f, 0.85f, 0.7f,"Teal   = Examine zone (0x2E)" },
             { 0.9f, 0.85f, 0.5f,"Gold   = Scene light (0x3A)" },
             { 0.2f, 0.4f, 1.0f, "Blue   = Camera eye" },
             { 1.0f, 0.2f, 0.2f, "Red pt = Camera target" },
