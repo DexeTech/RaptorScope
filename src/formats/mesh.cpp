@@ -2910,6 +2910,61 @@ static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
     }
 }
 
+/* Trigger zones: every 0x28 opcode in the script area.  The script walk
+   stops at the first 0x01, but 0x01 is a 4-byte opcode that scripts
+   continue past, so it missed most zones in rooms like ST103 (its door
+   triggers among them).  As with section placements, scan the whole area
+   at 4-byte steps instead.  A real zone repeats its type at +20 and has 1
+   at +23; every 0x28 in all rooms that is not a zone (bytes of embedded
+   data tables) fails that test.  Scripts set the same zone from several
+   branches, so identical type + corners are kept once.  Returns the
+   number of zones added. */
+static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
+                              RdtSceneOverlay& ov)
+{
+    int added = 0;
+    for (size_t pc = scd_base; pc + 24 <= scd_end && ov.n_zones < 64; pc += 4) {
+        u8 typ = dec[pc + 2];
+        if (dec[pc] != 0x28 || typ >= 12 || dec[pc + 20] != typ || dec[pc + 23] != 1)
+            continue;
+        RdtFloorZone z;
+        memset(&z, 0, sizeof(z));
+        for (int c = 0; c < 4; c++) {
+            z.x[c] = rd_s16(dec + pc + 4 + c * 4);
+            z.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
+        }
+        z.collision_group = dec[pc + 1];   /* zone slot */
+        z.target_index    = typ;
+        z.flags           = 0x28;
+        bool dup = false;
+        for (int i = 0; i < ov.n_zones && !dup; i++) {
+            const RdtFloorZone& o = ov.zones[i];
+            dup = o.flags == 0x28 && o.target_index == typ &&
+                  memcmp(o.x, z.x, sizeof(z.x)) == 0 && memcmp(o.z, z.z, sizeof(z.z)) == 0;
+        }
+        if (dup) continue;
+        ov.zones[ov.n_zones++] = z;
+        added++;
+    }
+    return added;
+}
+
+/* Adds a camera shot unless the same eye and target are already stored.
+   The walk follows loops back over the same 0x4C/0x2E opcodes, and
+   scripts repeat shots, so without this one shot can fill the table. */
+static bool add_camera(RdtSceneOverlay& ov, const RdtCameraEntry& cam)
+{
+    if (ov.n_cameras >= 32) return false;
+    for (int i = 0; i < ov.n_cameras; i++) {
+        const RdtCameraEntry& o = ov.cameras[i];
+        if (o.eye_x == cam.eye_x && o.eye_y == cam.eye_y && o.eye_z == cam.eye_z &&
+            o.tgt_x == cam.tgt_x && o.tgt_y == cam.tgt_y && o.tgt_z == cam.tgt_z)
+            return false;
+    }
+    ov.cameras[ov.n_cameras++] = cam;
+    return true;
+}
+
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& ov)
 {
@@ -3113,6 +3168,13 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
     if (ov.n_xforms > 0) found++;
 
     {
+        size_t scd_end = dec_size;
+        for (int i = 0; i < 7; i++)
+            if (offs[i] > offs[5] && offs[i] < scd_end) scd_end = offs[i];
+        if (scan_trigger_zones(dec, offs[5], scd_end, ov)) found++;
+    }
+
+    {
         size_t scd_base = offs[5];
         if (scd_base + 4 > dec_size) goto done;
 
@@ -3148,37 +3210,8 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 
                 /* ─── Extract spatial data from known opcodes ───
                    (0x23 and item-zone section placements are found by
-                   scan_section_placements, not by this walk.) */
-
-                /* 0x28: Collision/trigger zone (variable size)
-                   Zone data at +4: 4 × (s16 x, s16 z) = 16 bytes of XZ corners.
-                   Bytes +20..+23 are metadata: type, flags, floor_group, active.
-                   Dedup by slot — conditional branches may rewrite the same slot. */
-                if (op == 0x28 && pc + 20 <= dec_size) {
-                    u8 slot = dec[pc + 1];
-                    u8 typ  = dec[pc + 2];
-                    int sz = scd_op28_size(typ);
-                    if (pc + (size_t)sz <= dec_size && ov.n_zones < 64) {
-                        /* Dedup by slot: first write wins */
-                        bool dup = false;
-                        for (int di = 0; di < ov.n_zones; di++)
-                            if (ov.zones[di].flags == 0x28 &&
-                                ov.zones[di].collision_group == slot) { dup = true; break; }
-                        if (!dup) {
-                            RdtFloorZone& z = ov.zones[ov.n_zones++];
-                            for (int c = 0; c < 4; c++) {
-                                z.x[c] = rd_s16(dec + pc + 4 + c * 4);
-                                z.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
-                            }
-                            z.y = 0;
-                            z.height = 0;
-                            z.collision_group = slot;
-                            z.target_index    = typ;
-                            z.flags           = 0x28;
-                        }
-                        found++;
-                    }
-                }
+                   scan_section_placements, and 0x28 zones by
+                   scan_trigger_zones, not by this walk.) */
 
                 /* 0x42: Entity spawn (20 bytes).
                    byte[1]=slot, byte[2]=type, byte[3]=anim_set, byte[16]=entity_type.
@@ -3242,54 +3275,35 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                 }
 
                 /* 0x4C: Camera setup (32 bytes) */
-                if (op == 0x4C && pc + 32 <= dec_size && ov.n_cameras < 32) {
-                    s16 v1 = rd_s16(dec + pc + 2);
-                    s16 v2 = rd_s16(dec + pc + 4);
-                    s16 v3 = rd_s16(dec + pc + 6);
-                    s16 v9 = rd_s16(dec + pc + 18);
-                    s16 v10 = rd_s16(dec + pc + 20);
-                    s16 v11 = rd_s16(dec + pc + 22);
-                    RdtCameraEntry& cam = ov.cameras[ov.n_cameras++];
-                    cam.eye_x = v1;
-                    cam.eye_y = v2;
-                    cam.eye_z = v3;
-                    cam.tgt_x = v9;
-                    cam.tgt_y = v10;
-                    cam.tgt_z = v11;
+                if (op == 0x4C && pc + 32 <= dec_size) {
+                    RdtCameraEntry cam;
+                    cam.eye_x = rd_s16(dec + pc + 2);
+                    cam.eye_y = rd_s16(dec + pc + 4);
+                    cam.eye_z = rd_s16(dec + pc + 6);
+                    cam.tgt_x = rd_s16(dec + pc + 18);
+                    cam.tgt_y = rd_s16(dec + pc + 20);
+                    cam.tgt_z = rd_s16(dec + pc + 22);
                     cam.fov   = (u16)rd_s16(dec + pc + 8);
                     cam.flags = 0;
-                    found++;
+                    if (add_camera(ov, cam)) found++;
                 }
 
-                /* 0x2E: Examine/interact zone (20 bytes)
-                   byte[1]=zone_mask, bytes[4..19]=4 corners (s16 x, s16 z)
-                   Handler stores gs+35=mask, gs+36=ptr to corner data.
-                   Player standing in zone + action button triggers inspect. */
-                if (op == 0x2E && pc + 20 <= dec_size && ov.n_examines < 32) {
-                    u8 mask = dec[pc + 1];
-                    if (mask > 0 && mask < 8) {
-                        RdtExamineZone& ez = ov.examines[ov.n_examines];
-                        ez.mask = mask;
-                        ez.pad  = 0;
-                        bool valid = true;
-                        for (int c = 0; c < 4; c++) {
-                            ez.x[c] = rd_s16(dec + pc + 4 + c * 4);
-                            ez.z[c] = rd_s16(dec + pc + 4 + c * 4 + 2);
-                            if (ez.x[c] < -30000 || ez.x[c] > 30000 ||
-                                ez.z[c] < -30000 || ez.z[c] > 30000)
-                                valid = false;
-                        }
-                        /* Dedup: skip if identical corners already stored */
-                        bool dup = false;
-                        for (int d = 0; d < ov.n_examines; d++) {
-                            if (ov.examines[d].x[0] == ez.x[0] &&
-                                ov.examines[d].z[0] == ez.z[0] &&
-                                ov.examines[d].x[2] == ez.x[2] &&
-                                ov.examines[d].z[2] == ez.z[2])
-                                { dup = true; break; }
-                        }
-                        if (valid && !dup) { ov.n_examines++; found++; }
-                    }
+                /* 0x2E: Camera eye + target, short form of 0x4C (20 bytes).
+                   Its handler (0x427418) feeds the same camera setters as
+                   0x4C: eye x/y/z at +2/+4/+6 (sub_4220F7), target x/y/z
+                   at +8/+10/+12 (sub_4221B1), with each one's transition
+                   at +16/+18 (0 = cut straight to it). */
+                if (op == 0x2E && pc + 20 <= dec_size) {
+                    RdtCameraEntry cam;
+                    cam.eye_x = rd_s16(dec + pc + 2);
+                    cam.eye_y = rd_s16(dec + pc + 4);
+                    cam.eye_z = rd_s16(dec + pc + 6);
+                    cam.tgt_x = rd_s16(dec + pc + 8);
+                    cam.tgt_y = rd_s16(dec + pc + 10);
+                    cam.tgt_z = rd_s16(dec + pc + 12);
+                    cam.fov   = 0;
+                    cam.flags = 0;
+                    if (add_camera(ov, cam)) found++;
                 }
 
                 /* 0x3A: Scene light source (12 bytes)
@@ -3357,6 +3371,101 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 
 done:
     return found > 0;
+}
+
+/* Zones and collision rects are flat XZ shapes, so the viewer draws them
+   on one floor plane.  Taking the most common vertex height picked the
+   ceiling in rooms like ST105, whose ceiling (raw Y -3000) has more
+   vertices than its floor (raw Y 0).  Only upward-facing horizontal faces
+   count as floor; points spread over each zone and rect vote for every
+   floor height beneath them, so a big platform or yard outside the
+   walkable area (ST613) does not win.  Rooms whose overlay covers no
+   floor fall back to the height with the most floor area. */
+static bool xz_in_tri(f32 px, f32 pz, const MeshVert& a, const MeshVert& b,
+                      const MeshVert& c)
+{
+    f32 d1 = (px - b.x) * (a.z - b.z) - (a.x - b.x) * (pz - b.z);
+    f32 d2 = (px - c.x) * (b.z - c.z) - (b.x - c.x) * (pz - c.z);
+    f32 d3 = (px - a.x) * (c.z - a.z) - (c.x - a.x) * (pz - a.z);
+    bool neg = d1 < 0 || d2 < 0 || d3 < 0;
+    bool pos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(neg && pos);
+}
+
+f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& ov)
+{
+    if (mesh.tri_count <= 0) return 0.0f;
+    int* ftri = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
+    int* fh   = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
+    if (!ftri || !fh) { free(ftri); free(fh); return 0.0f; }
+
+    int h_y[256], h_votes[256];
+    f32 h_area[256];
+    u8  h_hit[256];
+    int n_h = 0, n_floor = 0;
+
+    /* Mesh verts have Y = -(raw PSX Y), so a face whose normal has +Y faces up */
+    for (int fi = 0; fi < mesh.tri_count; fi++) {
+        const MeshTri& t = mesh.tris[fi];
+        if (t.alt) continue;
+        const MeshVert& a = mesh.verts[t.idx[0]];
+        const MeshVert& b = mesh.verts[t.idx[1]];
+        const MeshVert& c = mesh.verts[t.idx[2]];
+        if (fabsf(a.y - b.y) > 1.0f || fabsf(a.y - c.y) > 1.0f) continue;
+        f32 ny = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+        if (ny <= 0.0f) continue;
+        int y = (int)floorf(a.y + 0.5f);
+        int hi = -1;
+        for (int h = 0; h < n_h && hi < 0; h++)
+            if (h_y[h] == y) hi = h;
+        if (hi < 0) {
+            if (n_h == 256) continue;
+            hi = n_h++;
+            h_y[hi] = y; h_area[hi] = 0.0f; h_votes[hi] = 0;
+        }
+        h_area[hi] += ny;
+        ftri[n_floor] = fi; fh[n_floor] = hi; n_floor++;
+    }
+
+    /* 3x3 sample points across a quad (corners in drawing order) */
+    auto vote = [&](const f32 qx[4], const f32 qz[4]) {
+        static const f32 s[3] = { 0.25f, 0.5f, 0.75f };
+        for (int u = 0; u < 3; u++)
+            for (int w = 0; w < 3; w++) {
+                f32 x0 = qx[0] + (qx[1] - qx[0]) * s[u], z0 = qz[0] + (qz[1] - qz[0]) * s[u];
+                f32 x1 = qx[3] + (qx[2] - qx[3]) * s[u], z1 = qz[3] + (qz[2] - qz[3]) * s[u];
+                f32 px = x0 + (x1 - x0) * s[w], pz = z0 + (z1 - z0) * s[w];
+                memset(h_hit, 0, (size_t)n_h);
+                for (int k = 0; k < n_floor; k++) {
+                    if (h_hit[fh[k]]) continue;
+                    const MeshTri& t = mesh.tris[ftri[k]];
+                    if (xz_in_tri(px, pz, mesh.verts[t.idx[0]], mesh.verts[t.idx[1]],
+                                  mesh.verts[t.idx[2]])) {
+                        h_hit[fh[k]] = 1;
+                        h_votes[fh[k]]++;
+                    }
+                }
+            }
+    };
+    for (int i = 0; i < ov.n_zones; i++) {
+        f32 qx[4], qz[4];
+        for (int c = 0; c < 4; c++) { qx[c] = -(f32)ov.zones[i].x[c]; qz[c] = (f32)ov.zones[i].z[c]; }
+        vote(qx, qz);
+    }
+    for (int i = 0; i < ov.n_collisions; i++) {
+        const RdtCollisionRect& r = ov.collisions[i];
+        f32 x0 = -(f32)r.x, x1 = -(f32)(r.x + (s16)r.w);
+        f32 z0 = (f32)r.z,  z1 = (f32)(r.z + (s16)r.h);
+        f32 qx[4] = { x0, x1, x1, x0 }, qz[4] = { z0, z0, z1, z1 };
+        vote(qx, qz);
+    }
+
+    int best = -1;
+    for (int h = 0; h < n_h; h++)
+        if (best < 0 || h_votes[h] > h_votes[best] ||
+            (h_votes[h] == h_votes[best] && h_area[h] > h_area[best])) best = h;
+    free(ftri); free(fh);
+    return best >= 0 ? (f32)h_y[best] : 0.0f;
 }
 
 /*═══════════════════════════════════════════════════════════════════

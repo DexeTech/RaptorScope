@@ -2319,35 +2319,7 @@ static void on_entry_select(int sel_param)
                         ov_cols   = overlay.n_collisions;
                         ov_cams   = overlay.n_cameras;
                         ov_spawns = overlay.n_spawns;
-                        /* Compute floor Y from mesh — find the most common vertex Y.
-                           Mesh verts already have Y = -(raw PSX Y). */
-                        if (mesh.vert_count > 0 && mesh.tri_count > 0) {
-                            /* Bucket vertex Y values rounded to nearest 50 units */
-                            int best_y_bucket = 0, best_count = 0;
-                            int buckets[256] = {0};
-                            int bucket_val[256] = {0};
-                            int n_buckets = 0;
-                            for (int fi = 0; fi < mesh.tri_count; fi++) {
-                                for (int vi = 0; vi < 3; vi++) {
-                                    int vy = (int)(mesh.verts[mesh.tris[fi].idx[vi]].y / 50.0f) * 50;
-                                    int bi = -1;
-                                    for (int b = 0; b < n_buckets; b++)
-                                        if (bucket_val[b] == vy) { bi = b; break; }
-                                    if (bi < 0 && n_buckets < 256) {
-                                        bi = n_buckets++;
-                                        bucket_val[bi] = vy;
-                                    }
-                                    if (bi >= 0) {
-                                        buckets[bi]++;
-                                        if (buckets[bi] > best_count) {
-                                            best_count = buckets[bi];
-                                            best_y_bucket = bucket_val[bi];
-                                        }
-                                    }
-                                }
-                            }
-                            overlay.floor_y = (f32)best_y_bucket;
-                        }
+                        overlay.floor_y = overlay_floor_y(mesh, overlay);
                         g_viewer3d.set_overlay(overlay);
                     }
 

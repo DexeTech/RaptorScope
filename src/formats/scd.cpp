@@ -12,17 +12,15 @@ static u16 rd16(const u8* p) { return p[0] | (p[1] << 8); }
 static u32 rd32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 static s16 rs16(const u8* p) { return (s16)rd16(p); }
 
-/* Get instruction size for a given opcode at pc.
-   Returns 0 for terminal opcodes (EVT_END, EVT_RESUME). */
+/* Get instruction size for a given opcode at pc (0 = past the end). */
 static int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
     if (pc >= scd_size) return 0;
     u8 op = scd[pc];
 
     if (op == 0x00) return 1;
-    if (op == 0x01 || op == 0x0A) return 0; /* terminal */
 
     /* 1-byte NOPs / control markers */
-    if (op == 0x04 || op == 0x10 || op == 0x11) return 1;
+    if (op == 0x10 || op == 0x11) return 1;
     if (op >= 0x19 && op <= 0x1F) return 1;
     if (op >= 0x70) return 1;
 
@@ -67,7 +65,7 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
     case 0x03: /* EVT_CHAIN */
         _snprintf(buf, bufsz, "thread=%d, target=0x%04X", data[1], rd16(data + 2));
         return;
-    case 0x04: /* EVT_EXEC */
+    case 0x04: /* EVT_END */
         return; /* no operands worth showing */
     case 0x05: /* EVT_KILL */
         _snprintf(buf, bufsz, "thread=%d", data[1]);
@@ -110,12 +108,12 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         u8 slot = data[1];
         u8 render = data[3];
         u32 sec_raw = rd32(data + 8);
-        s16 px = rs16(data + 16);
-        s16 py = rs16(data + 18);
-        s16 pz = rs16(data + 20);
-        s16 rx = rs16(data + 22);
-        s16 ry = rs16(data + 24);
-        s16 rz = rs16(data + 26);
+        s16 px = rs16(data + 12);
+        s16 py = rs16(data + 14);
+        s16 pz = rs16(data + 16);
+        s16 rx = rs16(data + 18);
+        s16 ry = rs16(data + 20);
+        s16 rz = rs16(data + 22);
         _snprintf(buf, bufsz, "slot=%d, render=%d, sec=0x%08X, pos=(%d,%d,%d), rot=(%d,%d,%d)",
                   slot, render, sec_raw, px, py, pz, rx, ry, rz);
         return;
@@ -141,15 +139,12 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         }
         return;
     }
-    case 0x2E: { /* EXAMINE */
-        if (len >= 12) {
-            s16 x0 = rs16(data+4), z0 = rs16(data+6);
-            s16 x1 = rs16(data+8), z1 = rs16(data+10);
-            _snprintf(buf, bufsz, "slot=%d, type=%d, rect=(%d,%d)-(%d,%d)",
-                      data[1], data[2], x0, z0, x1, z1);
-        }
+    case 0x2E: /* CAM_SET: eye, target, transition of each (0 = cut) */
+        _snprintf(buf, bufsz, "eye=(%d,%d,%d), tgt=(%d,%d,%d), eye_t=%d, tgt_t=%d",
+                  rs16(data+2), rs16(data+4), rs16(data+6),
+                  rs16(data+8), rs16(data+10), rs16(data+12),
+                  rs16(data+16), rs16(data+18));
         return;
-    }
     case 0x35: /* POS_SET */
         _snprintf(buf, bufsz, "x=%d, y=%d, z=%d", rs16(data+2), rs16(data+4), rs16(data+6));
         return;
@@ -165,12 +160,12 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         _snprintf(buf, bufsz, "type=%d, id=%d, x=%d, y=%d, z=%d",
                   data[1], data[2], rs16(data+6), rs16(data+8), rs16(data+10));
         return;
-    case 0x4C: { /* CAMERA */
+    case 0x4C: { /* CAMERA: handler 0x428CD1 takes the eye at +2 and
+                    the target at +18, each followed by its transition */
         s16 ex = rs16(data+2),  ey = rs16(data+4),  ez = rs16(data+6);
-        s16 tx = rs16(data+8),  ty = rs16(data+10), tz = rs16(data+12);
-        u16 fov = rd16(data+14);
-        _snprintf(buf, bufsz, "type=%d, eye=(%d,%d,%d), tgt=(%d,%d,%d), fov=%d",
-                  data[1], ex, ey, ez, tx, ty, tz, fov);
+        s16 tx = rs16(data+18), ty = rs16(data+20), tz = rs16(data+22);
+        _snprintf(buf, bufsz, "type=%d, eye=(%d,%d,%d), tgt=(%d,%d,%d), eye_t=%d, tgt_t=%d",
+                  data[1], ex, ey, ez, tx, ty, tz, rs16(data+8), rs16(data+24));
         return;
     }
     case 0x5B: { /* ITEM_SET */
@@ -188,6 +183,37 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         if (i > 1) pos += _snprintf(buf + pos, bufsz - pos, ", ");
         pos += _snprintf(buf + pos, bufsz - pos, "0x%02X", data[i]);
     }
+}
+
+/* End of thread ti.  0x01 and 0x0A are ordinary 4-byte opcodes, not thread
+   ends: every thread in the game decodes straight through to the start of
+   the next one, and every thread finishes with 0x04 00 00 00.  So a thread
+   runs to the next thread's start.  The last thread has message text after
+   it in the same block; it ends at the first 0x04 that no earlier jump
+   (0x0C/0x0D/0x0E) lands beyond.  On the other threads, whose ends are
+   known, that rule is exact for 2713 of 2735. */
+static size_t scd_thread_end(const u8* scd, size_t scd_size, const ScdDisasm& out, int ti)
+{
+    size_t start = out.thread_offsets[ti], next = scd_size;
+    for (int i = 0; i < out.n_threads; i++)
+        if (out.thread_offsets[i] > start && out.thread_offsets[i] < next)
+            next = out.thread_offsets[i];
+    if (next < scd_size) return next;
+
+    size_t pc = start, far = start;
+    while (pc < scd_size) {
+        int sz = scd_inst_size(scd, scd_size, pc);
+        if (sz == 0) break;
+        u8 op = scd[pc];
+        if ((op == 0x0C || op == 0x0D || op == 0x0E) && pc + 4 <= scd_size) {
+            long tgt = (long)pc + (long)rs16(scd + pc + 2);
+            if (tgt > (long)far) far = (size_t)tgt;
+        }
+        if (op == 0x04 && far <= pc)
+            return (pc + sz < scd_size) ? pc + sz : scd_size;
+        pc += sz;
+    }
+    return scd_size;
 }
 
 bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
@@ -216,20 +242,18 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
     const u8* scd = dec + scd_off;
     size_t scd_size = scd_end - scd_off;
 
-    /* Parse thread offset table: array of u32 relative offsets.
-       First offset that points past the table = end of table. */
+    /* Parse thread offset table: array of u32 relative offsets.  The first
+       thread starts right after the table, so the first offset / 4 is the
+       thread count (reading on would take code bytes as offsets). */
+    if (scd_size < 4) return false;
+    u32 table_size = rd32(scd);
+    if (table_size < 4 || table_size > scd_size || (table_size & 3) != 0) return false;
     int n_threads = 0;
-    size_t first_code = scd_size;
-    for (int i = 0; i < 64; i++) {
-        if ((size_t)i * 4 + 4 > scd_size) break;
+    for (int i = 0; i < 64 && (u32)i * 4 < table_size; i++) {
         u32 toff = rd32(scd + i * 4);
-        if (toff >= scd_size) break;
-        /* Heuristic: thread offsets should be >= table size */
-        if (toff < (u32)(i + 1) * 4) break;
+        if (toff < table_size || toff >= scd_size) break;
         out.thread_offsets[i] = toff;
-        if (toff < first_code) first_code = toff;
         n_threads++;
-        if (n_threads > 1 && toff <= out.thread_offsets[0]) break;
     }
     if (n_threads == 0) return false;
     out.n_threads = n_threads;
@@ -260,17 +284,14 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
     /* First pass: collect all branch targets to generate labels */
     bool* is_target = (bool*)calloc(scd_size, 1);
 
+    size_t code_end = 0;
     for (int ti = 0; ti < n_threads; ti++) {
         size_t pc = out.thread_offsets[ti];
-        int steps = 0;
-        while (pc < scd_size && steps < 4000) {
+        size_t end = scd_thread_end(scd, scd_size, out, ti);
+        if (end > code_end) code_end = end;
+        while (pc < end) {
             int sz = scd_inst_size(scd, scd_size, pc);
-            if (sz == 0) {
-                /* Terminal: mark the opcode itself */
-                if (pc < scd_size && (scd[pc] == 0x01 || scd[pc] == 0x0A))
-                    break;
-                break;
-            }
+            if (sz == 0) break;
             u8 op = scd[pc];
             /* Track branch targets */
             if ((op == 0x0C || op == 0x0D || op == 0x0E) && pc + 4 <= scd_size) {
@@ -280,7 +301,6 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
                     is_target[tgt] = true;
             }
             pc += sz;
-            steps++;
         }
     }
 
@@ -296,10 +316,10 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
         }
 
         size_t pc = out.thread_offsets[ti];
-        int steps = 0;
+        size_t end = scd_thread_end(scd, scd_size, out, ti);
         int indent = 0;
 
-        while (pc < scd_size && steps < 4000) {
+        while (pc < end) {
             /* Insert label if this is a branch target */
             if (is_target[pc]) {
                 ScdLine& lbl = out.add();
@@ -311,25 +331,6 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
 
             u8 op = scd[pc];
             int sz = scd_inst_size(scd, scd_size, pc);
-
-            /* Terminal opcodes */
-            if (sz == 0 && (op == 0x01 || op == 0x0A)) {
-                ScdLine& l = out.add();
-                l.offset = (u32)pc;
-                l.thread = (u8)ti;
-                l.opcode = op;
-                l.size = (op == 0x01) ? 4 : 4;
-                int term_sz = (pc + 4 <= scd_size) ? 4 : 1;
-                l.size = term_sz;
-                l.indent = indent;
-
-                const char* name = (op < 0x70) ? g_scd_opcodes[op].name : "UNK";
-                fmt_hex(l.hex, sizeof(l.hex), scd + pc, term_sz);
-                _snprintf(l.text, sizeof(l.text), "    %-14s", name);
-                _snprintf(l.comment, sizeof(l.comment), "; %s",
-                          (op < 0x70) ? g_scd_opcodes[op].desc : "");
-                break; /* end of this thread */
-            }
 
             if (sz == 0) break; /* safety */
             if (pc + sz > scd_size) break;
@@ -373,8 +374,7 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
                 _snprintf(l.text, sizeof(l.text), "    %-14s", name);
 
             /* Comment */
-            if (op < 0x70 && g_scd_opcodes[op].desc[0] &&
-                op != 0x00 && op != 0x01 && op != 0x0A) {
+            if (op < 0x70 && g_scd_opcodes[op].desc[0] && op != 0x00) {
                 _snprintf(l.comment, sizeof(l.comment), "; %s", g_scd_opcodes[op].desc);
             }
 
@@ -391,13 +391,20 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
             }
 
             pc += sz;
-            steps++;
         }
 
         /* Blank line between threads */
         ScdLine& blank = out.add();
         blank.thread = (u8)ti;
         blank.text[0] = 0;
+    }
+
+    if (code_end < scd_size) {
+        ScdLine& t = out.add();
+        t.offset = (u32)code_end;
+        t.thread = 0xFF;
+        _snprintf(t.text, sizeof(t.text), "; 0x%04X-0x%04X: message text, not script",
+                  (unsigned)code_end, (unsigned)scd_size);
     }
 
     free(is_target);

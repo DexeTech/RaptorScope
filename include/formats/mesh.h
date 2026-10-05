@@ -403,13 +403,6 @@ struct RdtCharPlace {
     u32 anim_ptr;
 };
 
-/*─── SCD opcode 0x2E: examine/interact zone (20B) ─────────────*/
-struct RdtExamineZone {
-    s16 x[4], z[4];          /* 4 corner XZ coords (world-space) */
-    u8  mask;                 /* active zone bitmask */
-    u8  pad;
-};
-
 /*─── SCD opcode 0x3A: scene light source (12B) ────────────────*/
 struct RdtSceneLight {
     u8  slot;
@@ -452,7 +445,6 @@ struct RdtSceneOverlay {
     RdtObjectSpawn    spawns[64];      int n_spawns;
     RdtCharPlace      chars[16];       int n_chars;
     RdtCameraCutZone  camcuts[128];    int n_camcuts;
-    RdtExamineZone    examines[32];    int n_examines;
     RdtSceneLight     lights[8];       int n_lights;
     u8  ambient_r, ambient_g, ambient_b;  /* room ambient from ptr[0]+8 */
     RdtItemSpawn      items[32];       int n_items;
@@ -478,6 +470,10 @@ struct RdtSceneOverlay {
 /*─── Parse RDT scene overlay from decompressed blob ────────────*/
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& overlay);
+
+/* Floor height (viewer Y) for the overlay's flat zones and rects, found
+   from the upward-facing horizontal faces of the placed room mesh. */
+f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& overlay);
 
 /*─── Texture usage ──────────────────────────────────────────────*/
 /* How one textured face samples VRAM: page and colour depth (tpage),
