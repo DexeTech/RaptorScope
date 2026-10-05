@@ -196,6 +196,7 @@ struct ViewerPanel3D {
     int     gl_list_id, gl_wire_id, gl_bone_id, gl_blend_id, gl_sub_id;
     int     gl_overlay_id;    /* RDT scene overlay (zones, collisions, doors, cameras) */
     int     gl_alt_id;        /* sections no script places (H) */
+    int     gl_2side_id;      /* see-through room faces, drawn without culling */
     int     gl_normals_id;    /* debug: vertex normal lines */
     int     tri_count, vert_count, bone_count;
 
@@ -347,7 +348,7 @@ struct ViewerPanel3D {
                       dragging(false), panning(false),
                       last_mx(0), last_my(0),
                       has_mesh(false), is_emd(false),
-                      gl_list_id(0), gl_wire_id(0), gl_bone_id(0), gl_blend_id(0), gl_sub_id(0), gl_overlay_id(0), gl_alt_id(0), gl_normals_id(0),
+                      gl_list_id(0), gl_wire_id(0), gl_bone_id(0), gl_blend_id(0), gl_sub_id(0), gl_overlay_id(0), gl_alt_id(0), gl_2side_id(0), gl_normals_id(0),
                       tri_count(0), vert_count(0), bone_count(0),
                       show_wireframe(false), show_lighting(true),
                       show_bones(false), show_bone_labels(false), show_textured(true),

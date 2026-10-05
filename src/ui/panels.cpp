@@ -2052,6 +2052,7 @@ void ViewerPanel3D::shutdown_gl() {
         wglMakeCurrent(hDC, hRC);
         if (gl_list_id) glDeleteLists(gl_list_id, 1);
         if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
         if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
         if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
         if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
@@ -2078,6 +2079,85 @@ void ViewerPanel3D::resize(int w, int h) {
     wglMakeCurrent(0, 0);
 }
 
+/* Atlas slice holding a face's CLUT: 2D sparse slice lookup,
+   slot 0 = 8bpp, slot rel+1 = 4bpp sub-palette. */
+static int face_atlas_slice(const MeshTri& t, int clut_base_y, int clut_base_x,
+                            int total_v_slices)
+{
+    if (total_v_slices <= 1) return 0;
+    int clut_y = (t.clut >> 6) & 0x1FF;
+    int row = clut_y - clut_base_y;
+    if (row < 0) row = 0;
+    if (row >= 16) row = 15;
+
+    int slice_idx;
+    if (((t.tpage >> 7) & 3) == 0) { /* 4bpp face → slot rel+1 */
+        int clut_x = (t.clut & 0x3F) * 16;
+        int rel = (clut_x - clut_base_x) / 16;
+        if (rel < 0) rel = 0; if (rel >= 64) rel = 63;
+        slice_idx = g_viewer3d.slice_map[row * 65 + rel + 1];
+        if (slice_idx < 0) slice_idx = g_viewer3d.slice_map[row * 65 + 0]; /* fallback: 8bpp */
+    } else { /* 8bpp face → slot 0 */
+        slice_idx = g_viewer3d.slice_map[row * 65 + 0];
+    }
+    if (slice_idx < 0) slice_idx = 0; /* ultimate fallback */
+    return slice_idx;
+}
+
+/* Marks the faces whose texture has see-through texels (alpha 0, which the
+   alpha test discards) inside the triangle: fences, grilles, and signs
+   painted on fence panels.  The game draws room faces from both sides, and
+   ST112's signs face away from the camera that shows them, so these faces
+   are drawn without culling; with culling the viewer only showed them from
+   behind, mirrored.  Solid faces keep culling so walls still let the camera
+   see into a room from outside. */
+static void mark_see_through(const Mesh& mesh, u8* out, const u8* atlas,
+                             int atlas_w, int atlas_h, u16 tex_vram_x, int tex_bpp,
+                             int clut_base_y, u16 tex_vram_y, int num_sub_pals,
+                             int clut_base_x)
+{
+    int tex_ppw = (tex_bpp == 4) ? 4 : (tex_bpp == 16) ? 1 : 2;
+    int total_v_slices = num_sub_pals;
+    int single_h = (total_v_slices > 1) ? atlas_h / total_v_slices : atlas_h;
+
+    for (int i = 0; i < mesh.tri_count; i++) {
+        const MeshTri& t = mesh.tris[i];
+        out[i] = 0;
+        if (!atlas) continue;
+        int tp = (t.tpage >> 7) & 3;
+        int face_ppw = (tp == 0) ? 4 : (tp == 2) ? 1 : 2;
+        int x0 = ((t.tpage & 0xF) * 64 - (int)tex_vram_x) * tex_ppw;
+        int y0 = face_atlas_slice(t, clut_base_y, clut_base_x, total_v_slices) * single_h
+               + ((t.tpage >> 4) & 1) * 256 - (int)tex_vram_y;
+
+        /* Texel centres inside the triangle in UV space */
+        int ua = t.uv[0][0], va = t.uv[0][1];
+        int ub = t.uv[1][0], vb = t.uv[1][1];
+        int uc = t.uv[2][0], vc = t.uv[2][1];
+        int area = (ub - ua) * (vc - va) - (uc - ua) * (vb - va);
+        if (area == 0) continue;
+        int umin = ua < ub ? ua : ub; if (uc < umin) umin = uc;
+        int umax = ua > ub ? ua : ub; if (uc > umax) umax = uc;
+        int vmin = va < vb ? va : vb; if (vc < vmin) vmin = vc;
+        int vmax = va > vb ? va : vb; if (vc > vmax) vmax = vc;
+        for (int v = vmin; v < vmax && !out[i]; v++) {
+            for (int u = umin; u < umax; u++) {
+                /* doubled coordinates: centre of texel (u, v) */
+                int pu = 2 * u + 1, pv = 2 * v + 1;
+                long w0 = (long)(2*ub - pu) * (2*vc - pv) - (long)(2*uc - pu) * (2*vb - pv);
+                long w1 = (long)(2*uc - pu) * (2*va - pv) - (long)(2*ua - pu) * (2*vc - pv);
+                long w2 = (long)(2*ua - pu) * (2*vb - pv) - (long)(2*ub - pu) * (2*va - pv);
+                if (area > 0 ? (w0 < 0 || w1 < 0 || w2 < 0) : (w0 > 0 || w1 > 0 || w2 > 0))
+                    continue;
+                int px = x0 + u * tex_ppw / face_ppw;
+                int py = y0 + v;
+                if (px < 0 || px >= atlas_w || py < 0 || py >= atlas_h) continue;
+                if (atlas[((size_t)py * atlas_w + px) * 4 + 3] == 0) { out[i] = 1; break; }
+            }
+        }
+    }
+}
+
 /* Build all display lists from mesh + optional skeleton */
 /* Build display list from mesh */
 static void build_solid_list(int list_id, const Mesh& mesh,
@@ -2086,7 +2166,9 @@ static void build_solid_list(int list_id, const Mesh& mesh,
                              bool flip_normals = true, u16 tex_vram_y = 0,
                              int alt_mode = 0 /* 0=all, 1=primary only, 2=alt only */,
                              int num_sub_pals = 1, int clut_base_x = 0,
-                             int abr_filter = -1 /* -1=all, 0..3=only that ABR */) {
+                             int abr_filter = -1 /* -1=all, 0..3=only that ABR */,
+                             const u8* see_through = 0,
+                             int side_filter = -1 /* -1=all, 0=solid only, 1=see-through only */) {
     /* tex_ppw: pixels per VRAM halfword at the TEXTURE's rendered BPP */
     int tex_ppw = (tex_bpp == 4) ? 4 : (tex_bpp == 16) ? 1 : 2;
     /* With 2D sparse atlas: num_sub_pals = total compact slices.
@@ -2096,12 +2178,23 @@ static void build_solid_list(int list_id, const Mesh& mesh,
 
     glNewList(list_id, GL_COMPILE);
     glBegin(GL_TRIANGLES);
-    for (int i = 0; i < mesh.tri_count; i++) {
+    /* Within a section, last face first: the game adds a section's faces to
+       its ordering table in file order and each one goes in front of its
+       bucket, so of two faces at the same depth the earlier one is drawn
+       last and ends up on top.  Signs are coplanar quads over fence quads
+       (ST112), and the passes draw with GL_LEQUAL, where the face drawn last
+       wins the tie.  Sections keep their order. */
+    for (int run = 0; run < mesh.tri_count; ) {
+    int run_end = run + 1;
+    while (run_end < mesh.tri_count && mesh.tris[run_end].src_off == mesh.tris[run].src_off)
+        run_end++;
+    for (int i = run_end - 1; i >= run; i--) {
         const MeshTri& t = mesh.tris[i];
 
         /* Filter by alt_mode: 1=primary only (skip alt), 2=alt only (skip primary) */
         if (alt_mode == 1 && t.alt) continue;
         if (alt_mode == 2 && !t.alt) continue;
+        if (see_through && side_filter >= 0 && (see_through[i] != 0) != (side_filter == 1)) continue;
 
         /* Filter by ABR (semi-transparency mode):
            -1=all, 0=opaque only, 1=additive (ABR 1+3), 2=subtractive (ABR 2) */
@@ -2159,22 +2252,7 @@ static void build_solid_list(int list_id, const Mesh& mesh,
            slot 0 = 8bpp, slot rel+1 = 4bpp sub-palette. */
         float clut_v_off = 0.0f;
         if (total_v_slices > 1) {
-            int clut_y = (t.clut >> 6) & 0x1FF;
-            int row = clut_y - clut_base_y;
-            if (row < 0) row = 0;
-            if (row >= 16) row = 15;
-
-            int slice_idx;
-            if (tp == 0) { /* 4bpp face → slot rel+1 */
-                int clut_x = (t.clut & 0x3F) * 16;
-                int rel = (clut_x - clut_base_x) / 16;
-                if (rel < 0) rel = 0; if (rel >= 64) rel = 63;
-                slice_idx = g_viewer3d.slice_map[row * 65 + rel + 1];
-                if (slice_idx < 0) slice_idx = g_viewer3d.slice_map[row * 65 + 0]; /* fallback: 8bpp */
-            } else { /* 8bpp face → slot 0 */
-                slice_idx = g_viewer3d.slice_map[row * 65 + 0];
-            }
-            if (slice_idx < 0) slice_idx = 0; /* ultimate fallback */
+            int slice_idx = face_atlas_slice(t, clut_base_y, clut_base_x, total_v_slices);
             clut_v_off = (float)(slice_idx * single_h) / th;
             v_off = v_off * ((float)single_h / th);
         }
@@ -2191,6 +2269,8 @@ static void build_solid_list(int list_id, const Mesh& mesh,
             }
             glVertex3f(vv.x, vv.y, vv.z);
         }
+    }
+    run = run_end;
     }
     glEnd();
     glEndList();
@@ -2704,6 +2784,7 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     if (has_mesh) {
         if (gl_list_id) glDeleteLists(gl_list_id, 1);
         if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
         if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
         if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
         if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
@@ -2734,10 +2815,32 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
          3 = quarter-additive (subtle glow)
        Opaque faces → gl_list_id,  additive (ABR 1+3) → gl_blend_id,
        subtractive (ABR 2) → gl_sub_id. */
+    /* See-through opaque faces go in their own list, drawn without culling */
+    u8* see_through = 0;
+    bool any_see_through = false;
+    if (has_texture && uv_atlas_rgba && mesh.tri_count > 0) {
+        see_through = (u8*)malloc(mesh.tri_count);
+        if (see_through) {
+            mark_see_through(mesh, see_through, uv_atlas_rgba, uv_atlas_w, uv_atlas_h,
+                             tex_vram_x, tex_bpp, clut_base_y, tex_vram_y,
+                             num_sub_pals, clut_base_x);
+            for (int fi = 0; fi < mesh.tri_count && !any_see_through; fi++)
+                any_see_through = see_through[fi] && !mesh.tris[fi].alt &&
+                                  ((mesh.tris[fi].tpage >> 5) & 3) == 0;
+        }
+    }
     gl_list_id = glGenLists(1);
     build_solid_list(gl_list_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
                      num_pal_rows, clut_base_y, true, tex_vram_y, 1,
-                     num_sub_pals, clut_base_x, 0);
+                     num_sub_pals, clut_base_x, 0, see_through, any_see_through ? 0 : -1);
+    gl_2side_id = 0;
+    if (any_see_through) {
+        gl_2side_id = glGenLists(1);
+        build_solid_list(gl_2side_id, mesh, tex_w, tex_h, tex_vram_x, tex_bpp,
+                         num_pal_rows, clut_base_y, true, tex_vram_y, 1,
+                         num_sub_pals, clut_base_x, 0, see_through, 1);
+    }
+    free(see_through);
 
     /* Scan for semi-transparent faces */
     bool has_additive = false, has_subtractive = false;
@@ -2887,6 +2990,7 @@ void ViewerPanel3D::set_emd(const EmdModel& emd) {
     if (has_mesh) {
         if (gl_list_id) glDeleteLists(gl_list_id, 1);
         if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
         if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
         if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
         if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
@@ -2898,6 +3002,7 @@ void ViewerPanel3D::set_emd(const EmdModel& emd) {
     gl_sub_id = 0;
     if (gl_overlay_id) { glDeleteLists(gl_overlay_id, 1); gl_overlay_id = 0; }
     if (gl_alt_id) { glDeleteLists(gl_alt_id, 1); gl_alt_id = 0; }
+    if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
     if (gl_pick_id) { glDeleteLists(gl_pick_id, 1); gl_pick_id = 0; }
     pick_tri = -1; pick_section = 0; pick_info[0] = 0;
     gl_list_id = glGenLists(1); build_solid_list(gl_list_id, emd.mesh, tex_w, tex_h, tex_vram_x, tex_bpp, num_pal_rows, clut_base_y, false, tex_vram_y, 0, num_sub_pals, clut_base_x);
@@ -2964,6 +3069,7 @@ void ViewerPanel3D::clear_mesh() {
         wglMakeCurrent(hDC, hRC);
         if (gl_list_id) glDeleteLists(gl_list_id, 1);
         if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
         if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
         if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
         if (gl_sel_id)  glDeleteLists(gl_sel_id, 1);
@@ -3178,6 +3284,7 @@ void ViewerPanel3D::anim_set_frame(int frame) {
         wglMakeCurrent(hDC, hRC);
         if (gl_list_id) { glDeleteLists(gl_list_id, 1); gl_list_id = 0; }
         if (gl_alt_id)  { glDeleteLists(gl_alt_id, 1); gl_alt_id = 0; }
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
         if (gl_wire_id) { glDeleteLists(gl_wire_id, 1); gl_wire_id = 0; }
         if (gl_bone_id) { glDeleteLists(gl_bone_id, 1); gl_bone_id = 0; }
         gl_list_id = glGenLists(1); build_solid_list(gl_list_id, anim_model->mesh, tex_w, tex_h, tex_vram_x, tex_bpp, num_pal_rows, clut_base_y, false, tex_vram_y, 0, num_sub_pals, clut_base_x);
@@ -3642,6 +3749,11 @@ void ViewerPanel3D::render() {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthFunc(GL_LEQUAL);
             if (gl_list_id) glCallList(gl_list_id);
+            if (gl_2side_id) {
+                glDisable(GL_CULL_FACE);
+                glCallList(gl_2side_id);
+                if (show_cull) glEnable(GL_CULL_FACE);
+            }
             if (show_alt_geo && gl_alt_id) glCallList(gl_alt_id);
             glDepthFunc(GL_LESS);
             glDisable(GL_BLEND);
