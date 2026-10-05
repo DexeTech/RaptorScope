@@ -43,7 +43,8 @@ The tool reconstructs the PSX GPU rendering pipeline in software — including 4
 ### 3D Room Viewer
 - **Full room geometry** reconstructed from RDT (Room Data Table) files, including the two rooms that store their RDT uncompressed (ST50B, ST60E)
 - **Mixed BPP rendering**: 4bpp and 8bpp textures coexist in a single atlas via 2D sparse sub-palette allocation
-- **SCD script walker**: Parses bytecode to extract collision zones (0x28), camera cuts (0x4C), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
+- **SCD script walker**: Parses bytecode to extract camera shots (0x4C, and its short form 0x2E), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
+- **Trigger zones**: Every 0x28 zone in the script area is found by scanning it, not by the walk, so zones set after an 0x01 (such as ST103's door triggers) are shown
 - **Scripted placement**: The room is built the way the game builds it — only the sections its scripts place into model slots are drawn. Placements (0x23, and item pickup zones 0x28 type 4) are found by scanning the whole script area, then later script writes to the slot (0x2A, 0x36, 0x37) adjust position and rotation, e.g. lifting items onto desks
 - **Item pickup models**: Type-4 zones (0x28) put their item model at the zone centre, as the game does
 - **Unplaced sections (H key)**: Sections the game stores but never places (unused leftovers, such as an unused DDK in ST103) are hidden by default; **H** shows them tinted magenta at their raw positions
@@ -76,12 +77,13 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 | Cyan | Item pickup zones, type 4 (0x28) |
 | Purple | Floor elevation zones (ptr[6]) |
 | Violet | Camera cut zones (ptr[2]) |
-| Teal (dashed) | Examine zones (0x2E) |
 | Gold | Scene lights (0x3A + ptr[0]) |
-| Blue dot | Camera eye position (0x4C) |
-| Red dot | Camera target (0x4C) |
+| Blue dot | Camera eye position (0x4C, 0x2E) |
+| Red dot | Camera target (0x4C, 0x2E) |
 | White diamond | Item pickup (0x5B) |
 | Orange dot | Character spawn (0x20) |
+
+Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the height of the upward-facing horizontal faces that lie under them (a ceiling never counts, even when it has more geometry than the floor, as in ST105).
 
 ### Character Model Viewer
 - EMD model parsing with skeletal hierarchy
@@ -212,12 +214,13 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 
 The room initialization script (ptr[5]) uses a multi-threaded virtual machine:
 
-- **Thread table**: Array of u32 offsets from SCD base
-- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (examine trigger), 0x3A (scene light), 0x42 (entity spawn), 0x4C (camera entry), 0x5B (item pickup)
+- **Thread table**: Array of u32 offsets from SCD base; the first offset / 4 is the thread count
+- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x42 (entity spawn), 0x4C (camera entry), 0x5B (item pickup)
 - **Opcode 0x23** (32 bytes): Places a mesh section into a model slot at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe; the opcode dispatch table starts at VA `0x006576A0` (the two words before it are 0 and 1)
+- **Opcode 0x28** (size by type): a zone's four XZ corners at +4..+19; a real zone repeats its type at +20 and has 1 at +23, which no other 0x28 byte in the scripts does
 - **Opcode 0x28 type 4** (44 bytes): Item pickup zone. Its model (slot at +34, section at +36) is placed on the floor at the zone centre (`sub_426DFC` → `sub_448E3B`) and spins while the item is there
 - **Work target**: 0x22 03 `<slot>` selects a model slot; 0x2A sets one of its fields (3/4/5 = x/y/z, 6/7/8 = rotation, via `sub_47416C`), 0x36 sets x/y/z and 0x37 the rotation
-- **Control flow**: 0x0C (unconditional jump), 0x01/0x0A (thread terminate), conditional branches
+- **Control flow**: 0x0C (unconditional jump), 0x0E (conditional relative jump), 0x04 (end of thread; every thread finishes with `04 00 00 00`). 0x01 and 0x0A are 4-byte opcodes that scripts continue past; decoding each script straight through with the opcode sizes lands exactly on the next script in every room. Message text follows the last thread in the same block
 
 ### PSX Transparency Rules
 
@@ -253,7 +256,7 @@ The tool composites all archive textures into a single OpenGL atlas using 2D spa
 | **L** | Toggle lighting |
 | **T** | Toggle textured rendering |
 | **V** | Toggle vertex colors |
-| **C** | Toggle backface culling |
+| **C** | Toggle backface culling (see-through room faces such as fences and the signs painted on them are always drawn from both sides, as the game does) |
 | **O** | Toggle overlay visualization |
 | **H** | Show/hide unplaced (unused) room sections |
 | **I** | Toggle room scene lights |
