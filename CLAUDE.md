@@ -109,13 +109,6 @@ Ordered with memory safety and data loss first.
 - **B5** **`new[]`/`free` mismatch.** `parse_standalone_emd_mesh_dec` fills `mesh.verts/tris` with `new[]`, but `Mesh` frees with `free`, and existing arrays are overwritten without being freed. Use `mesh.alloc`.
 - **B6** **Dangling pointer after a failed `realloc`.** `mesh_apply_xforms` returns without storing the moved pointer when one of its two `realloc`s fails after the other succeeded. `mesh.verts` or `mesh.tris` is then left dangling.
 - **B8** **WAV buffer leak.** `AudioPanel::load_wav` stores its PCM in `pcm_data`, but `free_samples()` and the destructor free only `samples[i].pcm`.
-- **B10** **OBJ/SMD export use the old room builder.**
-  - `IDM_EXPORT_OBJ`/`IDM_EXPORT_SMD` call `parse_rdt_scene`, which has its own outdated walker, leaves unplaced sections at raw positions, applies no 0x2A/0x36/0x37 adjustments and puts item models at y=0. They don't use the mesh the viewer shows, which GLB export does.
-  - They also LZSS-decompress unconditionally, so ST50B and ST60E can't be exported.
-- **B11** **Export dialogs misbehave.**
-  - In OBJ/SMD export, cancelling a character's save dialog falls through to the static-mesh path and opens a second dialog; for a child of an RDT scene, that dialog is for the room.
-  - With `sub == 0` they try an EMD first, the opposite of `on_entry_select`.
-  - Neither success nor failure is reported.
 - **B12** **SMD skeleton doesn't line up with the mesh.** `export_emd_smd` writes bone offsets in game axes but vertices in viewer axes (x, y, z negated). Any non-zero bone with parent 0xFF is written with parent 255.
 - **B13** **3D view can show stale textures.** `upload_archive_texture` caches the atlas by the `DatArchive*` address plus the CLUT list. `close_archive` doesn't reset that cache and Import/Replace doesn't invalidate it. A reopened archive allocated at the same address, or a replaced texture, can therefore show the old atlas. (likely)
 - **B14** **Status bar drops 4 characters of the path.** `App::open_archive` calls `set_status(buf + 18)` five times, but the "RaptorScope - " prefix is 14 characters. The 18 dates from the old title.
@@ -245,7 +238,7 @@ Ordered with memory safety and data loss first.
 - **M1** **Dead public API** (declared and defined, never called):
   - **Colour and audio:** `build_palette`, `rgba_to_bgr555`, `decode_bgr555`, `encode_bgr555`, `dc_clamp`/`dc_clampi`, `build_wav_memory`, `write_wav_stereo`, `split_vag_samples`
   - **Archive and textures:** `dat_is_item_bank`, `guess_default_bpp` (plus `parse_tpage_table`/`TpageInfo`, which only it uses), `swizzle_8bpp`, `render_linear_8bpp`, `extract_background`/`is_background_data`/`Background`/`BgTile`, `upscale_4x_smooth`
-  - **Images, video and meshes:** `save_bmp`, `save_tga`, `mpeg_get_info`, `is_emd_entry`, `find_emd_headers`, `is_rdt_scene`
+  - **Images, video and meshes:** `save_bmp`, `save_tga`, `mpeg_get_info`, `is_emd_entry`, `find_emd_headers`, `is_rdt_scene`, and the wrappers that LZSS-decompress first: `parse_rdt_scene`, `parse_room_mesh`, `parse_door_mesh`
   - **UI:**
     - `classify_lzss0` (`app.cpp`): `build_tree` re-implements it and never produces `SUB_STANDALONE_EMD`/`SUB_BACKGROUND`.
     - `ViewerPanel3D::clear_mesh` and `Uve_CmpTri`.

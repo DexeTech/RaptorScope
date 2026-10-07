@@ -1931,6 +1931,139 @@ static void upload_archive_texture()
     free(rgba);
 }
 
+/* The static mesh of an LZSS0 entry (or raw RDT) as the 3D viewer shows it,
+   which the OBJ/SMD exports share.  dd/ds is the entry's payload.
+
+   The game draws only the sections its scripts place in model slots
+   (0x23, item zones); mesh_apply_xforms builds exactly those.  Other
+   sections are leftovers (unused variants, objects in local coordinates)
+   and would pile up at the origin, so the sequential walk is only a
+   fallback for rooms without placements.  with_unplaced adds the
+   leftovers (such as ST103's unused DDK) at their raw coordinates,
+   flagged alt: the viewer hides them unless H is pressed, and exports
+   leave them out.  Returns the kind of mesh, or "" if there is none. */
+static const char* build_entry_mesh(const u8* dd, size_t ds, u32 base, Mesh& mesh,
+                                    RdtSceneOverlay& overlay, bool& has_overlay,
+                                    bool with_unplaced)
+{
+    has_overlay = parse_rdt_overlay(dd, ds, base, overlay);
+    bool placed = has_overlay && overlay.n_xforms > 0;
+    if (!placed) {
+        if (parse_rdt_scene_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+            return "Room Scene";
+        if (parse_room_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+            return "Static Mesh";
+        if (parse_standalone_emd_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
+            return "Character Mesh";
+        if (parse_door_mesh_dec(dd, ds, base, mesh))
+            return "Door Mesh";
+        return "";
+    }
+
+    mesh.alloc(0, 0);
+    mesh_apply_xforms(mesh, dd, ds, base, overlay.xforms, overlay.n_xforms);
+    mesh_compute_smooth_normals(mesh);
+
+    RdtLayout lay;
+    if (with_unplaced && parse_rdt_layout(dd, ds, base, lay)) {
+        RdtSectionXform unplaced[RDT_MAX_SECTIONS];
+        int n_unplaced = 0;
+        for (int si = 0; si < lay.section_count; si++) {
+            u32 so = (u32)lay.sections[si].offset;
+            bool used = false;
+            for (int xi = 0; xi < overlay.n_xforms && !used; xi++)
+                used = overlay.xforms[xi].section_off == so;
+            if (used) continue;
+            RdtSectionXform& u = unplaced[n_unplaced++];
+            memset(&u, 0, sizeof(u));
+            u.section_off = so;
+        }
+        int first_alt = mesh.tri_count;
+        mesh_apply_xforms(mesh, dd, ds, base, unplaced, n_unplaced);
+        for (int ti = first_alt; ti < mesh.tri_count; ti++)
+            mesh.tris[ti].alt = 1;
+    }
+    return "Room Scene";
+}
+
+/* File > Export OBJ / SMD: the selected entry's character model, or else
+   its static mesh as the viewer shows it, chosen the way on_entry_select
+   chooses.  Characters are parsed afresh, in their bind pose, because the
+   viewer animates g_emd_model's vertices in place. */
+static void export_selected_mesh(HWND hwnd, bool smd)
+{
+    const char* title = smd ? "Export SMD" : "Export OBJ";
+    int sel = g_app.selected_entry_idx();
+    int eidx = sel & 0xFFFF;
+    int sub = (sel >> 16) & 0xFF;
+    Buffer dec;
+    bool usable = sel >= 0 && g_app.archive && eidx < g_app.archive->count;
+    if (usable) {
+        const DatEntry& e = g_app.archive->entries[eidx];
+        usable = effective_entry_type(e) == DAT_LZSS0 && (e.y & 0x8000) &&
+                 dat_entry_payload(e, dec) && dec.size > 0;
+    }
+    if (!usable) {
+        MessageBoxA(hwnd, "Select a room, mesh or character entry first.", title,
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const DatEntry& e = g_app.archive->entries[eidx];
+    const u8* dd = dec.data;
+    size_t    ds = dec.size;
+    u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
+
+    /* sub >= 2: EMD by ordinal (sub-2).  sub=0: an EMD only when there is
+       no room mesh, as on_entry_select does. */
+    bool want_emd = sub >= 2;
+    if (sub == 0) {
+        RdtLayout room_layout;
+        want_emd = !(parse_rdt_layout(dd, ds, base, room_layout) &&
+                     room_layout.section_count > 0);
+    }
+    EmdModel emd;
+    bool is_emd = false;
+    if (want_emd) {
+        int emd_ordinal = (sub >= 2) ? (sub - 2) : 0;
+        int hint = -1;
+        EntryEmdInfo* info = get_emd_info(eidx);
+        if (info && emd_ordinal < info->count)
+            hint = (int)info->offsets[emd_ordinal];
+        is_emd = parse_emd_model_dec(dd, ds, e.y, e.x, emd, hint);
+    }
+
+    Mesh mesh;
+    if (!is_emd) {
+        RdtSceneOverlay overlay;
+        bool has_overlay = false;
+        if (!build_entry_mesh(dd, ds, base, mesh, overlay, has_overlay, false)[0]) {
+            MessageBoxA(hwnd, "This entry has no mesh or character model to export.", title,
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+    }
+
+    char path[MAX_PATH];
+    if (!ui_save_file(hwnd, path, MAX_PATH,
+                      smd ? "SMD Files (*.smd)\0*.smd\0" : "OBJ Files (*.obj)\0*.obj\0",
+                      title, smd ? "smd" : "obj"))
+        return;
+
+    const Mesh& m = is_emd ? emd.mesh : mesh;
+    bool ok = smd ? (is_emd ? export_emd_smd(path, emd) : export_mesh_smd(path, mesh))
+                  : export_mesh_obj(path, m);
+    if (!ok) {
+        MessageBoxA(hwnd, "Export failed: the file could not be written.", title,
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    char msg[MAX_PATH + 96];
+    _snprintf(msg, sizeof(msg) - 1, "Exported %s: %d verts, %d faces to %s",
+              is_emd ? "character" : "mesh", m.vert_count, m.tri_count, path);
+    msg[sizeof(msg) - 1] = 0;
+    g_app.set_status(msg);
+}
+
 /*═══════════════════════════════════════════════════════════════════
  *  Entry selection  -  auto-switch panel based on type
  *═══════════════════════════════════════════════════════════════════*/
@@ -2171,66 +2304,14 @@ static void on_entry_select(int sel_param)
             /* sub=1: static mesh only, or sub=0 fallback */
             {
                 Mesh mesh;
-                const char* mesh_type = "";
-
-                /* Parse overlay FIRST to get xform data */
                 RdtSceneOverlay overlay;
-                bool has_overlay = parse_rdt_overlay(dd, ds, base, overlay);
-
-                /* The game draws only the sections its scripts place in model
-                   slots (0x23, item zones); mesh_apply_xforms builds exactly
-                   those.  Other sections are leftovers (unused variants,
-                   objects in local coordinates) and would pile up at the
-                   origin, so the sequential walk is only a fallback for
-                   rooms without placements. */
-                bool placed = has_overlay && overlay.n_xforms > 0;
-                if (placed) {
-                    mesh.alloc(0, 0);
-                    mesh_type = "Room Scene";
-                }
-                else if (parse_rdt_scene_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
-                    mesh_type = "Room Scene";
-                else if (parse_room_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
-                    mesh_type = "Static Mesh";
-                else if (parse_standalone_emd_mesh_dec(dd, ds, base, mesh) && mesh.tri_count > 0)
-                    mesh_type = "Character Mesh";
-                else if (parse_door_mesh_dec(dd, ds, base, mesh))
-                    mesh_type = "Door Mesh";
+                bool has_overlay = false;
+                const char* mesh_type = build_entry_mesh(dd, ds, base, mesh, overlay,
+                                                         has_overlay, true);
                 if (mesh_type[0]) {
                     panel = PANEL_3D;
                     g_viewer3d.uv_cache_clut_row = 0;
-
-                    /* Apply xform instancing FIRST, so all faces are in mesh
-                       before we compute max_sub_pal for the texture atlas. */
                     int ov_zones = 0, ov_cols = 0, ov_cams = 0, ov_spawns = 0;
-                    if (placed) {
-                        mesh_apply_xforms(mesh, dd, ds, base,
-                                          overlay.xforms, overlay.n_xforms);
-                        mesh_compute_smooth_normals(mesh);
-
-                        /* Sections nothing places (leftovers such as ST103's
-                           unused DDK) go in at their raw coordinates, flagged
-                           alt: the viewer hides them unless H is pressed. */
-                        RdtLayout lay;
-                        if (parse_rdt_layout(dd, ds, base, lay)) {
-                            RdtSectionXform unplaced[RDT_MAX_SECTIONS];
-                            int n_unplaced = 0;
-                            for (int si = 0; si < lay.section_count; si++) {
-                                u32 so = (u32)lay.sections[si].offset;
-                                bool used = false;
-                                for (int xi = 0; xi < overlay.n_xforms && !used; xi++)
-                                    used = overlay.xforms[xi].section_off == so;
-                                if (used) continue;
-                                RdtSectionXform& u = unplaced[n_unplaced++];
-                                memset(&u, 0, sizeof(u));
-                                u.section_off = so;
-                            }
-                            int first_alt = mesh.tri_count;
-                            mesh_apply_xforms(mesh, dd, ds, base, unplaced, n_unplaced);
-                            for (int ti = first_alt; ti < mesh.tri_count; ti++)
-                                mesh.tris[ti].alt = 1;
-                        }
-                    }
 
                     /* Detect dominant BPP and collect unique CLUT values from ALL faces.
                        upload_archive_texture will build the 2D sparse atlas map from these. */
@@ -3018,48 +3099,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
         } break;
-        case IDM_EXPORT_OBJ: {
-            int sel = g_app.selected_entry_idx();
-            if (sel >= 0 && g_app.archive) {
-                int eidx = sel & 0xFFFF;
-                int sub = (sel >> 16) & 0xFF;
-                if (eidx < 0 || eidx >= g_app.archive->count) break;
-                const DatEntry& e = g_app.archive->entries[eidx];
-                u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
-
-                bool exported = false;
-
-                /* sub >= 2: specific EMD, or sub=0: first EMD */
-                if (sub >= 2 || sub == 0) {
-                    int emd_ordinal = (sub >= 2) ? (sub - 2) : 0;
-                    int hint = -1;
-                    EntryEmdInfo* info = get_emd_info(eidx);
-                    if (info && emd_ordinal < info->count)
-                        hint = (int)info->offsets[emd_ordinal];
-
-                    EmdModel emd;
-                    if (parse_emd_model(e.data, e.size, e.y, e.x, emd, hint)) {
-                        char path[MAX_PATH];
-                        if (ui_save_file(hwnd, path, MAX_PATH,
-                            "OBJ Files (*.obj)\0*.obj\0", "Export OBJ", "obj"))
-                            exported = export_mesh_obj(path, emd.mesh);
-                    }
-                }
-
-                /* sub=1: static mesh only, or sub=0 fallback */
-                if (!exported) {
-                    Mesh mesh;
-                    if (parse_rdt_scene(e.data, e.size, base, mesh) ||
-                        parse_room_mesh(e.data, e.size, base, mesh) ||
-                        parse_door_mesh(e.data, e.size, base, mesh)) {
-                        char path[MAX_PATH];
-                        if (ui_save_file(hwnd, path, MAX_PATH,
-                            "OBJ Files (*.obj)\0*.obj\0", "Export OBJ", "obj"))
-                            export_mesh_obj(path, mesh);
-                    }
-                }
-            }
-        } break;
+        case IDM_EXPORT_OBJ:
+            export_selected_mesh(hwnd, false);
+            break;
         case IDM_EXPORT_GLB: {
             bool is_char = g_emd_model && g_emd_model->valid && g_viewer3d.is_emd;
             bool is_room = !g_viewer3d.is_emd && g_viewer3d.has_mesh &&
@@ -3108,48 +3150,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 : "Export failed. The model, hierarchy, atlas, or a detected animation clip could not be exported.",
                         "Export GLB", MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONERROR));
         } break;
-        case IDM_EXPORT_SMD: {
-            int sel = g_app.selected_entry_idx();
-            if (sel >= 0 && g_app.archive) {
-                int eidx = sel & 0xFFFF;
-                int sub = (sel >> 16) & 0xFF;
-                if (eidx < 0 || eidx >= g_app.archive->count) break;
-                const DatEntry& e = g_app.archive->entries[eidx];
-                u32 base = ((u32)(e.y & 0x7FFF) << 16) | (u32)e.x | 0x80000000u;
-
-                bool exported = false;
-
-                /* Try EMD (skinned mesh with bones) */
-                if (sub >= 2 || sub == 0) {
-                    int emd_ordinal = (sub >= 2) ? (sub - 2) : 0;
-                    int hint = -1;
-                    EntryEmdInfo* info = get_emd_info(eidx);
-                    if (info && emd_ordinal < info->count)
-                        hint = (int)info->offsets[emd_ordinal];
-
-                    EmdModel emd;
-                    if (parse_emd_model(e.data, e.size, e.y, e.x, emd, hint)) {
-                        char path[MAX_PATH];
-                        if (ui_save_file(hwnd, path, MAX_PATH,
-                            "SMD Files (*.smd)\0*.smd\0", "Export SMD", "smd"))
-                            exported = export_emd_smd(path, emd);
-                    }
-                }
-
-                /* Fallback: static mesh as SMD (single root bone) */
-                if (!exported) {
-                    Mesh mesh;
-                    if (parse_rdt_scene(e.data, e.size, base, mesh) ||
-                        parse_room_mesh(e.data, e.size, base, mesh) ||
-                        parse_door_mesh(e.data, e.size, base, mesh)) {
-                        char path[MAX_PATH];
-                        if (ui_save_file(hwnd, path, MAX_PATH,
-                            "SMD Files (*.smd)\0*.smd\0", "Export SMD", "smd"))
-                            export_mesh_smd(path, mesh);
-                    }
-                }
-            }
-        } break;
+        case IDM_EXPORT_SMD:
+            export_selected_mesh(hwnd, true);
+            break;
         case IDM_EXPORT_WAV: {
             int sel = g_app.selected_entry_idx();
             int eidx = sel & 0xFFFF;
