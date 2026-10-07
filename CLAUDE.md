@@ -87,6 +87,43 @@ When you establish a format fact, cite the DINO.exe handler (for example `sub_42
 - Commit subjects look like `Area: what changed, lowercase` (for example `3D viewer: …`, `Rooms: …`, `Overlay: …`, `GLB export: …`, `README: …`). Bodies are prose: what the game does, which rooms showed the problem, and DINO.exe addresses.
 - User-visible features and key bindings go into README.md, usually as a separate `README:` commit. Changes to export behaviour also update EXPORTING.md.
 
+## Releases
+
+A release is the zip `bin\RaptorScope-DC1-GLB-win64.zip`. `bin/` is git-ignored, so the zip is never committed. It holds six files:
+
+| File | Source |
+|---|---|
+| `RaptorScope-DC1-GLB.exe` | `bin\Release_x64\DC_Archive_Tool.exe` from the MSBuild command under **Build**, renamed |
+| `dc1_export.exe` | The command-line GLB exporter, built with `cl` (step 3) |
+| `README.md`, `EXPORTING.md`, `LICENSE` | The repo root, as committed |
+| `RELEASE_NOTES.md` | Written for each release; it replaces the previous one and isn't kept in the repo |
+
+Both exes are MSVC x64 builds with the static runtime (`/MT`), so they need no extra DLLs. `build-windows.cmd` builds the same pair with MinGW, but MinGW isn't installed here.
+
+**Steps:**
+
+1. **Clean tree.** Commit and push everything on `dev` first, so `git status` is empty and the release matches a pushed commit.
+2. **GUI.** Close RaptorScope, then run the MSBuild command from **Build** with `/t:Rebuild` added.
+3. **CLI.** In a scratch folder, from cmd.exe:
+   ```bat
+   call "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvars64.bat"
+   cl /nologo /O2 /MT /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /I E:\RaptorScope\include E:\RaptorScope\tools\dc1_export.cpp E:\RaptorScope\src\formats\dat.cpp E:\RaptorScope\src\formats\mesh.cpp E:\RaptorScope\src\core\lzss.cpp /Fe:dc1_export.exe
+   ```
+   Run with no arguments, it should print its usage line and exit with code 2.
+4. **Notes.** Write `RELEASE_NOTES.md`, following the rules below.
+5. **Package.** Copy the six files into a scratch staging folder, and copy the old zip to scratch as a backup. Then replace the zip with `Compress-Archive -Path <the six files> -DestinationPath bin\RaptorScope-DC1-GLB-win64.zip -Force`, and list its entries to check all six are there.
+
+**Release notes:**
+
+- **Audience.** Write for people who use the tool to view and export Dino Crisis files, not for developers. Say what they will notice, with rooms and keys as examples. Leave out function names and Known-issues IDs.
+- **Coverage.** Cover every commit since the last release. The notes end with `Built from <hash> on dev.`; for the next release, `git log <hash>..HEAD` lists what's new. The 2026-10-05 build recorded no hash; it was built from `2e77ded`.
+- **Format.**
+  - Title `# RaptorScope DC1 GLB: <YYYY-MM-DD> build`, then a short summary paragraph.
+  - One section per area (for example 3D viewer, Room overlay, Export, Editors), each a list of bullets with a bold lead-in.
+  - Build and packaging changes go last, under **Package**.
+
+**Tags and GitHub releases.** Tags `v1`–`v1.2` (2026-10-02 to 10-04) point at `main`. The zip builds since then aren't tagged. Create a tag or a GitHub release only when the user asks, since both publish; `gh` isn't logged in on this machine.
+
 ## Known issues
 
 From a full review of the hand-written code on 2026-10-07. The review covered the working tree, including the then-uncommitted overlay and camera-shot work. Generated and vendored files were not reviewed.
@@ -205,6 +242,7 @@ Ordered with memory safety and data loss first.
   - README promises OpenGL 1.1 with a software fallback, but the atlas has non-power-of-two dimensions, which GL 1.1 (GDI Generic) can't texture.
   - README lists `include/ext/ddraw_ext.h`; the actual file is `pl_mpeg.h`.
   - TODO.md lists Import/Replace, PNG export and entry ownership as missing, but all three exist. "Export as PNG" actually writes BMP.
+  - EXPORTING.md, which ships in the release zip, says the zip contains a `source/` folder, which it doesn't. It also says the Windows build is cross-compiled and has never been run on Windows; releases are now MSVC builds made and checked on Windows.
   - The window title and class (`Dino Crisis Archive Tool v2.2`, `DCArchiveToolMain`) and the VS target `DC_Archive_Tool` predate the RaptorScope name.
 
 ### Performance and silent limits
