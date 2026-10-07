@@ -587,17 +587,20 @@ struct WeaponPanel {
         HWND labels[10];    /* field name labels */
     };
     RecordUI rec_ui[WEP_MAX_RECORDS];
+    int     aim_off;      /* aim/camera block after the pointer tables, -1 = none */
+    HWND    aim_ui[14];   /* 8 aim edits, then 6 camera offset edits */
     HWND    save_btn;
     HWND    status_lbl;
     int     scroll_y;
     int     content_h;
 
     WeaponPanel() : hwnd(0), data(0), data_size(0), code_end(0),
-                    ptrtbl_start(0), n_records(0), save_btn(0),
+                    ptrtbl_start(0), n_records(0), aim_off(-1), save_btn(0),
                     status_lbl(0), scroll_y(0), content_h(0) {
         memset(filename, 0, sizeof(filename));
         memset(records, 0, sizeof(records));
         memset(rec_ui, 0, sizeof(rec_ui));
+        memset(aim_ui, 0, sizeof(aim_ui));
     }
     ~WeaponPanel() { free(data); }
 

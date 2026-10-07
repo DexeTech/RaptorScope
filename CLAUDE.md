@@ -104,10 +104,7 @@ Entries are confirmed by reading the code unless tagged **(verify)**. A (verify)
 
 Ordered with memory safety and data loss first.
 
-- **B3** **Weapon editor control IDs collide.**
-  - Record edits use `9100 + 16*record + field` (fields 6–13) and the aim/camera edits use 9200–9213, so they overlap from record 6 on.
-  - `WeaponPanel::save_file` finds aim edits with `GetDlgItem`, which returns the record edit instead. Saving a file with 7 or more records (wep11/wep13 name 13) writes record values into the aim block.
-  - The aim values are read every 4 bytes but written back as u16 only, so the high halves are left as they were. (verify the field width)
+- **B3** **Weapon aim values may be 32-bit (verify).** The weapon editor reads the 8 aim values every 4 bytes but only as the low s16, and writes back only that half. If they are s32, editing a negative value to a positive one (or the reverse) leaves the old sign in the high half.
 - **B4** **Save editor out-of-bounds read.** `dc_save_build` indexes its 10-entry digit table with `hours/10`. The Play Time edit has no length limit, so 100+ hours reads past the table.
 - **B5** **`new[]`/`free` mismatch.** `parse_standalone_emd_mesh_dec` fills `mesh.verts/tris` with `new[]`, but `Mesh` frees with `free`, and existing arrays are overwritten without being freed. Use `mesh.alloc`.
 - **B6** **Dangling pointer after a failed `realloc`.** `mesh_apply_xforms` returns without storing the moved pointer when one of its two `realloc`s fails after the other succeeded. `mesh.verts` or `mesh.tris` is then left dangling.
@@ -276,7 +273,7 @@ Ordered with memory safety and data loss first.
 - **M4** **Duplicated file-open code.**
   - `IDM_FILE_OPEN` and `WM_DROPFILES` each contain about 180 lines of the same MPEG/IMD/TIM/save probing, and the copies have already drifted: a dropped save doesn't fill the tree, and dropping requires a file extension.
   - `App::open_archive` inlines about 440 lines of raw-file sniffing.
-  - Weapon names live in three tables, and the aim-block scan appears in two functions.
+  - Weapon names live in three tables.
 - **M5** **Other duplication.**
   - Four different palette-matching heuristics for textures: DAT_TEXTURE, raw DATA, LZSS0 texture, and the atlas.
   - Three BMP writers, two of which use unaligned `*(u32*)` stores.

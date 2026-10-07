@@ -6864,12 +6864,13 @@ static const char* WEP_ALL_FIELD_NAMES[16] = {
     "Blast Radius", "Blast Falloff", "unk14", "unk15"
 };
 
-/* Control IDs */
-#define WEP_EDIT_BASE    9100
-#define WEP_COMBO_MODE   9080
-#define WEP_COMBO_AMMO   9081
-#define WEP_SAVE_BTN     9199
-#define WEP_AIM_EDIT     9200
+/* Control IDs, one range per kind; the ranges must not overlap for
+   WEP_MAX_RECORDS records (record edits run to 9100 + 16*15 + 15). */
+#define WEP_COMBO_MODE   9000   /* + record */
+#define WEP_COMBO_AMMO   9020   /* + record */
+#define WEP_EDIT_BASE    9100   /* + 16*record + field */
+#define WEP_SAVE_BTN     9399
+#define WEP_AIM_EDIT     9400   /* + 0..13 */
 
 /* Layout constants */
 #define WEP_ROW_H        28
@@ -6882,6 +6883,22 @@ static const char* WEP_ALL_FIELD_NAMES[16] = {
 
 /* Track which record is "selected" for the dropdown combos */
 static int s_wep_sel_rec = 0;
+
+/* Aim/camera block: the first non-pointer word after the pointer tables,
+   skipping single nulls between them.  -1 if there is none. */
+static int wep_find_aim_block(const u8* data, size_t size, int ptrtbl_start) {
+    int o = ptrtbl_start;
+    while (o + 4 <= (int)size) {
+        u32 v = rd_u32(data + o);
+        if ((v & 0xFF000000) != 0x80000000 && v != 0) return o;
+        if (v == 0) {
+            u32 next = (o + 8 <= (int)size) ? rd_u32(data + o + 4) : 0;
+            if ((next & 0xFF000000) != 0x80000000 && next != 0) return o + 4;
+        }
+        o += 4;
+    }
+    return -1;
+}
 
 bool WeaponPanel::load(const u8* buf, size_t sz, const char* fname) {
     free(data);
@@ -6922,6 +6939,7 @@ bool WeaponPanel::load(const u8* buf, size_t sz, const char* fname) {
             records[i].fields[f] = (s16)rd_u16(data + off + f * 2);
     }
 
+    aim_off = wep_find_aim_block(data, data_size, ptrtbl_start);
     s_wep_sel_rec = 0;
     return true;
 }
@@ -7029,7 +7047,7 @@ void WeaponPanel::create_controls() {
             HWND combo = CreateWindowExA(0, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
                 cx, y - 1, WEP_AMMO_W, 200, hwnd,
-                (HMENU)(LONG_PTR)(WEP_COMBO_AMMO + r * 10), g_app.hInst, 0);
+                (HMENU)(LONG_PTR)(WEP_COMBO_AMMO + r), g_app.hInst, 0);
             SendMessage(combo, WM_SETFONT, (WPARAM)hFont, 0);
             /* Add standard ammo types + special dart types */
             for (int i = 0; WEP_AMMO_TYPES[i]; i++)
@@ -7060,30 +7078,10 @@ void WeaponPanel::create_controls() {
     y += WEP_SECTION_GAP;
 
     /* ── Section: Aim Parameters (common block found in all weapon files) ── */
-    /* Located right after the first PSX pointer table:
+    /* Located right after the first PSX pointer table (aim_off, from load):
        8 s16 values: aim_neg_x, aim_base, aim_neg_y, aim_far, aim_near, aim_far2, aim_pos_x, aim_pos_base
        Then 6 s16: camera offsets (3 pairs of s16) */
-    int aim_off = -1;
-    /* Scan for the aim params block signature: value after last PSX pointer in first table */
-    {
-        int o = ptrtbl_start;
-        while (o + 4 <= (int)data_size) {
-            u32 v = rd_u32(data + o);
-            if ((v & 0xFF000000) != 0x80000000 && v != 0) {
-                aim_off = o;
-                break;
-            }
-            if (v == 0) { /* skip single nulls between ptr tables */
-                u32 next = (o + 4 < (int)data_size) ? rd_u32(data + o + 4) : 0;
-                if ((next & 0xFF000000) != 0x80000000 && next != 0) {
-                    aim_off = o + 4;
-                    break;
-                }
-            }
-            o += 4;
-        }
-    }
-
+    memset(aim_ui, 0, sizeof(aim_ui));
     if (aim_off >= 0 && aim_off + 26 <= (int)data_size) {
         wep_create_label(hwnd, "-- Aim / Camera Parameters --", x0, y, 280, 18, hFont);
         y += 20;
@@ -7096,12 +7094,12 @@ void WeaponPanel::create_controls() {
             s16 val = (s16)rd_u16(data + aim_off + i * 4);
             int id = WEP_AIM_EDIT + i;
             wep_create_label(hwnd, aim_labels[i], x0, y + 3, 120, 18, hFont);
-            wep_create_edit(hwnd, val, x0 + 124, y, 70, id, hFont);
-            if (i % 2 == 0 && i + 1 < 8) {
+            aim_ui[i] = wep_create_edit(hwnd, val, x0 + 124, y, 70, id, hFont);
+            if (i % 2 == 0 && i + 1 < 8 && aim_off + (i+1) * 4 + 4 <= (int)data_size) {
                 /* Put two per row */
                 s16 val2 = (s16)rd_u16(data + aim_off + (i+1) * 4);
                 wep_create_label(hwnd, aim_labels[i+1], x0 + 210, y + 3, 120, 18, hFont);
-                wep_create_edit(hwnd, val2, x0 + 334, y, 70, WEP_AIM_EDIT + i + 1, hFont);
+                aim_ui[i+1] = wep_create_edit(hwnd, val2, x0 + 334, y, 70, WEP_AIM_EDIT + i + 1, hFont);
                 i++; /* skip next in loop */
             }
             y += WEP_ROW_H;
@@ -7121,7 +7119,7 @@ void WeaponPanel::create_controls() {
                     int id = WEP_AIM_EDIT + 8 + i + j;
                     int xp = x0 + j * 160;
                     wep_create_label(hwnd, cam_labels[i + j], xp, y + 3, 90, 18, hFont);
-                    wep_create_edit(hwnd, val, xp + 94, y, 56, id, hFont);
+                    aim_ui[8 + i + j] = wep_create_edit(hwnd, val, xp + 94, y, 56, id, hFont);
                 }
                 y += WEP_ROW_H;
             }
@@ -7211,22 +7209,9 @@ void WeaponPanel::save_file() {
     }
 
     /* Write aim params back */
-    int aim_off = -1;
-    {
-        int o = ptrtbl_start;
-        while (o + 4 <= (int)data_size) {
-            u32 v = rd_u32(data + o);
-            if ((v & 0xFF000000) != 0x80000000 && v != 0) { aim_off = o; break; }
-            if (v == 0) {
-                u32 next = (o + 4 < (int)data_size) ? rd_u32(data + o + 4) : 0;
-                if ((next & 0xFF000000) != 0x80000000 && next != 0) { aim_off = o + 4; break; }
-            }
-            o += 4;
-        }
-    }
     if (aim_off >= 0) {
         for (int i = 0; i < 8 && aim_off + i * 4 + 4 <= (int)data_size; i++) {
-            HWND ed = GetDlgItem(hwnd, WEP_AIM_EDIT + i);
+            HWND ed = aim_ui[i];
             if (ed) {
                 char val[16] = {};
                 GetWindowTextA(ed, val, 15);
@@ -7235,7 +7220,7 @@ void WeaponPanel::save_file() {
         }
         int cam_off = aim_off + 32;
         for (int i = 0; i < 6 && cam_off + i * 2 + 2 <= (int)data_size; i++) {
-            HWND ed = GetDlgItem(hwnd, WEP_AIM_EDIT + 8 + i);
+            HWND ed = aim_ui[8 + i];
             if (ed) {
                 char val[16] = {};
                 GetWindowTextA(ed, val, 15);
