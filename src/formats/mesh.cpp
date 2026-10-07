@@ -2756,62 +2756,6 @@ const char* get_bone_name(int bone_count, int bone_idx)
  *    - Floor zones (ptr[6])         → trigger/transition quads
  *═══════════════════════════════════════════════════════════════════*/
 
-/* Opcode 0x28 size lookup by type field (byte[2]) */
-static int scd_op28_size(u8 type) {
-    static const int tbl[] = {48,40,32,36,44,32,32,52,32,32,32,32};
-    return (type < 12) ? tbl[type] : 32;
-}
-
-/* Compute opcode advance and whether it terminates the walk.
-   Returns advance amount in bytes, or 0 if we should stop. */
-static int scd_opcode_advance(const u8* dec, size_t dec_size, size_t pc) {
-    if (pc >= dec_size) return 0;
-    u8 op = dec[pc];
-
-    /* NOP/yield group: advance 1 byte */
-    if (op == 0x00 || (op >= 0x19 && op <= 0x1F) || op >= 0x70)
-        return 1;
-
-    /* Terminators — only true script-end opcodes */
-    if (op == 0x01 || op == 0x0A)
-        return 0;
-
-    /* Control-flow markers (1 byte, not terminals) */
-    if (op == 0x04 || op == 0x10 || op == 0x11)
-        return 1;
-
-    /* Conditional branches: take skip path (advance 4) */
-    if (op == 0x05 || op == 0x0F) return 4;
-
-    /* Relative jump: follow it */
-    if (op == 0x0C) {
-        if (pc + 4 > dec_size) return 0;
-        s16 jump = rd_s16(dec + pc + 2);
-        /* Return negative of current pos to signal absolute target */
-        /* Actually, return the jump offset encoded as special value */
-        return -1;  /* caller handles */
-    }
-
-    /* Variable: 0x28 */
-    if (op == 0x28) {
-        if (pc + 3 > dec_size) return 0;
-        return scd_op28_size(dec[pc + 2]);
-    }
-
-    /* Fixed-size table */
-    static const u8 sizes[0x70] = {
-     /* 0x00 */ 1, 4, 4, 4, 0, 4, 4, 4, 4, 8, 0, 4, 0, 4, 4, 4,
-     /* 0x10 */ 0, 0, 4, 4, 4, 8, 4, 4, 4,  1, 1, 1, 1, 1, 1, 1,
-     /* 0x20 */24, 8, 4,32, 8, 4, 4, 4, 0, 8, 8, 8, 4, 4,20, 4,
-     /* 0x30 */ 4, 4, 4, 4, 4, 8, 8, 8, 4, 4,12, 4, 8,12, 4, 8,
-     /* 0x40 */12, 4,20, 8, 8, 8, 8, 4, 4, 4, 4,12,32, 8, 8, 8,
-     /* 0x50 */ 8, 8, 4,12, 4,12,28, 8, 8,20, 8,44, 4, 4,20,12,
-     /* 0x60 */ 4, 4, 8, 8, 4, 4, 4, 8, 8, 4, 8, 4, 4, 4, 4, 4,
-    };
-    if (op < 0x70) return sizes[op];
-    return 1;  /* 0x70+ handled above */
-}
-
 /* Section placements: every 0x23 opcode (model slot = section at a
    position) and every item pickup zone (0x28 type 4) that shows a model.
    The linear script walk loses sync on some scripts and misses
@@ -2863,9 +2807,8 @@ static void scan_section_placements(const u8* dec, size_t dec_size, u32 base,
                     else if (a > -30000 && a < 30000 && b > -30000 && b < 30000 &&
                              c > -30000 && c < 30000) { t.px = a; t.py = b; t.pz = c; }
                 }
-                int adv = scd_opcode_advance(dec, dec_size, q);
-                if (adv < 0) adv = 4;                /* 0x0C jump */
-                if (adv == 0) break;                 /* end of script */
+                int adv = scd_inst_size(dec, dec_size, q);
+                if (adv == 0) break;
                 q += (size_t)adv;
             }
             continue;
@@ -2966,8 +2909,8 @@ static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
    slot, byte[2] = type (+0x27), byte[3] (+0x2F), position at +4/+6/+8,
    rotation at +10, model and animation pointers at +12/+16; the game
    writes its spawn progress back into the opcode at +0x22.  Found by
-   scanning the script area, as the walk misses spawns in branches the
-   walk skips (ST309, ST504 and five more).  Both pointers lie in the room
+   scanning the script area rather than by the walk, which used to skip
+   the branches that hold them (ST309, ST504 and five more).  Both pointers lie in the room
    data and differ; mesh data that happens to match has them equal or a
    slot past the table. */
 static int scan_enemy_spawns(const u8* dec, size_t scd_base, size_t scd_end, u32 base,
@@ -3053,8 +2996,8 @@ static void scan_camera_views(const u8* dec, size_t scd_base, size_t scd_end,
 }
 
 /* Adds a camera shot unless the same eye and target are already stored.
-   The walk follows loops back over the same 0x4C/0x2E opcodes, and
-   scripts repeat shots, so without this one shot can fill the table. */
+   Scripts repeat shots, in several threads and on both sides of a
+   branch, so without this one shot can fill the table. */
 static bool add_camera(RdtSceneOverlay& ov, const RdtCameraEntry& cam)
 {
     if (ov.n_cameras >= 32) return false;
@@ -3266,52 +3209,44 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
      *   ...
      *   u32[N-1] = offset to script[N-1]
      * First u32 / 4 gives the script count (table size = first_offset bytes).
-     * Each script is walked linearly, skipping conditional branches.
+     * Each thread is decoded straight through to its end (scd_thread_end),
+     * so both sides of every branch are visited once.
      */
     scan_section_placements(dec, dec_size, base, offs[5], meta_min, ov);
     if (ov.n_xforms > 0) found++;
 
     {
+        size_t scd_base = offs[5];
         size_t scd_end = dec_size;
         for (int i = 0; i < 7; i++)
-            if (offs[i] > offs[5] && offs[i] < scd_end) scd_end = offs[i];
-        if (scan_trigger_zones(dec, offs[5], scd_end, ov)) found++;
-        if (scan_enemy_spawns(dec, offs[5], scd_end, base, dec_size, ov)) found++;
-        scan_camera_views(dec, offs[5], scd_end, ov);
-    }
+            if (offs[i] > scd_base && offs[i] < scd_end) scd_end = offs[i];
+        if (scan_trigger_zones(dec, scd_base, scd_end, ov)) found++;
+        if (scan_enemy_spawns(dec, scd_base, scd_end, base, dec_size, ov)) found++;
+        scan_camera_views(dec, scd_base, scd_end, ov);
 
-    {
-        size_t scd_base = offs[5];
-        if (scd_base + 4 > dec_size) goto done;
+        const u8* scd = dec + scd_base;
+        size_t scd_size = scd_end - scd_base;
+        if (scd_size < 4) goto done;
 
-        u32 first_off = rd_u32(dec + scd_base);
-        if (first_off < 4 || first_off > 0x1000 || (first_off & 3) != 0)
+        u32 first_off = rd_u32(scd);
+        if (first_off < 4 || first_off > 0x1000 || first_off > scd_size || (first_off & 3) != 0)
             goto done;
 
-        int n_scripts = (int)(first_off / 4);
-        if (n_scripts > 64) n_scripts = 64;
+        /* Thread table, read as the script view reads it (scd_disassemble) */
+        u32 toffs[64];
+        int n_threads = 0;
+        for (int i = 0; i < 64 && (u32)i * 4 < first_off; i++) {
+            u32 t = rd_u32(scd + i * 4);
+            if (t < first_off || t >= scd_size) break;
+            toffs[n_threads++] = t;
+        }
 
-        for (int si = 0; si < n_scripts; si++) {
-            u32 script_rel = rd_u32(dec + scd_base + si * 4);
-            size_t pc = scd_base + script_rel;
-            if (pc >= dec_size) continue;
-
-            int steps = 0;
-            while (pc < dec_size && steps < 2000) {
+        for (int ti = 0; ti < n_threads; ti++) {
+            size_t end = scd_base + scd_thread_end(scd, scd_size, toffs, n_threads, toffs[ti]);
+            size_t pc = scd_base + toffs[ti];
+            while (pc < end) {
                 u8 op = dec[pc];
-
-                /* Relative jump: compute target and follow */
-                if (op == 0x0C) {
-                    if (pc + 4 > dec_size) break;
-                    s16 jump = rd_s16(dec + pc + 2);
-                    size_t target = (size_t)((int)pc + (int)jump);
-                    if (target >= dec_size || target < scd_base) break;
-                    pc = target;
-                    steps++;
-                    continue;
-                }
-
-                int adv = scd_opcode_advance(dec, dec_size, pc);
+                int adv = scd_inst_size(dec, end, pc);
                 if (adv <= 0) break;
 
                 /* ─── Extract spatial data from known opcodes ───
@@ -3334,7 +3269,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     es.py    = rd_s16(dec + pc + 6);
                     es.pz    = rd_s16(dec + pc + 8);
                     es.rot_y = rd_s16(dec + pc + 12);
-                    /* the walk can pass the same code more than once */
+                    /* the same object on both sides of a branch is kept once */
                     bool dup = false;
                     for (int k = 0; k < ov.n_enemies && !dup; k++) {
                         const RdtEnemySpawn& o = ov.enemies[k];
@@ -3457,7 +3392,6 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                 /* 0x5B enemy spawns are found by scan_enemy_spawns */
 
                 pc += (size_t)adv;
-                steps++;
             }
         }
     }

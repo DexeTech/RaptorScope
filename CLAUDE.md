@@ -109,10 +109,6 @@ Ordered with memory safety and data loss first.
 - **B5** **`new[]`/`free` mismatch.** `parse_standalone_emd_mesh_dec` fills `mesh.verts/tris` with `new[]`, but `Mesh` frees with `free`, and existing arrays are overwritten without being freed. Use `mesh.alloc`.
 - **B6** **Dangling pointer after a failed `realloc`.** `mesh_apply_xforms` returns without storing the moved pointer when one of its two `realloc`s fails after the other succeeded. `mesh.verts` or `mesh.tris` is then left dangling.
 - **B8** **WAV buffer leak.** `AudioPanel::load_wav` stores its PCM in `pcm_data`, but `free_samples()` and the destructor free only `samples[i].pcm`.
-- **B9** **Script walk stops at 0x01/0x0A.**
-  - `scd_opcode_advance` (`mesh.cpp`) treats 0x01/0x0A as script ends and 0x04 as one byte. That contradicts README and `scd_inst_size`.
-  - As a result, `parse_rdt_overlay`'s walk misses 0x42/0x20/0x4C/0x2E/0x3A/0x3C/0x3D after them, and the 0x22 adjustment loop in `scan_section_placements` stops early.
-  - Fix: switch to `scd_inst_size`.
 - **B10** **OBJ/SMD export use the old room builder.**
   - `IDM_EXPORT_OBJ`/`IDM_EXPORT_SMD` call `parse_rdt_scene`, which has its own outdated walker, leaves unplaced sections at raw positions, applies no 0x2A/0x36/0x37 adjustments and puts item models at y=0. They don't use the mesh the viewer shows, which GLB export does.
   - They also LZSS-decompress unconditionally, so ST50B and ST60E can't be exported.
@@ -182,10 +178,10 @@ Ordered with memory safety and data loss first.
   - 0x3A: the subtype is ignored and xyz is read at +2 instead of +4.
   - 0x37 is shown as a sound.
   - 0x28 type 4 is shown as a door, with a "destination" read from corner bytes.
-- **C4** **Three opcode-size tables disagree.**
-  - The tables are `scd_inst_size`/`g_scd_opcodes` (`scd.h`), and `scd_opcode_advance` and `opsz` in `parse_rdt_scene_dec` (`mesh.cpp`).
-  - They give 0x04 sizes of 4/1/1, 0x0A 4/end/end, and 0x10–0x11 1/0.
-  - The 0x28 size table exists three times.
+- **C4** **Two opcode-size tables disagree.**
+  - The tables are `scd_inst_size`/`g_scd_opcodes` (`scd.h`) and `opsz` in `parse_rdt_scene_dec` (`mesh.cpp`).
+  - `opsz` gives 0x04 one byte and treats 0x0A as a script end, where `scd_inst_size` gives both 4 bytes.
+  - The 0x28 size table exists twice (`g_scd_op28_sizes` and `op28sz`).
 - **C5** **Stale comments.**
   - `mesh.h`'s RDT block calls ptr[0] the "SCD main script table"; it holds lights and ambient.
   - `parse_rdt_overlay` has two stacked banners, one listing ptr[2] as camera data and ptr[4] as door zones.

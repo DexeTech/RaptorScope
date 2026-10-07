@@ -179,6 +179,40 @@ static inline int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
     return 1;
 }
 
+/* End of the thread that starts at start; offsets are from the SCD start.
+   0x01 and 0x0A are ordinary 4-byte opcodes, not thread ends: every
+   thread in the game decodes straight through to the start of the next
+   one, and every thread finishes with 0x04 00 00 00.  So a thread runs to
+   the next thread's start.  The last thread has message text after it in
+   the same block; it ends at the first 0x04 that no earlier jump
+   (0x0C/0x0D/0x0E) lands beyond.  On the other threads, whose ends are
+   known, that rule is exact for 2713 of 2735. */
+static inline size_t scd_thread_end(const u8* scd, size_t scd_size,
+                                    const u32* thread_offsets, int n_threads,
+                                    size_t start)
+{
+    size_t next = scd_size;
+    for (int i = 0; i < n_threads; i++)
+        if (thread_offsets[i] > start && thread_offsets[i] < next)
+            next = thread_offsets[i];
+    if (next < scd_size) return next;
+
+    size_t pc = start, reach = start;
+    while (pc < scd_size) {
+        int sz = scd_inst_size(scd, scd_size, pc);
+        if (sz == 0) break;
+        u8 op = scd[pc];
+        if ((op == 0x0C || op == 0x0D || op == 0x0E) && pc + 4 <= scd_size) {
+            long tgt = (long)pc + (long)(s16)(scd[pc + 2] | (scd[pc + 3] << 8));
+            if (tgt > (long)reach) reach = (size_t)tgt;
+        }
+        if (op == 0x04 && reach <= pc)
+            return (pc + sz < scd_size) ? pc + sz : scd_size;
+        pc += sz;
+    }
+    return scd_size;
+}
+
 /* Category names (for color coding) */
 static const char* g_scd_cat_names[] = {
     "flow", "thread", "var", "scene", "entity",
