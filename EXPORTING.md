@@ -24,6 +24,12 @@ Open a room (an RDT scene entry) in the 3D viewer and choose the same **Export G
 
 Coordinates are the viewer's (Y up), converted from game units to metres, the same axes and scale as character exports.
 
+## OBJ and SMD export
+
+**Export OBJ** and **Export SMD** write the entry selected in the archive tree. For a character, that is its model in the bind pose. For a room, it is the room as the viewer builds it, with the same sections as a room GLB and no unplaced ones. The two rooms stored uncompressed (ST50B, ST60E) export as well. Neither format carries textures; OBJ writes each face's colour as a `# vc r g b` comment after it.
+
+OBJ positions use the viewer's axes and are in metres, so an OBJ lines up with a GLB of the same room. SMD positions are still in game units.
+
 ## Limitations
 
 - **Experimental and not yet validated on real DC1 assets or launched under Windows.** The Windows programs were cross-compiled successfully; synthetic GLB tests ran on Linux. No copyrighted game assets are included.

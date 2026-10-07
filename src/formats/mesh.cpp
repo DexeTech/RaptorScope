@@ -2519,12 +2519,17 @@ bool export_mesh_obj(const char* path, const Mesh& mesh)
     FILE* f = fopen(path, "w");
     if (!f) return false;
 
+    /* Game units are about a millimetre; write metres, as GLB export does,
+       so a room imports at its real size instead of kilometres across. */
+    const f32 unit = 0.001f;
+
     fprintf(f, "# RaptorScope - Dino Crisis Mesh Export\n");
-    fprintf(f, "# Vertices: %d  Faces: %d\n\n", mesh.vert_count, mesh.tri_count);
+    fprintf(f, "# Vertices: %d  Faces: %d  Units: metres\n\n", mesh.vert_count, mesh.tri_count);
 
     /* Vertices with positions (transforms already baked into mesh.verts) */
     for (int i = 0; i < mesh.vert_count; i++)
-        fprintf(f, "v %f %f %f\n", mesh.verts[i].x, mesh.verts[i].y, mesh.verts[i].z);
+        fprintf(f, "v %f %f %f\n", mesh.verts[i].x * unit, mesh.verts[i].y * unit,
+                mesh.verts[i].z * unit);
 
     fprintf(f, "\n");
 
