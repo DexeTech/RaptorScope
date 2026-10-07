@@ -111,7 +111,6 @@ Ordered with memory safety and data loss first.
 - **B8** **WAV buffer leak.** `AudioPanel::load_wav` stores its PCM in `pcm_data`, but `free_samples()` and the destructor free only `samples[i].pcm`.
 - **B12** **SMD skeleton doesn't line up with the mesh.** `export_emd_smd` writes bone offsets in game axes but vertices in viewer axes (x, y, z negated). Any non-zero bone with parent 0xFF is written with parent 255.
 - **B13** **3D view can show stale textures.** `upload_archive_texture` caches the atlas by the `DatArchive*` address plus the CLUT list. `close_archive` doesn't reset that cache and Import/Replace doesn't invalidate it. A reopened archive allocated at the same address, or a replaced texture, can therefore show the old atlas. (likely)
-- **B14** **Status bar drops 4 characters of the path.** `App::open_archive` calls `set_status(buf + 18)` five times, but the "RaptorScope - " prefix is 14 characters. The 18 dates from the old title.
 - **B15** **Import/Replace and saving leave stale state.**
   - The tree isn't rebuilt, so labels and the `g_emd_info` EMD offsets reflect the old data, and the refresh drops the sub-selector.
   - Save As on an item bank writes the original `raw` bytes, silently dropping any replacements.

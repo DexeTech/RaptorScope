@@ -42,6 +42,10 @@
 
 App g_app;
 
+/* Window titles start with this; the status bar shows the title without it */
+#define TITLE_PREFIX     "RaptorScope - "
+#define TITLE_PREFIX_LEN (sizeof(TITLE_PREFIX) - 1)
+
 /* Panel instances (shared with panels.cpp) */
 HexPanel      g_hex;
 ImagePanel    g_image;
@@ -621,9 +625,9 @@ bool App::open_archive(const char* path) {
                         handled = true;
 
                         char buf2[512];
-                        _snprintf(buf2, 511, "RaptorScope - %s (Dev Manifest, %d assets)", path, n_entries);
+                        _snprintf(buf2, 511, TITLE_PREFIX "%s (Dev Manifest, %d assets)", path, n_entries);
                         SetWindowTextA(hMain, buf2);
-                        set_status(buf2 + 18);
+                        set_status(buf2 + TITLE_PREFIX_LEN);
                     }
 
                     /* ── MIPS Weapon Overlay: detect by ADDIU SP prologue ── */
@@ -759,9 +763,9 @@ bool App::open_archive(const char* path) {
                             else if (strcmp(wlc,"wep20")==0||strcmp(wlc,"wep21")==0) wid = "An. Dart Gun";
                             else if (strcmp(wlc,"wep22")==0||strcmp(wlc,"wep23")==0) wid = "Shotgun/Grenade/Heat";
                             else if (strcmp(wlc,"wep30")==0||strcmp(wlc,"wep31")==0) wid = "Heavy Weapons";
-                            _snprintf(buf2, 511, "RaptorScope - %s - %s Editor", wfn, wid);
+                            _snprintf(buf2, 511, TITLE_PREFIX "%s - %s Editor", path, wid);
                             SetWindowTextA(hMain, buf2);
-                            set_status(buf2 + 18);
+                            set_status(buf2 + TITLE_PREFIX_LEN);
                         }
                     }
 
@@ -906,9 +910,9 @@ bool App::open_archive(const char* path) {
                                 handled = true;
 
                                 char buf2[512];
-                                _snprintf(buf2, 511, "RaptorScope - %s (Text Script, %d blocks)", path, block_num);
+                                _snprintf(buf2, 511, TITLE_PREFIX "%s (Text Script, %d blocks)", path, block_num);
                                 SetWindowTextA(hMain, buf2);
-                                set_status(buf2 + 18);
+                                set_status(buf2 + TITLE_PREFIX_LEN);
                             }
                         }
                     }
@@ -919,9 +923,9 @@ bool App::open_archive(const char* path) {
                         _snprintf(node, 255, "%s  (%d bytes)", fname, (int)sz);
                         tree_add(hTree, TVI_ROOT, node, -1);
                         char buf2[512];
-                        _snprintf(buf2, 511, "RaptorScope - %s (raw hex)", path);
+                        _snprintf(buf2, 511, TITLE_PREFIX "%s (raw hex)", path);
                         SetWindowTextA(hMain, buf2);
-                        set_status(buf2 + 18);
+                        set_status(buf2 + TITLE_PREFIX_LEN);
                     }
 
                     return true;
@@ -936,12 +940,12 @@ bool App::open_archive(const char* path) {
     char buf[512];
     if (archive->is_item_bank) {
         int num_items = archive->count;
-        _snprintf(buf, 511, "RaptorScope - %s - Item Sprite Bank (%d sprites)", path, num_items);
+        _snprintf(buf, 511, TITLE_PREFIX "%s - Item Sprite Bank (%d sprites)", path, num_items);
     } else {
-        _snprintf(buf, 511, "RaptorScope - %s - %d entries", path, archive->count);
+        _snprintf(buf, 511, TITLE_PREFIX "%s - %d entries", path, archive->count);
     }
     SetWindowTextA(hMain, buf);
-    set_status(buf + 18);
+    set_status(buf + TITLE_PREFIX_LEN);
     return true;
 }
 
@@ -2822,7 +2826,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         g_video.video.fps, g_video.video.frame_count, path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                 } else {
                                     g_app.set_status("ERROR: Failed to decode MPEG-1 video");
@@ -2873,7 +2877,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         img.width, img.height, path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                     InvalidateRect(g_image.hwnd, 0, FALSE);
                                 } else {
@@ -2931,7 +2935,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         img.has_clut ? " (CLUT)" : "", path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                     InvalidateRect(g_image.hwnd, 0, FALSE);
                                 } else {
@@ -2963,7 +2967,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         DC_DIFF_NAMES[g_save.save.difficulty & 3]);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - Save Editor - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "Save Editor - %s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                     /* Populate tree with save info */
                                     if (g_app.hTree) {
@@ -3470,7 +3474,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         g_video.video.width, g_video.video.height, path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                 }
                                 free(buf);
@@ -3517,7 +3521,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         img.width, img.height, path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                     InvalidateRect(g_image.hwnd, 0, FALSE);
                                 } else {
@@ -3575,7 +3579,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         img.has_clut ? " (CLUT)" : "", path);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "%s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                     InvalidateRect(g_image.hwnd, 0, FALSE);
                                 } else {
@@ -3605,7 +3609,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         DC_DIFF_NAMES[g_save.save.difficulty & 3]);
                                     g_app.set_status(msg);
                                     char title[512];
-                                    _snprintf(title, 511, "RaptorScope - Save Editor - %s", path);
+                                    _snprintf(title, 511, TITLE_PREFIX "Save Editor - %s", path);
                                     SetWindowTextA(g_app.hMain, title);
                                 } else {
                                     g_app.set_status("ERROR: Failed to parse save file");
