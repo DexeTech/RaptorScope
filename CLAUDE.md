@@ -104,9 +104,6 @@ Entries are confirmed by reading the code unless tagged **(verify)**. A (verify)
 
 Ordered with memory safety and data loss first.
 
-- **B2** **UV editor isn't truly modal.** `ShowUVEditor` (`uv_editor.h`) runs its own message loop without disabling the main window, unlike `ShowAboutDialog`.
-  - Selecting another entry meanwhile frees `ViewerPanel3D::sel_mask`, which the editor still writes through.
-  - File > Exit's `WM_QUIT` is swallowed by the nested loop.
 - **B3** **Weapon editor control IDs collide.**
   - Record edits use `9100 + 16*record + field` (fields 6–13) and the aim/camera edits use 9200–9213, so they overlap from record 6 on.
   - `WeaponPanel::save_file` finds aim edits with `GetDlgItem`, which returns the record edit instead. Saving a file with 7 or more records (wep11/wep13 name 13) writes record values into the aim block.

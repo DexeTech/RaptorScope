@@ -1632,12 +1632,29 @@ static void ShowUVEditor(HWND hParent,
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
 
-    /* Modal message loop */
+    /* Modal message loop.  hParent is the 3D panel, a child window, so
+       disable the main window: picking another entry meanwhile would free
+       the selection mask this editor writes to. */
+    HWND owner = GetAncestor(hParent, GA_ROOT);
+    EnableWindow(owner, FALSE);
+
     MSG m;
-    while (IsWindow(hwnd) && GetMessageA(&m, NULL, 0, 0)) {
+    while (IsWindow(hwnd)) {
+        BOOL r = GetMessageA(&m, NULL, 0, 0);
+        if (r == 0) {
+            /* WM_QUIT: close, and pass it on to the main loop */
+            DestroyWindow(hwnd);
+            PostQuitMessage((int)m.wParam);
+            break;
+        }
+        if (r == -1) { DestroyWindow(hwnd); break; }
         TranslateMessage(&m);
         DispatchMessageA(&m);
     }
+
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    SetFocus(hParent);
 }
 
 #endif /* DC_UV_EDITOR_H */
