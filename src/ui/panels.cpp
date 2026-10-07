@@ -377,9 +377,27 @@ void ImagePanel::set_bitmap(const u8* rgba, int w, int h) {
     }
 }
 
+/* Copy one entry and its bytes; rerender() passes the copies back in, so
+   an entry that already is the copy is left alone. */
+static void keep_entry(const DatEntry& e, DatEntry& copy, Buffer& bytes) {
+    if (&e == &copy) return;
+    copy = e;
+    bytes.clear();
+    if (e.data && e.size) bytes.append(e.data, e.size);
+    copy.data = bytes.data;
+    copy.owned = false;
+}
+
+void ImagePanel::keep_source(const DatEntry& tex, const DatEntry* pal) {
+    keep_entry(tex, src_tex, src_tex_data);
+    if (pal) keep_entry(*pal, src_pal, src_pal_data);
+    cur_tex = &src_tex;
+    cur_pal = pal ? &src_pal : 0;
+}
+
 void ImagePanel::render_entry(const DatEntry& tex, const DatEntry* pal, bool do_deswizzle) {
-    /* Cache for re-rendering on palette row change */
-    cur_tex = &tex; cur_pal = pal; cur_is_linear = false;
+    keep_source(tex, pal);
+    cur_is_linear = false;
     if (pal && pal->size > 0) {
         int row_bytes = (bpp == 4) ? 32 : 512;
         max_pal_rows = (int)(pal->size / row_bytes);
@@ -425,8 +443,8 @@ void ImagePanel::render_entry(const DatEntry& tex, const DatEntry* pal, bool do_
 }
 
 void ImagePanel::render_linear(const DatEntry& tex, const DatEntry* pal) {
-    /* Cache for re-rendering on palette row change */
-    cur_tex = &tex; cur_pal = pal; cur_is_linear = true;
+    keep_source(tex, pal);
+    cur_is_linear = true;
     if (pal && pal->size > 0) {
         int row_bytes = (bpp == 4) ? 32 : 512;
         max_pal_rows = (int)(pal->size / row_bytes);

@@ -46,10 +46,15 @@ struct ImagePanel {
     int     bpp, pal_row, sub_pal;
     int     max_pal_rows;          /* available palette rows for current texture */
 
-    /* Cached references for re-rendering on palette row change */
+    /* What was last rendered, for re-rendering on palette row change.
+       cur_tex/cur_pal point at the copies in src_*: callers may pass an
+       entry on their stack, or one whose data they free afterwards
+       (LZSS0 textures, item bank CLUTs). */
     const DatEntry* cur_tex;
     const DatEntry* cur_pal;
     bool    cur_is_linear;         /* true = render_linear, false = render_entry */
+    DatEntry src_tex, src_pal;
+    Buffer   src_tex_data, src_pal_data;
 
     /* zoom / pan state */
     double  zoom;          /* current zoom factor (1.0 = 1 texel = 1 pixel) */
@@ -80,6 +85,7 @@ struct ImagePanel {
     ~ImagePanel() { if (hBmp) DeleteObject(hBmp); free(face_uses); }
 
     void clear_face_usage();               /* call when the archive changes */
+    void keep_source(const DatEntry& tex, const DatEntry* pal);  /* copy into src_* */
     void render_entry(const DatEntry& tex, const DatEntry* pal, bool do_deswizzle = true);
     void render_linear(const DatEntry& tex, const DatEntry* pal);
     void rerender();                           /* re-render with current pal_row */

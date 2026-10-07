@@ -104,7 +104,6 @@ Entries are confirmed by reading the code unless tagged **(verify)**. A (verify)
 
 Ordered with memory safety and data loss first.
 
-- **B1** **Image panel reads freed memory.** `ImagePanel::render_entry`/`render_linear` keep `cur_tex`/`cur_pal` pointers. `on_entry_select` passes a stack `DatEntry fake` for LZSS0 textures (its data is in a local `Buffer`) and a stack `tmp_pal` for item banks. Pressing Up/Down in the image panel, or clicking a palette-panel row, re-renders from that freed memory. Keep copies or an entry index instead.
 - **B2** **UV editor isn't truly modal.** `ShowUVEditor` (`uv_editor.h`) runs its own message loop without disabling the main window, unlike `ShowAboutDialog`.
   - Selecting another entry meanwhile frees `ViewerPanel3D::sel_mask`, which the editor still writes through.
   - File > Exit's `WM_QUIT` is swallowed by the nested loop.
