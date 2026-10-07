@@ -1235,6 +1235,7 @@ static HFONT audio_font(int size, bool bold = false, int zoom = 100);
 void AudioPanel::paint_wav(HDC buf, int cw, int ch) {
     HFONT f12 = audio_font(12);
     HFONT f14 = audio_font(14);
+    HGDIOBJ old_font = GetCurrentObject(buf, OBJ_FONT);
 
     /* Header bar */
     int hh = 28;
@@ -1249,7 +1250,6 @@ void AudioPanel::paint_wav(HDC buf, int cw, int ch) {
     _snprintf(title, 511, "  WAV: %s  |  %d Hz, %d-ch, %d samples (%.1fs)  |  Space = Play/Stop",
               wav_name, sample_rate, channels, wav_total_samples, dur);
     TextOutA(buf, 4, 5, title, (int)strlen(title));
-    DeleteObject(f14);
 
     /* Playback progress bar */
     int bar_y = hh + 4;
@@ -1323,14 +1323,18 @@ void AudioPanel::paint_wav(HDC buf, int cw, int ch) {
             SelectObject(buf, cur_pen);
             MoveToEx(buf, cx, wave_top, NULL);
             LineTo(buf, cx, wave_top + wave_h);
+            SelectObject(buf, wave_pen);
             DeleteObject(cur_pen);
         }
 
+        SelectObject(buf, dim_pen);
         DeleteObject(wave_pen);
     }
 
     SelectObject(buf, old_pen);
     DeleteObject(dim_pen);
+    SelectObject(buf, old_font);  /* a font still selected can't be deleted */
+    DeleteObject(f14);
     DeleteObject(f12);
 }
 
@@ -1387,6 +1391,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
     HFONT fTitle = audio_font(13, true, z);
     HFONT fLabel = audio_font(11, false, z);
     HFONT fSmall = audio_font(9, false, z);
+    HGDIOBJ old_font = GetCurrentObject(buf, OBJ_FONT);
     int hdr_h = zs(26, z);
 
     if (num_samples <= 0) {
@@ -1416,8 +1421,9 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
 
         /* Separator */
         HPEN sep = CreatePen(PS_SOLID, 1, audio_border());
-        SelectObject(buf, sep);
+        HGDIOBJ old_sep = SelectObject(buf, sep);
         MoveToEx(buf, 0, hdr_h, 0); LineTo(buf, cw, hdr_h);
+        SelectObject(buf, old_sep);
         DeleteObject(sep);
 
         /* Sample rows */
@@ -1477,8 +1483,9 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
 
                 /* Center line */
                 HPEN cline = CreatePen(PS_DOT, 1, T.isDark ? RGB(35,40,50) : RGB(200,200,210));
-                SelectObject(buf, cline);
+                HGDIOBJ old_cline = SelectObject(buf, cline);
                 MoveToEx(buf, wx, wy + wh/2, 0); LineTo(buf, wx + ww, wy + wh/2);
+                SelectObject(buf, old_cline);
                 DeleteObject(cline);
 
                 draw_wave_minmax(buf, s.pcm, s.count, wx, wy, ww, wh,
@@ -1487,8 +1494,9 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
 
             /* Row separator */
             HPEN rsep = CreatePen(PS_SOLID, 1, T.isDark ? RGB(30,35,45) : RGB(220,220,225));
-            SelectObject(buf, rsep);
+            HGDIOBJ old_rsep = SelectObject(buf, rsep);
             MoveToEx(buf, 0, y_off + rh - 1, 0); LineTo(buf, cw, y_off + rh - 1);
+            SelectObject(buf, old_rsep);
             DeleteObject(rsep);
 
             y_off += rh;
@@ -1496,6 +1504,7 @@ void AudioPanel::paint_sndb(HDC buf, int cw, int ch)
     }
 
 sndb_cleanup:
+    SelectObject(buf, old_font);  /* a font still selected can't be deleted */
     DeleteObject(fTitle); DeleteObject(fLabel); DeleteObject(fSmall);
 }
 
@@ -1506,6 +1515,7 @@ void AudioPanel::paint_sndh(HDC buf, int cw, int ch)
     HFONT fTitle = audio_font(13, true, z);
     HFONT fLabel = audio_font(11, false, z);
     HFONT fSmall = audio_font(9, false, z);
+    HGDIOBJ old_font = GetCurrentObject(buf, OBJ_FONT);
     int hdr_h = zs(26, z);
 
     if (!gian.valid) {
@@ -1528,8 +1538,9 @@ void AudioPanel::paint_sndh(HDC buf, int cw, int ch)
         TextOutA(buf, zs(6,z), zs(5,z), title, (int)strlen(title));
 
         HPEN sep = CreatePen(PS_SOLID, 1, audio_border());
-        SelectObject(buf, sep);
+        HGDIOBJ old_sep = SelectObject(buf, sep);
         MoveToEx(buf, 0, hdr_h, 0); LineTo(buf, cw, hdr_h);
+        SelectObject(buf, old_sep);
         DeleteObject(sep);
 
         int y = hdr_h + zs(4, z);
@@ -1563,8 +1574,9 @@ void AudioPanel::paint_sndh(HDC buf, int cw, int ch)
         y += tone_h;
 
         HPEN hsep = CreatePen(PS_SOLID, 1, audio_border());
-        SelectObject(buf, hsep);
+        HGDIOBJ old_hsep = SelectObject(buf, hsep);
         MoveToEx(buf, zs(10,z), y, 0); LineTo(buf, cw - zs(10,z), y);
+        SelectObject(buf, old_hsep);
         DeleteObject(hsep);
         y += 3;
 
@@ -1616,6 +1628,7 @@ void AudioPanel::paint_sndh(HDC buf, int cw, int ch)
     }
 
 sndh_cleanup:
+    SelectObject(buf, old_font);
     DeleteObject(fTitle); DeleteObject(fLabel); DeleteObject(fSmall);
 }
 
@@ -1626,6 +1639,7 @@ void AudioPanel::paint_snde(HDC buf, int cw, int ch)
     HFONT fTitle = audio_font(13, true, z);
     HFONT fSmall = audio_font(9, false, z);
     HFONT fTiny  = audio_font(8, false, z);
+    HGDIOBJ old_font = GetCurrentObject(buf, OBJ_FONT);
     int hdr_h = zs(26, z);
 
     if (!seq_hdr.valid || seq_note_count <= 0) {
@@ -1671,8 +1685,9 @@ void AudioPanel::paint_snde(HDC buf, int cw, int ch)
         }
 
         HPEN sep_pen = CreatePen(PS_SOLID, 1, audio_border());
-        SelectObject(buf, sep_pen);
+        HGDIOBJ old_sep = SelectObject(buf, sep_pen);
         MoveToEx(buf, 0, hdr_h, 0); LineTo(buf, cw, hdr_h);
+        SelectObject(buf, old_sep);
         DeleteObject(sep_pen);
 
         /* Piano roll area */
@@ -1703,7 +1718,7 @@ void AudioPanel::paint_snde(HDC buf, int cw, int ch)
 
         /* Horizontal grid at octave boundaries */
         HPEN grid_pen = CreatePen(PS_DOT, 1, T.isDark ? RGB(25,28,40) : RGB(210,210,218));
-        SelectObject(buf, grid_pen);
+        HGDIOBJ old_grid = SelectObject(buf, grid_pen);
         static const char* note_names[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
         SelectObject(buf, fTiny);
         int label_step = note_range > 48 ? 12 : (note_range > 24 ? 6 : 1);
@@ -1717,6 +1732,7 @@ void AudioPanel::paint_snde(HDC buf, int cw, int ch)
             SetTextColor(buf, audio_dim());
             TextOutA(buf, 2, ny - 5, nl, (int)strlen(nl));
         }
+        SelectObject(buf, old_grid);
         DeleteObject(grid_pen);
 
         /* Channel colors */
@@ -1775,6 +1791,7 @@ void AudioPanel::paint_snde(HDC buf, int cw, int ch)
     }
 
 snde_cleanup:
+    SelectObject(buf, old_font);
     DeleteObject(fTitle); DeleteObject(fSmall); DeleteObject(fTiny);
 }
 
@@ -1799,8 +1816,9 @@ void AudioPanel::paint(HDC hdc, RECT& rc)
     case AMODE_WAV:  paint_wav(buf, cw, ch_h);  break;
     default: {
         HFONT f = audio_font(12);
-        SelectObject(buf, f); SetTextColor(buf, audio_dim());
+        HGDIOBJ old_font = SelectObject(buf, f); SetTextColor(buf, audio_dim());
         DrawTextA(buf, "Select an audio entry", -1, &rc, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        SelectObject(buf, old_font);
         DeleteObject(f);
     } break;
     }
@@ -6380,9 +6398,10 @@ static LRESULT CALLBACK ProgPopupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         /* Draw border */
         HPEN hp = CreatePen(PS_SOLID, 1, T.isDark ? RGB(70,70,80) : RGB(180,180,190));
-        SelectObject(hdc, hp);
-        SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
+        HGDIOBJ old_pen = SelectObject(hdc, hp);
+        HGDIOBJ old_br = SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
         Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+        SelectObject(hdc, old_pen); SelectObject(hdc, old_br);
         DeleteObject(hp);
 
         /* Title text */

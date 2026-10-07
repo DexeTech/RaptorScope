@@ -108,9 +108,6 @@ Ordered with memory safety and data loss first.
 - **B4** **Save editor out-of-bounds read.** `dc_save_build` indexes its 10-entry digit table with `hours/10`. The Play Time edit has no length limit, so 100+ hours reads past the table.
 - **B5** **`new[]`/`free` mismatch.** `parse_standalone_emd_mesh_dec` fills `mesh.verts/tris` with `new[]`, but `Mesh` frees with `free`, and existing arrays are overwritten without being freed. Use `mesh.alloc`.
 - **B6** **Dangling pointer after a failed `realloc`.** `mesh_apply_xforms` returns without storing the moved pointer when one of its two `realloc`s fails after the other succeeded. `mesh.verts` or `mesh.tris` is then left dangling.
-- **B7** **Audio panel leaks fonts on every repaint.**
-  - `paint_wav`, `paint_sndb`, `paint_sndh`, `paint_snde` and the idle branch of `AudioPanel::paint` call `DeleteObject` on fonts that are still selected into the memory DC. The original font is never reselected, so the delete fails.
-  - The panel repaints every 33 ms during playback, so GDI handles run out after a few minutes.
 - **B8** **WAV buffer leak.** `AudioPanel::load_wav` stores its PCM in `pcm_data`, but `free_samples()` and the destructor free only `samples[i].pcm`.
 - **B9** **Script walk stops at 0x01/0x0A.**
   - `scd_opcode_advance` (`mesh.cpp`) treats 0x01/0x0A as script ends and 0x04 as one byte. That contradicts README and `scd_inst_size`.
