@@ -43,7 +43,7 @@ The tool reconstructs the PSX GPU rendering pipeline in software — including 4
 ### 3D Room Viewer
 - **Full room geometry** reconstructed from RDT (Room Data Table) files, including the two rooms that store their RDT uncompressed (ST50B, ST60E)
 - **Mixed BPP rendering**: 4bpp and 8bpp textures coexist in a single atlas via 2D sparse sub-palette allocation
-- **SCD script walker**: Parses bytecode to extract camera shots (0x4C, and its short form 0x2E), objects (0x42: a type and position for each, mostly effect objects such as the 80 by ST10A's broken window), enemy spawns (0x5B), and scene lights (0x3A)
+- **SCD script walker**: Decodes every script thread straight through, both sides of each branch, to extract camera shots (0x4C, and its short form 0x2E), objects (0x42: a type and position for each, mostly effect objects such as the 80 by ST10A's broken window), enemy spawns (0x5B), and scene lights (0x3A)
 - **Trigger zones**: Every 0x28 zone in the script area is found by scanning it, not by the walk, so zones set after an 0x01 (such as ST103's door triggers) are shown
 - **Scripted placement**: The room is built the way the game builds it — only the sections its scripts place into model slots are drawn. Placements (0x23, and item pickup zones 0x28 type 4) are found by scanning the whole script area, then later script writes to the slot (0x2A, 0x36, 0x37) adjust position and rotation, e.g. lifting items onto desks
 - **Item pickup models**: Type-4 zones (0x28) put their item model at the zone centre, as the game does
@@ -84,7 +84,7 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 | Blue dot | Script camera eye position (0x4C, 0x2E) |
 | Red dot | Script camera target (0x4C, 0x2E) |
 | Dashed | Camera trigger zones (ptr[3]), coloured per camera |
-| Red X | Enemy spawn (0x5B); found by scanning the script area, as some sit in branches the script walk skips |
+| Red X | Enemy spawn (0x5B), found by scanning the script area |
 | White star | Object (0x42) |
 | Orange dot | Character spawn (0x20) |
 | Pale blue rings | Fog (0x3D) |
