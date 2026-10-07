@@ -2318,15 +2318,15 @@ static void on_entry_select(int sel_param)
                         ov_zones  = overlay.n_zones;
                         ov_cols   = overlay.n_collisions;
                         ov_cams   = overlay.n_cameras;
-                        ov_spawns = overlay.n_spawns;
-                        overlay.floor_y = overlay_floor_y(mesh, overlay);
+                        ov_spawns = overlay.n_items;   /* 0x5B enemy spawns */
+                        overlay_floor_heights(mesh, overlay);
                         g_viewer3d.set_overlay(overlay);
                     }
 
                     char buf[256];
                     if (has_overlay) {
                         int ov_enemies = overlay.n_enemies;
-                        _snprintf(buf, 255, "Entry %d: %s  -  %d v, %d f  |  %d zones, %d cols, %d cams, %d spawns, %d enemies [O=overlay, F4=SCD]",
+                        _snprintf(buf, 255, "Entry %d: %s  -  %d v, %d f  |  %d zones, %d cols, %d cams, %d enemies, %d objects [O=overlay, F4=SCD]",
                             idx, mesh_type, mesh.vert_count, mesh.tri_count,
                             ov_zones, ov_cols, ov_cams, ov_spawns, ov_enemies);
                     } else {
@@ -3338,7 +3338,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         fprintf(f, "# Walkable area from collision rects + floor zones\n\n");
                         const RdtSceneOverlay& ov = g_viewer3d.cached_overlay;
                         int vi = 1;  /* OBJ vertex index (1-based) */
-                        float fy = ov.floor_y;
 
                         /* Collision rects */
                         fprintf(f, "o CollisionRects\n");
@@ -3346,6 +3345,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             const RdtCollisionRect& cr = ov.collisions[i];
                             float x0 = -(float)cr.x, z0 = (float)cr.z;
                             float x1 = -(float)(cr.x + cr.w), z1 = (float)(cr.z + cr.h);
+                            float fy = ov.rect_y[i];
                             fprintf(f, "v %f %f %f\n", x0, fy, z0);
                             fprintf(f, "v %f %f %f\n", x1, fy, z0);
                             fprintf(f, "v %f %f %f\n", x1, fy, z1);
@@ -3360,7 +3360,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             const RdtFloorZone& fz = ov.zones[i];
                             for (int c = 0; c < 4; c++) {
                                 float zx = -(float)fz.x[c], zz = (float)fz.z[c];
-                                float zy = -(float)fz.y;
+                                float zy = ov.zone_y[i] - (float)fz.y;
                                 fprintf(f, "v %f %f %f\n", zx, zy, zz);
                             }
                             fprintf(f, "f %d %d %d %d\n", vi, vi+1, vi+2, vi+3);

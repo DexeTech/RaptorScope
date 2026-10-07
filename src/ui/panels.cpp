@@ -2072,6 +2072,7 @@ void ViewerPanel3D::resize(int w, int h) {
     int bar_h = anim_model ? 66 : 0;
     int vh = h - bar_h;
     if (vh < 1) vh = 1;
+    w = view_w(w);
     glViewport(0, bar_h, w, vh);
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     gluPerspective(45.0, (double)w / (double)vh, 1.0, 100000.0);
@@ -2394,312 +2395,377 @@ static void build_bone_list(int list_id, const EmdSkeleton& skel) {
 }
 
 /*─── Build scene overlay display list (zones, collisions, cameras, spawns) ───*/
-static void build_overlay_list(int list_id, const RdtSceneOverlay& ov) {
+/* The element selected in the overlay tree is drawn again on top, white
+   and thicker (markers larger), so it can be told apart. */
+static bool s_ov_hl;
+static void ov_color(f32 r, f32 g, f32 b, f32 a = 1.0f) {
+    if (s_ov_hl) glColor4f(1.0f, 1.0f, 1.0f, 1.0f); else glColor4f(r, g, b, a);
+}
+static void ov_width(f32 w) { glLineWidth(s_ov_hl ? w + 3.0f : w); }
+
+/* Highlight: a tall white pin standing on the element (viewer coords) */
+static void ov_pin(f32 x, f32 y, f32 z) {
+    glLineWidth(2.0f);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_LINES); glVertex3f(x, y, z); glVertex3f(x, y + 2500.0f, z); glEnd();
+    glPointSize(12.0f);
+    glBegin(GL_POINTS); glVertex3f(x, y + 2500.0f, z); glEnd();
+    glPointSize(1.0f);
+}
+
+static void ov_draw_zone(const RdtSceneOverlay& ov, int i) {
+    const RdtFloorZone& z = ov.zones[i];
+    if (z.flags == 0x28) {
+        /* SCD 0x28 zone — color by type number.
+           Type only determines data layout size, not gameplay role.
+           Only type 4 is confirmed as door (exe calls sub_426DFC). */
+        switch (z.target_index) {
+            case 0: ov_color(1.0f, 0.4f, 0.1f); break;  /* orange = type 0 */
+            case 1: ov_color(0.2f, 0.7f, 1.0f); break;  /* light blue = type 1 */
+            case 2: ov_color(0.9f, 0.9f, 0.2f); break;  /* yellow = type 2 */
+            case 3: ov_color(0.2f, 0.9f, 0.5f); break;  /* mint = type 3 */
+            case 4: ov_color(0.0f, 0.9f, 0.9f); break;  /* cyan = type 4 (door) */
+            default: ov_color(0.8f, 0.3f, 0.8f); break; /* purple = other */
+        }
+        ov_width((z.target_index == 4) ? 3.0f : 2.0f);
+    } else {
+        ov_width(2.0f);
+        ov_color(1.0f, 1.0f, 0.0f);         /* yellow = floor zone */
+    }
+
+    f32 y0 = ov.zone_y[i] + -(f32)z.y;
+    f32 y1 = y0 + (f32)z.height;
+
+    if (z.height > 0 && z.flags == 0x28) {
+        /* 3D wireframe box: floor quad + ceiling quad + verticals */
+        /* Floor */
+        glBegin(GL_LINE_LOOP);
+        for (int c = 0; c < 4; c++)
+            glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
+        glEnd();
+        /* Ceiling */
+        glBegin(GL_LINE_LOOP);
+        for (int c = 0; c < 4; c++)
+            glVertex3f(-(f32)z.x[c], y1, (f32)z.z[c]);
+        glEnd();
+        /* Vertical edges */
+        glBegin(GL_LINES);
+        for (int c = 0; c < 4; c++) {
+            glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
+            glVertex3f(-(f32)z.x[c], y1, (f32)z.z[c]);
+        }
+        glEnd();
+    } else {
+        /* Flat floor outline */
+        glBegin(GL_LINE_LOOP);
+        for (int c = 0; c < 4; c++)
+            glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
+        glEnd();
+    }
+    if (s_ov_hl)
+        ov_pin(-(z.x[0] + z.x[1] + z.x[2] + z.x[3]) * 0.25f, y0, (z.z[0] + z.z[1] + z.z[2] + z.z[3]) * 0.25f);
+}
+
+/* Collision rects (ptr[1]): walkable floor areas — green outline */
+static void ov_draw_rect(const RdtSceneOverlay& ov, int i) {
+    ov_width(2.0f);
+    ov_color(0.0f, 0.8f, 0.2f);
+    const RdtCollisionRect& r = ov.collisions[i];
+    f32 x0 = -(f32)r.x;
+    f32 x1 = -(f32)(r.x + (s16)r.w);
+    f32 z0 = (f32)r.z;
+    f32 z1 = (f32)(r.z + (s16)r.h);
+    f32 ry = ov.rect_y[i];
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(x0, ry, z0);
+    glVertex3f(x1, ry, z0);
+    glVertex3f(x1, ry, z1);
+    glVertex3f(x0, ry, z1);
+    glEnd();
+    if (s_ov_hl) ov_pin((x0 + x1) * 0.5f, ry, (z0 + z1) * 0.5f);
+}
+
+/* Script cameras (0x4C, 0x2E): blue eye → red target */
+static void ov_draw_script_cam(const RdtSceneOverlay& ov, int i) {
+    const RdtCameraEntry& cam = ov.cameras[i];
+    glPointSize(s_ov_hl ? 16.0f : 10.0f);
+    glBegin(GL_POINTS);
+    ov_color(0.2f, 0.4f, 1.0f);
+    glVertex3f(-(f32)cam.eye_x, -(f32)cam.eye_y, (f32)cam.eye_z);
+    ov_color(1.0f, 0.2f, 0.2f);
+    glVertex3f(-(f32)cam.tgt_x, -(f32)cam.tgt_y, (f32)cam.tgt_z);
+    glEnd();
+    ov_width(1.0f);
+    glBegin(GL_LINES);
+    ov_color(0.2f, 0.4f, 1.0f);
+    glVertex3f(-(f32)cam.eye_x, -(f32)cam.eye_y, (f32)cam.eye_z);
+    ov_color(1.0f, 0.2f, 0.2f);
+    glVertex3f(-(f32)cam.tgt_x, -(f32)cam.tgt_y, (f32)cam.tgt_z);
+    glEnd();
+    glPointSize(1.0f);
+    if (s_ov_hl) ov_pin(-(f32)cam.eye_x, -(f32)cam.eye_y, (f32)cam.eye_z);
+}
+
+/* Cross of half-size s (object spawns, character placements) */
+static void ov_cross(f32 x, f32 y, f32 z, f32 s) {
+    glBegin(GL_LINES);
+    glVertex3f(x - s, y, z); glVertex3f(x + s, y, z);
+    glVertex3f(x, y - s, z); glVertex3f(x, y + s, z);
+    glVertex3f(x, y, z - s); glVertex3f(x, y, z + s);
+    glEnd();
+}
+
+/* Object spawns (RdtObjectSpawn): magenta crosses */
+static void ov_draw_spawn(const RdtSceneOverlay& ov, int i) {
+    ov_width(2.0f);
+    ov_color(1.0f, 0.3f, 1.0f);
+    const RdtObjectSpawn& sp = ov.spawns[i];
+    ov_cross(-(f32)sp.px, -(f32)sp.py, (f32)sp.pz, s_ov_hl ? 400.0f : 200.0f);
+    if (s_ov_hl) ov_pin(-(f32)sp.px, -(f32)sp.py, (f32)sp.pz);
+}
+
+/* Character placements (0x20): orange crosses */
+static void ov_draw_char(const RdtSceneOverlay& ov, int i) {
+    ov_width(2.0f);
+    ov_color(1.0f, 0.6f, 0.0f);
+    const RdtCharPlace& cp = ov.chars[i];
+    ov_cross(-(f32)cp.px, -(f32)cp.py, (f32)cp.pz, s_ov_hl ? 600.0f : 300.0f);
+    if (s_ov_hl) ov_pin(-(f32)cp.px, -(f32)cp.py, (f32)cp.pz);
+}
+
+/* Camera cut zones (ptr[2]): violet rect outlines */
+static void ov_draw_camcut(const RdtSceneOverlay& ov, int i) {
+    ov_width(1.5f);
+    const RdtCameraCutZone& cc = ov.camcuts[i];
+    float r = 0.5f + 0.15f * (cc.cam_group % 4);
+    float g = 0.3f;
+    float b = 0.8f + 0.05f * (cc.cam_group % 3);
+    ov_color(r, g, b);
+    /* x,z = top-left; w,h = dimensions in XZ */
+    f32 x0 = -(f32)cc.x;
+    f32 x1 = -(f32)(cc.x + cc.w);
+    f32 z0 = (f32)cc.z;
+    f32 z1 = (f32)(cc.z + cc.h);
+    f32 cy = ov.camcut_y[i] + 10.0f;
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(x0, cy, z0);
+    glVertex3f(x1, cy, z0);
+    glVertex3f(x1, cy, z1);
+    glVertex3f(x0, cy, z1);
+    glEnd();
+    if (s_ov_hl) ov_pin((x0 + x1) * 0.5f, cy, (z0 + z1) * 0.5f);
+}
+
+/* Scene lights (0x3A): colored octahedron wireframes */
+static void ov_draw_light(const RdtSceneOverlay& ov, int i) {
+    const RdtSceneLight& li = ov.lights[i];
+    if (!li.has_pos) return;
+    ov_width(2.0f);
+    f32 x = -(f32)li.px, y = -(f32)li.py, z = (f32)li.pz;
+    f32 r = li.has_color ? li.r / 255.0f : 0.9f;
+    f32 g = li.has_color ? li.g / 255.0f : 0.85f;
+    f32 b = li.has_color ? li.b / 255.0f : 0.75f;
+    f32 s = s_ov_hl ? 300.0f : 150.0f;
+    /* Wireframe octahedron */
+    ov_color(r, g, b);
+    glBegin(GL_LINES);
+    /* Equator */
+    glVertex3f(x+s, y, z); glVertex3f(x, y, z+s);
+    glVertex3f(x, y, z+s); glVertex3f(x-s, y, z);
+    glVertex3f(x-s, y, z); glVertex3f(x, y, z-s);
+    glVertex3f(x, y, z-s); glVertex3f(x+s, y, z);
+    /* Top pole */
+    glVertex3f(x, y+s, z); glVertex3f(x+s, y, z);
+    glVertex3f(x, y+s, z); glVertex3f(x-s, y, z);
+    glVertex3f(x, y+s, z); glVertex3f(x, y, z+s);
+    glVertex3f(x, y+s, z); glVertex3f(x, y, z-s);
+    /* Bottom pole */
+    glVertex3f(x, y-s, z); glVertex3f(x+s, y, z);
+    glVertex3f(x, y-s, z); glVertex3f(x-s, y, z);
+    glVertex3f(x, y-s, z); glVertex3f(x, y, z+s);
+    glVertex3f(x, y-s, z); glVertex3f(x, y, z-s);
+    glEnd();
+    /* Floor radius circle using actual light radius */
+    ov_width(1.0f);
+    ov_color(r, g, b, 0.3f);
+    f32 rad = (li.radius > 0) ? (f32)li.radius : 800.0f;
+    glBegin(GL_LINE_LOOP);
+    for (int a = 0; a < 24; a++) {
+        f32 ang = (f32)a * (2.0f * 3.14159f / 24.0f);
+        glVertex3f(x + rad * cosf(ang), ov.floor_y, z + rad * sinf(ang));
+    }
+    glEnd();
+    if (s_ov_hl) ov_pin(x, y, z);
+}
+
+/* Enemy spawns (0x5B): red X on a circle with a post */
+static void ov_draw_enemy(const RdtSceneOverlay& ov, int i) {
+    ov_width(3.0f);
+    ov_color(1.0f, 0.15f, 0.1f);  /* red */
+    const RdtItemSpawn& es = ov.items[i];
+    f32 x = -(f32)es.px, y = -(f32)es.py, z = (f32)es.pz;
+    f32 s = 250.0f;
+    /* X marker (two diagonals) */
+    glBegin(GL_LINES);
+    glVertex3f(x - s, y,     z - s); glVertex3f(x + s, y,     z + s);
+    glVertex3f(x - s, y,     z + s); glVertex3f(x + s, y,     z - s);
+    /* Vertical line showing height */
+    glVertex3f(x, y,     z); glVertex3f(x, y + s*2, z);
+    /* Small crossbar at top */
+    glVertex3f(x - s*0.4f, y + s*2, z); glVertex3f(x + s*0.4f, y + s*2, z);
+    glEnd();
+    /* Circle on ground */
+    glBegin(GL_LINE_LOOP);
+    for (int a = 0; a < 16; a++) {
+        f32 ang = (f32)a * 6.2832f / 16.0f;
+        glVertex3f(x + s * cosf(ang), y, z + s * sinf(ang));
+    }
+    glEnd();
+    if (s_ov_hl) ov_pin(x, y, z);
+}
+
+/* Game cameras: the trigger zones (ptr[3]) that switch to camera cam_id,
+   dashed, per-camera color */
+static void ov_draw_camera(const RdtSceneOverlay& ov, int cam_id) {
+    glEnable(GL_LINE_STIPPLE);
+    glLineStipple(1, 0xF0F0);
+    ov_width(2.0f);
+    float hue = (float)(cam_id % 8) / 8.0f;
+    float r = 0.5f + 0.5f * sinf(hue * 6.28f);
+    float g = 0.5f + 0.5f * sinf(hue * 6.28f + 2.09f);
+    float b = 0.5f + 0.5f * sinf(hue * 6.28f + 4.19f);
+    ov_color(r, g, b);
+    for (int i = 0; i < ov.n_cam_threads; i++) {
+        const RdtSceneOverlay::CamThread& ct = ov.cam_threads[i];
+        if (ct.cam_id != cam_id) continue;
+        glBegin(GL_LINE_LOOP);
+        for (int c = 0; c < 4; c++)
+            glVertex3f(-(f32)ct.x[c], ov.cam_thread_y[i] + 15.0f, (f32)ct.z[c]);
+        glEnd();
+    }
+    glDisable(GL_LINE_STIPPLE);
+    for (int i = 0; i < ov.n_cam_threads && s_ov_hl; i++) {
+        const RdtSceneOverlay::CamThread& ct = ov.cam_threads[i];
+        if (ct.cam_id == cam_id)
+            ov_pin(-(ct.x[0] + ct.x[1] + ct.x[2] + ct.x[3]) * 0.25f, ov.cam_thread_y[i] + 15.0f,
+                   (ct.z[0] + ct.z[1] + ct.z[2] + ct.z[3]) * 0.25f);
+    }
+}
+
+/* Objects (0x42): small white stars.  Mostly effect objects (such as the
+   80 by ST10A's broken window) */
+static void ov_draw_object(const RdtSceneOverlay& ov, int i) {
+    ov_width(2.0f);
+    ov_color(1.0f, 1.0f, 1.0f);
+    const RdtEnemySpawn& is = ov.enemies[i];
+    f32 x = -(f32)is.px, y = -(f32)is.py, z = (f32)is.pz;
+    f32 s = s_ov_hl ? 180.0f : 60.0f;
+    /* 6-pointed star: 3 intersecting lines */
+    glBegin(GL_LINES);
+    glVertex3f(x - s, y, z); glVertex3f(x + s, y, z);
+    glVertex3f(x, y - s, z); glVertex3f(x, y + s, z);
+    glVertex3f(x, y, z - s); glVertex3f(x, y, z + s);
+    /* Diamond diagonals */
+    f32 d = s * 0.7f;
+    glVertex3f(x - d, y + d, z); glVertex3f(x + d, y - d, z);
+    glVertex3f(x - d, y - d, z); glVertex3f(x + d, y + d, z);
+    glVertex3f(x, y + d, z - d); glVertex3f(x, y - d, z + d);
+    glVertex3f(x, y - d, z - d); glVertex3f(x, y + d, z + d);
+    glEnd();
+    if (s_ov_hl) ov_pin(x, y, z);
+}
+
+/* Fog volumes (0x3D): translucent sphere wireframe */
+static void ov_draw_fog(const RdtSceneOverlay& ov, int i) {
+    ov_width(1.0f);
+    ov_color(0.5f, 0.6f, 0.8f, 0.4f);  /* pale blue */
+    const RdtFogParams& fp = ov.fog[i];
+    f32 r_far = (f32)fp.dist_far;
+    if (r_far < 100) r_far = 2000;
+    /* Draw sphere rings at fog far distance */
+    f32 cx = 0, cy = -(f32)fp.dist_near, cz = 0;
+    /* Horizontal ring */
+    glBegin(GL_LINE_LOOP);
+    for (int a = 0; a < 32; a++) {
+        f32 ang = (f32)a * 6.2832f / 32.0f;
+        glVertex3f(cx + r_far * cosf(ang), cy, cz + r_far * sinf(ang));
+    }
+    glEnd();
+    /* Vertical ring */
+    glBegin(GL_LINE_LOOP);
+    for (int a = 0; a < 32; a++) {
+        f32 ang = (f32)a * 6.2832f / 32.0f;
+        glVertex3f(cx + r_far * cosf(ang), cy + r_far * sinf(ang), cz);
+    }
+    glEnd();
+}
+
+/* One overlay element: type is an OverlayVis type, i its index (cam_id
+   for cameras) */
+static void ov_draw(const RdtSceneOverlay& ov, int type, int i) {
+    switch (type) {
+    case OverlayVis::TRIGGERS:
+    case OverlayVis::FLOOR_ZONES: if (i < ov.n_zones) ov_draw_zone(ov, i); break;
+    case OverlayVis::RECTS:       if (i < ov.n_collisions) ov_draw_rect(ov, i); break;
+    case OverlayVis::SCRIPT_CAMS: if (i < ov.n_cameras) ov_draw_script_cam(ov, i); break;
+    case OverlayVis::SPAWNS:      if (i < ov.n_spawns) ov_draw_spawn(ov, i); break;
+    case OverlayVis::CHARS:       if (i < ov.n_chars) ov_draw_char(ov, i); break;
+    case OverlayVis::CAM_CUTS:    if (i < ov.n_camcuts) ov_draw_camcut(ov, i); break;
+    case OverlayVis::LIGHTS:      if (i < ov.n_lights) ov_draw_light(ov, i); break;
+    case OverlayVis::ENEMIES:     if (i < ov.n_items) ov_draw_enemy(ov, i); break;
+    case OverlayVis::CAMERAS:     ov_draw_camera(ov, i); break;
+    case OverlayVis::OBJECTS:     if (i < ov.n_enemies) ov_draw_object(ov, i); break;
+    case OverlayVis::FOG:         if (i < ov.n_fog) ov_draw_fog(ov, i); break;
+    }
+}
+
+static void build_overlay_list(int list_id, const RdtSceneOverlay& ov, const OverlayVis& vis) {
     glNewList(list_id, GL_COMPILE);
 
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_LIGHTING);
+    s_ov_hl = false;
 
-    /* Floor Y for all flat overlay elements — from mesh vertex analysis */
-    f32 fy = ov.floor_y;
-
-    /* ─── Zones: ptr[6] floor zones (yellow) vs SCD 0x28 trigger zones ─── */
-    if (ov.n_zones > 0) {
-        for (int i = 0; i < ov.n_zones; i++) {
-            const RdtFloorZone& z = ov.zones[i];
-            if (z.flags == 0x28) {
-                /* SCD 0x28 zone — color by type number.
-                   Type only determines data layout size, not gameplay role.
-                   Only type 4 is confirmed as door (exe calls sub_426DFC). */
-                switch (z.target_index) {
-                    case 0: glColor3f(1.0f, 0.4f, 0.1f); break;  /* orange = type 0 */
-                    case 1: glColor3f(0.2f, 0.7f, 1.0f); break;  /* light blue = type 1 */
-                    case 2: glColor3f(0.9f, 0.9f, 0.2f); break;  /* yellow = type 2 */
-                    case 3: glColor3f(0.2f, 0.9f, 0.5f); break;  /* mint = type 3 */
-                    case 4: glColor3f(0.0f, 0.9f, 0.9f); break;  /* cyan = type 4 (door) */
-                    default: glColor3f(0.8f, 0.3f, 0.8f); break; /* purple = other */
-                }
-                glLineWidth((z.target_index == 4) ? 3.0f : 2.0f);
-            } else {
-                glLineWidth(2.0f);
-                glColor3f(1.0f, 1.0f, 0.0f);         /* yellow = floor zone */
+    /* Drawn in this order, later types on top (no depth test) */
+    for (int i = 0; i < ov.n_zones; i++) {
+        int t = ov.zones[i].flags == 0x28 ? OverlayVis::TRIGGERS : OverlayVis::FLOOR_ZONES;
+        if (vis.shown(t, i)) ov_draw(ov, t, i);
+    }
+    static const int order[] = {
+        OverlayVis::RECTS, OverlayVis::SCRIPT_CAMS, OverlayVis::SPAWNS, OverlayVis::CHARS,
+        OverlayVis::CAM_CUTS, OverlayVis::LIGHTS, OverlayVis::ENEMIES, OverlayVis::CAMERAS,
+        OverlayVis::OBJECTS, OverlayVis::FOG,
+    };
+    for (int k = 0; k < (int)(sizeof(order) / sizeof(order[0])); k++) {
+        int t = order[k];
+        if (!vis.on[t]) continue;
+        if (t == OverlayVis::CAMERAS) {
+            /* Each camera once, in the order of its first zone */
+            for (int i = 0; i < ov.n_cam_threads; i++) {
+                int id = ov.cam_threads[i].cam_id;
+                bool first = true;
+                for (int j = 0; j < i && first; j++) first = ov.cam_threads[j].cam_id != id;
+                if (first && vis.shown(t, id)) ov_draw(ov, t, id);
             }
-
-            f32 y0 = fy + -(f32)z.y;
-            f32 y1 = y0 + (f32)z.height;
-
-            if (z.height > 0 && z.flags == 0x28) {
-                /* 3D wireframe box: floor quad + ceiling quad + verticals */
-                /* Floor */
-                glBegin(GL_LINE_LOOP);
-                for (int c = 0; c < 4; c++)
-                    glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
-                glEnd();
-                /* Ceiling */
-                glBegin(GL_LINE_LOOP);
-                for (int c = 0; c < 4; c++)
-                    glVertex3f(-(f32)z.x[c], y1, (f32)z.z[c]);
-                glEnd();
-                /* Vertical edges */
-                glBegin(GL_LINES);
-                for (int c = 0; c < 4; c++) {
-                    glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
-                    glVertex3f(-(f32)z.x[c], y1, (f32)z.z[c]);
-                }
-                glEnd();
-            } else {
-                /* Flat floor outline */
-                glBegin(GL_LINE_LOOP);
-                for (int c = 0; c < 4; c++)
-                    glVertex3f(-(f32)z.x[c], y0, (f32)z.z[c]);
-                glEnd();
-            }
+            continue;
         }
+        int n = t == OverlayVis::RECTS ? ov.n_collisions : t == OverlayVis::SCRIPT_CAMS ? ov.n_cameras :
+                t == OverlayVis::SPAWNS ? ov.n_spawns : t == OverlayVis::CHARS ? ov.n_chars :
+                t == OverlayVis::CAM_CUTS ? ov.n_camcuts : t == OverlayVis::LIGHTS ? ov.n_lights :
+                t == OverlayVis::ENEMIES ? ov.n_items : t == OverlayVis::OBJECTS ? ov.n_enemies : ov.n_fog;
+        for (int i = 0; i < n; i++)
+            if (vis.shown(t, i)) ov_draw(ov, t, i);
     }
 
-    /* ─── Collision rects (ptr[1]): walkable floor areas — green outline ─── */
-    if (ov.n_collisions > 0) {
-        glLineWidth(2.0f);
-        glColor3f(0.0f, 0.8f, 0.2f);
-        for (int i = 0; i < ov.n_collisions; i++) {
-            const RdtCollisionRect& r = ov.collisions[i];
-            f32 x0 = -(f32)r.x;
-            f32 x1 = -(f32)(r.x + (s16)r.w);
-            f32 z0 = (f32)r.z;
-            f32 z1 = (f32)(r.z + (s16)r.h);
-            glBegin(GL_LINE_LOOP);
-            glVertex3f(x0, fy, z0);
-            glVertex3f(x1, fy, z0);
-            glVertex3f(x1, fy, z1);
-            glVertex3f(x0, fy, z1);
-            glEnd();
-        }
-    }
-
-    /* ─── Cameras (0x4C, 0x2E): blue eye → red target ─── */
-    if (ov.n_cameras > 0) {
-        glPointSize(10.0f);
-        glBegin(GL_POINTS);
-        for (int i = 0; i < ov.n_cameras; i++) {
-            const RdtCameraEntry& cam = ov.cameras[i];
-            glColor3f(0.2f, 0.4f, 1.0f);
-            glVertex3f(-(f32)cam.eye_x, -(f32)cam.eye_y, (f32)cam.eye_z);
-            glColor3f(1.0f, 0.2f, 0.2f);
-            glVertex3f(-(f32)cam.tgt_x, -(f32)cam.tgt_y, (f32)cam.tgt_z);
-        }
-        glEnd();
-        glLineWidth(1.0f);
-        glBegin(GL_LINES);
-        for (int i = 0; i < ov.n_cameras; i++) {
-            const RdtCameraEntry& cam = ov.cameras[i];
-            glColor3f(0.2f, 0.4f, 1.0f);
-            glVertex3f(-(f32)cam.eye_x, -(f32)cam.eye_y, (f32)cam.eye_z);
-            glColor3f(1.0f, 0.2f, 0.2f);
-            glVertex3f(-(f32)cam.tgt_x, -(f32)cam.tgt_y, (f32)cam.tgt_z);
-        }
-        glEnd();
-        glPointSize(1.0f);
-    }
-
-    /* ─── Object spawns (0x42): magenta crosses ─── */
-    if (ov.n_spawns > 0) {
-        glLineWidth(2.0f);
-        glColor3f(1.0f, 0.3f, 1.0f);
-        glBegin(GL_LINES);
-        for (int i = 0; i < ov.n_spawns; i++) {
-            const RdtObjectSpawn& sp = ov.spawns[i];
-            f32 x = -(f32)sp.px, y = -(f32)sp.py, z = (f32)sp.pz;
-            f32 s = 200.0f;
-            glVertex3f(x - s, y, z); glVertex3f(x + s, y, z);
-            glVertex3f(x, y - s, z); glVertex3f(x, y + s, z);
-            glVertex3f(x, y, z - s); glVertex3f(x, y, z + s);
-        }
-        glEnd();
-    }
-
-    /* ─── Character placements (0x20): orange crosses ─── */
-    if (ov.n_chars > 0) {
-        glLineWidth(2.0f);
-        glColor3f(1.0f, 0.6f, 0.0f);
-        glBegin(GL_LINES);
-        for (int i = 0; i < ov.n_chars; i++) {
-            const RdtCharPlace& cp = ov.chars[i];
-            f32 x = -(f32)cp.px, y = -(f32)cp.py, z = (f32)cp.pz;
-            f32 s = 300.0f;
-            glVertex3f(x - s, y, z); glVertex3f(x + s, y, z);
-            glVertex3f(x, y - s, z); glVertex3f(x, y + s, z);
-            glVertex3f(x, y, z - s); glVertex3f(x, y, z + s);
-        }
-        glEnd();
-    }
-
-    /* ─── Camera cut zones (ptr[2]): violet rect outlines ─── */
-    if (ov.n_camcuts > 0) {
-        glLineWidth(1.5f);
-        for (int i = 0; i < ov.n_camcuts; i++) {
-            const RdtCameraCutZone& cc = ov.camcuts[i];
-            float r = 0.5f + 0.15f * (cc.cam_group % 4);
-            float g = 0.3f;
-            float b = 0.8f + 0.05f * (cc.cam_group % 3);
-            glColor3f(r, g, b);
-            /* x,z = top-left; w,h = dimensions in XZ */
-            f32 x0 = -(f32)cc.x;
-            f32 x1 = -(f32)(cc.x + cc.w);
-            f32 z0 = (f32)cc.z;
-            f32 z1 = (f32)(cc.z + cc.h);
-            glBegin(GL_LINE_LOOP);
-            glVertex3f(x0, fy + 10.0f, z0);
-            glVertex3f(x1, fy + 10.0f, z0);
-            glVertex3f(x1, fy + 10.0f, z1);
-            glVertex3f(x0, fy + 10.0f, z1);
-            glEnd();
-        }
-    }
-
-    /* ─── Scene lights (0x3A): colored octahedron wireframes ─── */
-    if (ov.n_lights > 0) {
-        glLineWidth(2.0f);
-        for (int i = 0; i < ov.n_lights; i++) {
-            const RdtSceneLight& li = ov.lights[i];
-            if (!li.has_pos) continue;
-            f32 x = -(f32)li.px, y = -(f32)li.py, z = (f32)li.pz;
-            f32 r = li.has_color ? li.r / 255.0f : 0.9f;
-            f32 g = li.has_color ? li.g / 255.0f : 0.85f;
-            f32 b = li.has_color ? li.b / 255.0f : 0.75f;
-            f32 s = 150.0f;
-            /* Wireframe octahedron */
-            glColor3f(r, g, b);
-            glBegin(GL_LINES);
-            /* Equator */
-            glVertex3f(x+s, y, z); glVertex3f(x, y, z+s);
-            glVertex3f(x, y, z+s); glVertex3f(x-s, y, z);
-            glVertex3f(x-s, y, z); glVertex3f(x, y, z-s);
-            glVertex3f(x, y, z-s); glVertex3f(x+s, y, z);
-            /* Top pole */
-            glVertex3f(x, y+s, z); glVertex3f(x+s, y, z);
-            glVertex3f(x, y+s, z); glVertex3f(x-s, y, z);
-            glVertex3f(x, y+s, z); glVertex3f(x, y, z+s);
-            glVertex3f(x, y+s, z); glVertex3f(x, y, z-s);
-            /* Bottom pole */
-            glVertex3f(x, y-s, z); glVertex3f(x+s, y, z);
-            glVertex3f(x, y-s, z); glVertex3f(x-s, y, z);
-            glVertex3f(x, y-s, z); glVertex3f(x, y, z+s);
-            glVertex3f(x, y-s, z); glVertex3f(x, y, z-s);
-            glEnd();
-            /* Floor radius circle using actual light radius */
-            glLineWidth(1.0f);
-            glColor4f(r, g, b, 0.3f);
-            f32 rad = (li.radius > 0) ? (f32)li.radius : 800.0f;
-            glBegin(GL_LINE_LOOP);
-            for (int a = 0; a < 24; a++) {
-                f32 ang = (f32)a * (2.0f * 3.14159f / 24.0f);
-                glVertex3f(x + rad * cosf(ang), fy, z + rad * sinf(ang));
-            }
-            glEnd();
-            glLineWidth(2.0f);
-        }
-    }
-
-    /* ─── Item/pickup spawns (0x5B): white diamond markers ─── */
-    if (ov.n_items > 0) {
-        glLineWidth(2.0f);
-        glColor3f(1.0f, 1.0f, 1.0f);
-        for (int i = 0; i < ov.n_items; i++) {
-            const RdtItemSpawn& is = ov.items[i];
-            f32 x = -(f32)is.px, y = -(f32)is.py, z = (f32)is.pz;
-            f32 s = 120.0f;
-            /* 6-pointed star: 3 intersecting lines */
-            glBegin(GL_LINES);
-            glVertex3f(x - s, y, z); glVertex3f(x + s, y, z);
-            glVertex3f(x, y - s, z); glVertex3f(x, y + s, z);
-            glVertex3f(x, y, z - s); glVertex3f(x, y, z + s);
-            /* Diamond diagonals */
-            f32 d = s * 0.7f;
-            glVertex3f(x - d, y + d, z); glVertex3f(x + d, y - d, z);
-            glVertex3f(x - d, y - d, z); glVertex3f(x + d, y + d, z);
-            glVertex3f(x, y + d, z - d); glVertex3f(x, y - d, z + d);
-            glVertex3f(x, y - d, z - d); glVertex3f(x, y + d, z + d);
-            glEnd();
-        }
-    }
-
-    /* ─── Camera thread activation zones (ptr[3]): dashed, per-camera color ─── */
-    if (ov.n_cam_threads > 0) {
-        glEnable(GL_LINE_STIPPLE);
-        glLineStipple(1, 0xF0F0);
-        glLineWidth(2.0f);
-        for (int i = 0; i < ov.n_cam_threads; i++) {
-            const RdtSceneOverlay::CamThread& ct = ov.cam_threads[i];
-            float hue = (float)(ct.cam_id % 8) / 8.0f;
-            float r = 0.5f + 0.5f * sinf(hue * 6.28f);
-            float g = 0.5f + 0.5f * sinf(hue * 6.28f + 2.09f);
-            float b = 0.5f + 0.5f * sinf(hue * 6.28f + 4.19f);
-            glColor3f(r, g, b);
-            glBegin(GL_LINE_LOOP);
-            for (int c = 0; c < 4; c++)
-                glVertex3f(-(f32)ct.x[c], fy + 15.0f, (f32)ct.z[c]);
-            glEnd();
-        }
-        glDisable(GL_LINE_STIPPLE);
-    }
-
-    /* ─── Enemy spawns (0x42): red X markers with type label ─── */
-    if (ov.n_enemies > 0) {
-        glLineWidth(3.0f);
-        glColor3f(1.0f, 0.15f, 0.1f);  /* red */
-        for (int i = 0; i < ov.n_enemies; i++) {
-            const RdtEnemySpawn& es = ov.enemies[i];
-            f32 x = -(f32)es.px, y = -(f32)es.py, z = (f32)es.pz;
-            f32 s = 200.0f;
-            /* X marker (two diagonals) */
-            glBegin(GL_LINES);
-            glVertex3f(x - s, y,     z - s); glVertex3f(x + s, y,     z + s);
-            glVertex3f(x - s, y,     z + s); glVertex3f(x + s, y,     z - s);
-            /* Vertical line showing height */
-            glVertex3f(x, y,     z); glVertex3f(x, y + s*2, z);
-            /* Small crossbar at top */
-            glVertex3f(x - s*0.4f, y + s*2, z); glVertex3f(x + s*0.4f, y + s*2, z);
-            glEnd();
-            /* Circle on ground */
-            glBegin(GL_LINE_LOOP);
-            for (int a = 0; a < 16; a++) {
-                f32 ang = (f32)a * 6.2832f / 16.0f;
-                glVertex3f(x + s * cosf(ang), y, z + s * sinf(ang));
-            }
-            glEnd();
-        }
-    }
-
-    /* ─── Fog volumes (0x3D): translucent sphere wireframe ─── */
-    if (ov.n_fog > 0) {
-        glLineWidth(1.0f);
-        glColor4f(0.5f, 0.6f, 0.8f, 0.4f);  /* pale blue */
-        glEnable(GL_BLEND);
-        for (int i = 0; i < ov.n_fog; i++) {
-            const RdtFogParams& fp = ov.fog[i];
-            f32 r_far = (f32)fp.dist_far;
-            if (r_far < 100) r_far = 2000;
-            /* Draw sphere rings at fog far distance */
-            f32 cx = 0, cy = -(f32)fp.dist_near, cz = 0;
-            /* Horizontal ring */
-            glBegin(GL_LINE_LOOP);
-            for (int a = 0; a < 32; a++) {
-                f32 ang = (f32)a * 6.2832f / 32.0f;
-                glVertex3f(cx + r_far * cosf(ang), cy, cz + r_far * sinf(ang));
-            }
-            glEnd();
-            /* Vertical ring */
-            glBegin(GL_LINE_LOOP);
-            for (int a = 0; a < 32; a++) {
-                f32 ang = (f32)a * 6.2832f / 32.0f;
-                glVertex3f(cx + r_far * cosf(ang), cy + r_far * sinf(ang), cz);
-            }
-            glEnd();
-        }
-        glDisable(GL_BLEND);
+    /* The element selected in the tree, on top */
+    if (vis.sel_type >= 0 && vis.sel_item >= 0 && vis.shown(vis.sel_type, vis.sel_item)) {
+        s_ov_hl = true;
+        ov_draw(ov, vis.sel_type, vis.sel_item);
+        s_ov_hl = false;
     }
 
     glLineWidth(1.0f);
+    glPointSize(1.0f);
     glEndList();
 }
 
@@ -2764,38 +2830,7 @@ static double orbit_far_clip(float cam_dist, float tx, float ty, float tz, float
     return far_clip;
 }
 
-void ViewerPanel3D::set_mesh(const Mesh& mesh) {
-    if (!hRC) return;
-
-    /* Clear any animation state from previous EMD */
-    if (anim_model) {
-        anim_model = 0;
-        anim_playing = false;
-        if (anim_timer_id) { KillTimer(hwnd, anim_timer_id); anim_timer_id = 0; }
-        if (anim_track) { DestroyWindow(anim_track); anim_track = 0; }
-        if (anim_label) { DestroyWindow(anim_label); anim_label = 0; }
-        if (anim_clip_combo) { DestroyWindow(anim_clip_combo); anim_clip_combo = 0; }
-        /* Restore full viewport (no control bar) */
-        RECT rc; GetClientRect(hwnd, &rc);
-        resize(rc.right, rc.bottom);
-    }
-
-    wglMakeCurrent(hDC, hRC);
-    if (has_mesh) {
-        if (gl_list_id) glDeleteLists(gl_list_id, 1);
-        if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
-        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
-        if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
-        if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
-        if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
-        if (gl_sub_id) glDeleteLists(gl_sub_id, 1);
-        if (gl_normals_id) glDeleteLists(gl_normals_id, 1);
-        gl_normals_id = 0;
-        if (gl_overlay_id) glDeleteLists(gl_overlay_id, 1);
-        gl_overlay_id = 0;
-        if (gl_pick_id) glDeleteLists(gl_pick_id, 1);
-        gl_pick_id = 0; pick_tri = -1; pick_section = 0; pick_info[0] = 0;
-    }
+void ViewerPanel3D::build_mesh_lists(const Mesh& mesh) {
     /* clut_base_y is set by upload_archive_texture to match the atlas.
        If not set (single-texture path), compute from mesh faces. */
     if (num_pal_rows > 1 && clut_base_y == 0 && mesh.tri_count > 0) {
@@ -2884,6 +2919,307 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
     if (gl_normals_id) { glDeleteLists(gl_normals_id, 1); gl_normals_id = 0; }
     gl_normals_id = glGenLists(1); build_normals_list(gl_normals_id, mesh);
     gl_bone_id = 0;
+}
+
+/* K: the room as one game camera shows it.  The display lists are rebuilt
+   without the model slots that camera's setup thread hides, and a camera
+   with a shot puts the view where the game puts it. */
+void ViewerPanel3D::select_camera(int sel) {
+    if (!hRC || !has_mesh || is_emd || !im_tris || sel >= n_cams) return;
+    cam_sel = sel;
+    shot_locked = false;
+    shot_kind = RDT_SHOT_NONE;
+    shot_cur = -1;
+    shot_zoom = 1;
+    set_view_hide(sel >= 0 ? cam_list[sel].hide : 0);
+    if (sel >= 0 && cam_list[sel].shot >= 0) {
+        /* The player starts in the middle of the zone that switches the
+           game to this shot, on the floor under it */
+        int si = cam_list[sel].shot;
+        const RdtSceneOverlay::CamThread& ct = cached_overlay.cam_threads[si];
+        shot_player[0] = shot_player[2] = 0;
+        for (int k = 0; k < 4; k++) {
+            shot_player[0] += ct.x[k] * 0.25f;
+            shot_player[2] += ct.z[k] * 0.25f;
+        }
+        shot_player[1] = -cached_overlay.cam_thread_y[si];
+        shot_cur = si;
+        update_shot(true);
+    }
+    render();
+}
+
+void ViewerPanel3D::set_view_hide(u64 hide) {
+    if (hide == view_hide) return;
+    view_hide = hide;
+    Mesh m;
+    m.verts = im_verts; m.vert_count = im_vert_count;
+    m.tris = (MeshTri*)malloc((im_tri_count ? im_tri_count : 1) * sizeof(MeshTri));
+    if (!m.tris) { m.verts = 0; return; }
+    for (int i = 0; i < im_tri_count; i++)
+        if (tri_in_view(im_tris[i])) m.tris[m.tri_count++] = im_tris[i];
+
+    wglMakeCurrent(hDC, hRC);
+    if (gl_list_id) glDeleteLists(gl_list_id, 1);
+    if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+    if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
+    if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
+    if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
+    if (gl_sub_id) glDeleteLists(gl_sub_id, 1);
+    if (gl_pick_id) { glDeleteLists(gl_pick_id, 1); gl_pick_id = 0; }
+    pick_tri = -1; pick_section = 0; pick_group_count = 0; pick_info[0] = 0;
+    build_mesh_lists(m);
+    wglMakeCurrent(0, 0);
+    m.verts = 0;  /* owned by im_verts */
+}
+
+/* Recomputes the shot in use for the player's position.  While the view is
+   on the shot (or lock asks for it), the orbit camera is put on it: target
+   at the orbit centre, eye at the orbit distance and angles, so dragging
+   carries on from it. */
+void ViewerPanel3D::update_shot(bool lock) {
+    if (shot_cur < 0) return;
+    shot_kind = rdt_camera_shot(cached_overlay.cam_threads[shot_cur].desc,
+                                shot_player, shot_eye, shot_tgt);
+    if (shot_kind == RDT_SHOT_NONE) return;
+    if (lock) shot_locked = true;
+    if (!shot_locked) return;
+    cam_x = -shot_tgt[0]; cam_y = -shot_tgt[1]; cam_z = shot_tgt[2];   /* viewer: x and y negated */
+    f32 dx = -shot_eye[0] - cam_x, dy = -shot_eye[1] - cam_y, dz = shot_eye[2] - cam_z;
+    f32 d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (d < 1) d = 1;
+    cam_dist = d;
+    cam_pitch = asinf(dy / d) * 180.0f / 3.14159265f;
+    cam_yaw = atan2f(dx, dz) * 180.0f / 3.14159265f;
+    cam_upx = 0; cam_upy = 1; cam_upz = 0;
+}
+
+/* WASD / arrows: walk the player along the view's heading and keep it on
+   the floor.  Walking into another shot's trigger zone cuts to that shot,
+   as the game does; the view follows the shot unless the mouse freed it. */
+void ViewerPanel3D::move_shot_player(f32 fwd, f32 right) {
+    if (cam_sel < 0 || shot_cur < 0) return;
+    f32 yr = cam_yaw * 3.14159265f / 180.0f;
+    f32 fx = -sinf(yr), fz = -cosf(yr);       /* eye to target, on the floor */
+    f32 vx = -shot_player[0] + fx * fwd - fz * right;
+    f32 vz =  shot_player[2] + fz * fwd + fx * right;
+    f32 vy = floor_below(vx, vz, -shot_player[1]);
+    shot_player[0] = -vx; shot_player[1] = -vy; shot_player[2] = vz;
+
+    int z = shot_zone_at(shot_player);
+    if (z >= 0 && z != shot_cur) {
+        const u8* d = cached_overlay.cam_threads[z].desc;
+        for (int k = 0; k < n_cams; k++) {
+            if (cam_list[k].shot < 0) continue;
+            const u8* o = cached_overlay.cam_threads[cam_list[k].shot].desc;
+            if (o[0] != d[0] || o[2] != d[2] || memcmp(o + 0x24, d + 0x24, 0x20) != 0) continue;
+            if (k != cam_sel) { cam_sel = k; set_view_hide(cam_list[k].hide); }
+            break;
+        }
+        shot_cur = z;
+    }
+    update_shot(false);
+    render();
+}
+
+/* The placed shot whose trigger zone holds p (raw coordinates) at about
+   its height; the shot in use while p is still inside its zone. */
+int ViewerPanel3D::shot_zone_at(const f32 p[3]) const {
+    int found = -1;
+    for (int i = 0; i < cached_overlay.n_cam_threads; i++) {
+        const RdtSceneOverlay::CamThread& ct = cached_overlay.cam_threads[i];
+        if (fabsf(cached_overlay.cam_thread_y[i] + p[1]) > 1500) continue;
+        bool in = false;
+        for (int a = 0, b = 3; a < 4; b = a++)
+            if ((ct.z[a] > p[2]) != (ct.z[b] > p[2]) &&
+                p[0] < ct.x[b] + (f32)(ct.x[a] - ct.x[b]) * (p[2] - ct.z[b]) / (f32)(ct.z[a] - ct.z[b]))
+                in = !in;
+        if (!in) continue;
+        if (i == shot_cur) return i;
+        f32 e[3], t[3];
+        if (found < 0 && rdt_camera_shot(ct.desc, p, e, t) != RDT_SHOT_NONE) found = i;
+    }
+    return found;
+}
+
+/* Timer while WASD / arrows are held: walk at about the game's pace
+   (Shift runs), relative to the view's heading. */
+void ViewerPanel3D::shot_tick() {
+    f32 fwd = 0, right = 0;
+    if (GetFocus() == hwnd) {
+        if ((GetAsyncKeyState('W') | GetAsyncKeyState(VK_UP))    & 0x8000) fwd += 1;
+        if ((GetAsyncKeyState('S') | GetAsyncKeyState(VK_DOWN))  & 0x8000) fwd -= 1;
+        if ((GetAsyncKeyState('D') | GetAsyncKeyState(VK_RIGHT)) & 0x8000) right += 1;
+        if ((GetAsyncKeyState('A') | GetAsyncKeyState(VK_LEFT))  & 0x8000) right -= 1;
+    }
+    if ((fwd == 0 && right == 0) || shot_cur < 0) {
+        KillTimer(hwnd, 9003);
+        shot_moving = false;
+        return;
+    }
+    DWORD now = GetTickCount();
+    f32 dt = (now - shot_tick_ms) / 1000.0f;
+    shot_tick_ms = now;
+    if (dt > 0.1f) dt = 0.1f;
+    f32 v = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? 4500.0f : 1800.0f;
+    move_shot_player(fwd * v * dt, right * v * dt);
+}
+
+/* Highest upward face under (vx, vz) that is at most a step above vy;
+   vy itself when there is none (viewer coordinates). */
+f32 ViewerPanel3D::floor_below(f32 vx, f32 vz, f32 vy) const {
+    f32 best = 0;
+    bool found = false;
+    for (int i = 0; i < im_tri_count; i++) {
+        const MeshTri& t = im_tris[i];
+        if (t.alt) continue;
+        const MeshVert& a = im_verts[t.idx[0]];
+        const MeshVert& b = im_verts[t.idx[1]];
+        const MeshVert& c = im_verts[t.idx[2]];
+        if ((b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z) <= 0) continue;  /* not upward */
+        f32 det = (b.x - a.x) * (c.z - a.z) - (c.x - a.x) * (b.z - a.z);
+        if (fabsf(det) < 1e-3f) continue;
+        f32 u = ((vx - a.x) * (c.z - a.z) - (c.x - a.x) * (vz - a.z)) / det;
+        f32 v = ((b.x - a.x) * (vz - a.z) - (vx - a.x) * (b.z - a.z)) / det;
+        if (u < 0 || v < 0 || u + v > 1) continue;
+        f32 y = a.y + u * (b.y - a.y) + v * (c.y - a.y);
+        if (y > vy + 700) continue;
+        if (!found || y > best) { best = y; found = true; }
+    }
+    return found ? best : vy;
+}
+
+/* Field of view: the game's (H=320 on a 320x240 screen) while the view is
+   on a shot, fitted so the whole 4:3 frame shows, times the scroll zoom. */
+double ViewerPanel3D::view_fovy(double aspect) const {
+    if (!shot_locked || cam_sel < 0) return 45.0;
+    double half = 120.0 / 320.0;
+    if (aspect < 4.0 / 3.0) half = (160.0 / 320.0) / aspect;
+    return 2.0 * atan(half * shot_zoom) * 180.0 / 3.14159265;
+}
+
+/* The shot's trigger zone and the player, then either the game's 4:3
+   frame (outside it dimmed) while the view is on the shot, or the game
+   camera's view pyramid once the mouse has freed the view.  Called with
+   the scene's matrices current. */
+void ViewerPanel3D::draw_shot_overlay(int w, int vh) {
+    if (cam_sel < 0 || shot_cur < 0) return;
+    const RdtSceneOverlay::CamThread& ct = cached_overlay.cam_threads[shot_cur];
+    glPushAttrib(GL_ENABLE_BIT | GL_LINE_BIT | GL_POINT_BIT | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT);
+    glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+
+    f32 zy = cached_overlay.cam_thread_y[shot_cur] + 8;
+    glLineWidth(2.0f);
+    glColor3ub(0, 230, 255);
+    glBegin(GL_LINE_LOOP);
+    for (int k = 0; k < 4; k++) glVertex3f(-(f32)ct.x[k], zy, (f32)ct.z[k]);
+    glEnd();
+
+    f32 px = -shot_player[0], py = -shot_player[1], pz = shot_player[2];
+    glColor3ub(255, 140, 0);
+    glBegin(GL_LINES);
+    glVertex3f(px, py, pz);           glVertex3f(px, py + 1700, pz);
+    glVertex3f(px - 250, py + 5, pz); glVertex3f(px + 250, py + 5, pz);
+    glVertex3f(px, py + 5, pz - 250); glVertex3f(px, py + 5, pz + 250);
+    glEnd();
+    glPointSize(8.0f);
+    glBegin(GL_POINTS); glVertex3f(px, py + 1700, pz); glEnd();
+
+    if (!shot_locked && shot_kind != RDT_SHOT_NONE) {
+        /* Eye, the pyramid out to the target's distance, and the target */
+        f32 E[3] = { -shot_eye[0], -shot_eye[1], shot_eye[2] };
+        f32 T[3] = { -shot_tgt[0], -shot_tgt[1], shot_tgt[2] };
+        f32 f[3] = { T[0] - E[0], T[1] - E[1], T[2] - E[2] };
+        f32 d = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        if (d > 1) {
+            for (int k = 0; k < 3; k++) f[k] /= d;
+            f32 r[3] = { -f[2], 0, f[0] };            /* f x up */
+            f32 rl = sqrtf(r[0] * r[0] + r[2] * r[2]);
+            if (rl < 1e-4f) { r[0] = 1; r[2] = 0; rl = 1; }
+            r[0] /= rl; r[2] /= rl;
+            f32 u[3] = { r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0] };
+            f32 c[4][3];
+            static const f32 sx[4] = { -1, 1, 1, -1 }, sy[4] = { -1, -1, 1, 1 };
+            for (int k = 0; k < 4; k++)
+                for (int j = 0; j < 3; j++)
+                    c[k][j] = E[j] + f[j] * d + r[j] * sx[k] * 0.5f * d + u[j] * sy[k] * 0.375f * d;
+            glColor3ub(255, 230, 60);
+            glBegin(GL_LINES);
+            for (int k = 0; k < 4; k++) { glVertex3fv(E); glVertex3fv(c[k]); }
+            for (int j = 0; j < 3; j += 2) {
+                f32 a[3] = { E[0], E[1], E[2] }, b[3] = { E[0], E[1], E[2] };
+                a[j] -= 150; b[j] += 150;
+                glVertex3fv(a); glVertex3fv(b);
+            }
+            glEnd();
+            glBegin(GL_LINE_LOOP);
+            for (int k = 0; k < 4; k++) glVertex3fv(c[k]);
+            glEnd();
+            glBegin(GL_POINTS); glVertex3fv(E); glVertex3fv(T); glEnd();
+        }
+    }
+
+    if (shot_locked) {
+        f32 fw = (f32)w, fh = (f32)vh;
+        if (fw * 3 > fh * 4) fw = fh * 4 / 3; else fh = fw * 3 / 4;
+        fw /= shot_zoom; fh /= shot_zoom;
+        f32 x0 = (w - fw) / 2, y0 = (vh - fh) / 2, x1 = x0 + fw, y1 = y0 + fh;
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        glOrtho(0, w, 0, vh, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0, 0, 0, 0.55f);
+        glBegin(GL_QUADS);
+        glVertex2f(0, 0);   glVertex2f(x0, 0);         glVertex2f(x0, (f32)vh);        glVertex2f(0, (f32)vh);
+        glVertex2f(x1, 0);  glVertex2f((f32)w, 0);     glVertex2f((f32)w, (f32)vh);    glVertex2f(x1, (f32)vh);
+        glVertex2f(x0, 0);  glVertex2f(x1, 0);         glVertex2f(x1, y0);             glVertex2f(x0, y0);
+        glVertex2f(x0, y1); glVertex2f(x1, y1);        glVertex2f(x1, (f32)vh);        glVertex2f(x0, (f32)vh);
+        glEnd();
+        glLineWidth(1.0f);
+        glColor4f(1.0f, 0.9f, 0.25f, 0.7f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
+        glEnd();
+        glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    }
+    glPopAttrib();
+}
+
+void ViewerPanel3D::set_mesh(const Mesh& mesh) {
+    if (!hRC) return;
+
+    /* Clear any animation state from previous EMD */
+    if (anim_model) {
+        anim_model = 0;
+        anim_playing = false;
+        if (anim_timer_id) { KillTimer(hwnd, anim_timer_id); anim_timer_id = 0; }
+        if (anim_track) { DestroyWindow(anim_track); anim_track = 0; }
+        if (anim_label) { DestroyWindow(anim_label); anim_label = 0; }
+        if (anim_clip_combo) { DestroyWindow(anim_clip_combo); anim_clip_combo = 0; }
+        /* Restore full viewport (no control bar) */
+        RECT rc; GetClientRect(hwnd, &rc);
+        resize(rc.right, rc.bottom);
+    }
+
+    wglMakeCurrent(hDC, hRC);
+    if (has_mesh) {
+        if (gl_list_id) glDeleteLists(gl_list_id, 1);
+        if (gl_alt_id) glDeleteLists(gl_alt_id, 1);
+        if (gl_2side_id) { glDeleteLists(gl_2side_id, 1); gl_2side_id = 0; }
+        if (gl_wire_id) glDeleteLists(gl_wire_id, 1);
+        if (gl_bone_id) glDeleteLists(gl_bone_id, 1);
+        if (gl_blend_id) glDeleteLists(gl_blend_id, 1);
+        if (gl_sub_id) glDeleteLists(gl_sub_id, 1);
+        if (gl_normals_id) glDeleteLists(gl_normals_id, 1);
+        gl_normals_id = 0;
+        if (gl_overlay_id) glDeleteLists(gl_overlay_id, 1);
+        gl_overlay_id = 0;
+        if (gl_pick_id) glDeleteLists(gl_pick_id, 1);
+        gl_pick_id = 0; pick_tri = -1; pick_section = 0; pick_info[0] = 0;
+    }
+    cam_sel = -1; n_cams = 0; view_hide = 0; shot_locked = false; shot_kind = 0; shot_cur = -1; shot_zoom = 1;
+    build_mesh_lists(mesh);
 
     /* Cache mesh for immediate-mode drawing (VM fallback) */
     free(im_verts); free(im_tris);
@@ -2939,10 +3275,47 @@ void ViewerPanel3D::set_mesh(const Mesh& mesh) {
 void ViewerPanel3D::set_overlay(const RdtSceneOverlay& overlay) {
     if (!hRC) return;
     cached_overlay = overlay;  /* keep copy for export */
+    /* K list: every shot that places the camera (a camera's identical
+       shots for different trigger zones once), then cameras with no shot
+       that still hide slots; in camera order */
+    n_cams = 0;
+    for (int i = 0; i < overlay.n_cam_threads && n_cams < 64; i++) {
+        const RdtSceneOverlay::CamThread& ct = overlay.cam_threads[i];
+        f32 p[3] = {0, 0, 0}, e[3], t[3];
+        if (rdt_camera_shot(ct.desc, p, e, t) == RDT_SHOT_NONE) continue;
+        bool dup = false;
+        for (int k = 0; k < n_cams && !dup; k++) {
+            const u8* o = overlay.cam_threads[cam_list[k].shot].desc;
+            dup = o[0] == ct.desc[0] && o[2] == ct.desc[2] && memcmp(o + 0x24, ct.desc + 0x24, 0x20) == 0;
+        }
+        if (dup) continue;
+        CamEntry& ce = cam_list[n_cams++];
+        ce.shot = i; ce.cam_id = ct.cam_id; ce.hide = 0;
+    }
+    for (int v = 0; v < overlay.n_cam_views; v++) {
+        bool has = false;
+        for (int k = 0; k < n_cams; k++)
+            if (cam_list[k].cam_id == overlay.cam_views[v].cam_id) {
+                cam_list[k].hide = overlay.cam_views[v].hide_mask;
+                has = true;
+            }
+        if (!has && n_cams < 64) {
+            CamEntry& ce = cam_list[n_cams++];
+            ce.shot = -1; ce.cam_id = overlay.cam_views[v].cam_id; ce.hide = overlay.cam_views[v].hide_mask;
+        }
+    }
+    for (int i = 1; i < n_cams; i++)
+        for (int j = i; j > 0 && cam_list[j].cam_id < cam_list[j - 1].cam_id; j--) {
+            CamEntry tmp = cam_list[j]; cam_list[j] = cam_list[j - 1]; cam_list[j - 1] = tmp;
+        }
+    /* Every element of the new room is shown; the types hidden stay hidden */
+    memset(ov_vis.hidden, 0, sizeof(ov_vis.hidden));
+    ov_vis.sel_type = ov_vis.sel_item = -1;
+    fill_ov_tree();
     wglMakeCurrent(hDC, hRC);
     if (gl_overlay_id) glDeleteLists(gl_overlay_id, 1);
     gl_overlay_id = glGenLists(1);
-    build_overlay_list(gl_overlay_id, overlay);
+    build_overlay_list(gl_overlay_id, cached_overlay, ov_vis);
     /* Cache collision rects for walk-through collision */
     n_walk_cols = (overlay.n_collisions < MAX_WALK_COLS) ? overlay.n_collisions : MAX_WALK_COLS;
     for (int i = 0; i < n_walk_cols; i++) walk_cols[i] = overlay.collisions[i];
@@ -2971,8 +3344,247 @@ void ViewerPanel3D::set_overlay(const RdtSceneOverlay& overlay) {
     render();
 }
 
+/*─── Overlay element tree ───────────────────────────────────────
+   A checkbox per element type (hides all of it) and, under it, one per
+   instance.  Item lParam = type * 4096 + instance + 1 (instance -1 for a
+   type's own row).  Selecting an instance highlights it in the view. */
+#define OV_TREE_W 290
+#define WM_OV_TREE_CHECK (WM_APP + 31)   /* lParam = HTREEITEM whose checkbox changed */
+
+static HTREEITEM ov_tree_add(HWND tv, HTREEITEM parent, const char* text,
+                             int type, int item, bool checked) {
+    TVINSERTSTRUCTA tvi;
+    memset(&tvi, 0, sizeof(tvi));
+    tvi.hParent = parent;
+    tvi.hInsertAfter = TVI_LAST;
+    tvi.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_STATE;
+    tvi.item.pszText = (LPSTR)text;
+    tvi.item.lParam = (LPARAM)(type * 4096 + item + 1);
+    tvi.item.stateMask = TVIS_STATEIMAGEMASK;
+    tvi.item.state = INDEXTOSTATEIMAGEMASK(checked ? 2 : 1);
+    return (HTREEITEM)SendMessageA(tv, TVM_INSERTITEMA, 0, (LPARAM)&tvi);
+}
+
+static void ov_tree_theme(HWND tv) {
+    typedef HRESULT (WINAPI* SetWindowThemeFn)(HWND, LPCWSTR, LPCWSTR);
+    static SetWindowThemeFn set_theme = 0;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        HMODULE ux = LoadLibraryA("uxtheme.dll");
+        if (ux) set_theme = (SetWindowThemeFn)(void*)GetProcAddress(ux, "SetWindowTheme");
+    }
+    TreeView_SetBkColor(tv, T.listBg);
+    TreeView_SetTextColor(tv, T.listText);
+    if (set_theme) set_theme(tv, T.isDark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+}
+
+void ViewerPanel3D::fill_ov_tree() {
+    if (!hwnd) return;
+    if (!ov_tree) {
+        ov_tree = CreateWindowExA(0, WC_TREEVIEWA, "",
+            WS_CHILD | WS_VSCROLL | WS_CLIPSIBLINGS | TVS_HASBUTTONS | TVS_LINESATROOT |
+            TVS_SHOWSELALWAYS | TVS_FULLROWSELECT,
+            0, 0, OV_TREE_W, 100, hwnd, 0, GetModuleHandle(0), 0);
+        if (!ov_tree) return;
+        /* Checkboxes set after creation, before any item, as the control asks */
+        SetWindowLongA(ov_tree, GWL_STYLE, GetWindowLongA(ov_tree, GWL_STYLE) | TVS_CHECKBOXES);
+        SendMessageA(ov_tree, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+        ov_tree_dark = -1;
+    }
+    SendMessageA(ov_tree, WM_SETREDRAW, FALSE, 0);
+    TreeView_DeleteAllItems(ov_tree);
+
+    static const char* names[OverlayVis::N_TYPES] = {
+        "Cameras", "Script cameras (0x4C/0x2E)", "Camera cut zones", "Trigger zones (0x28)",
+        "Floor zones", "Collision rects", "Enemy spawns (0x5B)", "Characters (0x20)",
+        "Objects (0x42)", "Object spawns", "Lights (0x3A)", "Fog (0x3D)",
+    };
+    const RdtSceneOverlay& ov = cached_overlay;
+    char buf[128];
+    for (int t = 0; t < OverlayVis::N_TYPES; t++) {
+        HTREEITEM h = ov_tree_add(ov_tree, TVI_ROOT, names[t], t, -1, ov_vis.on[t]);
+        int n = 0;
+#define OV_ITEM(idx) do { ov_tree_add(ov_tree, h, buf, t, (idx), true); n++; } while (0)
+        switch (t) {
+        case OverlayVis::CAMERAS: {
+            /* Each camera number once, in order, with the zones that switch to it */
+            bool seen[256] = {};
+            for (int i = 0; i < ov.n_cam_threads; i++) seen[ov.cam_threads[i].cam_id] = true;
+            for (int id = 0; id < 256; id++) {
+                if (!seen[id]) continue;
+                int zones = 0;
+                bool fixed = false, tracking = false;
+                for (int i = 0; i < ov.n_cam_threads; i++) {
+                    const RdtSceneOverlay::CamThread& ct = ov.cam_threads[i];
+                    if (ct.cam_id != id) continue;
+                    zones++;
+                    f32 p[3] = { 0, -ov.cam_thread_y[i], 0 }, e[3], g[3];
+                    for (int k = 0; k < 4; k++) { p[0] += ct.x[k] * 0.25f; p[2] += ct.z[k] * 0.25f; }
+                    int kind = rdt_camera_shot(ct.desc, p, e, g);
+                    if (kind == RDT_SHOT_FIXED) fixed = true;
+                    if (kind == RDT_SHOT_TRACKING) tracking = true;
+                }
+                _snprintf(buf, sizeof(buf) - 1, "Camera %d  (%s%d zone%s)", id,
+                          fixed && tracking ? "fixed/tracking, " : fixed ? "fixed, " :
+                          tracking ? "tracking, " : "", zones, zones == 1 ? "" : "s");
+                OV_ITEM(id);
+            }
+        } break;
+        case OverlayVis::SCRIPT_CAMS:
+            for (int i = 0; i < ov.n_cameras; i++) {
+                const RdtCameraEntry& c = ov.cameras[i];
+                _snprintf(buf, sizeof(buf) - 1, "#%d  eye (%d, %d, %d)", i + 1, c.eye_x, c.eye_y, c.eye_z);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::CAM_CUTS:
+            for (int i = 0; i < ov.n_camcuts; i++) {
+                _snprintf(buf, sizeof(buf) - 1, "#%d  group %d", i + 1, ov.camcuts[i].cam_group);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::TRIGGERS:
+        case OverlayVis::FLOOR_ZONES:
+            for (int i = 0; i < ov.n_zones; i++) {
+                const RdtFloorZone& z = ov.zones[i];
+                if ((z.flags == 0x28) != (t == OverlayVis::TRIGGERS)) continue;
+                if (t == OverlayVis::TRIGGERS)
+                    _snprintf(buf, sizeof(buf) - 1, "#%d  type %d%s", n + 1, z.target_index,
+                              z.target_index == 4 ? " (item)" : "");
+                else
+                    _snprintf(buf, sizeof(buf) - 1, "#%d", n + 1);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::RECTS:
+            for (int i = 0; i < ov.n_collisions; i++) {
+                const RdtCollisionRect& r = ov.collisions[i];
+                _snprintf(buf, sizeof(buf) - 1, "#%d  (%d, %d)  %d x %d", i + 1, r.x, r.z, r.w, r.h);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::ENEMIES:
+            for (int i = 0; i < ov.n_items; i++) {
+                const RdtItemSpawn& e = ov.items[i];
+                _snprintf(buf, sizeof(buf) - 1, "Slot %d  type %d  (%d, %d, %d)  %d\xB0", e.slot, e.type,
+                          e.px, e.py, e.pz, ((e.rot_y & 0xFFF) * 360 + 2048) / 4096 % 360);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::CHARS:
+            for (int i = 0; i < ov.n_chars; i++) {
+                const RdtCharPlace& c = ov.chars[i];
+                _snprintf(buf, sizeof(buf) - 1, "Slot %d  type %d  (%d, %d, %d)  %d\xB0", c.slot, c.type,
+                          c.px, c.py, c.pz, ((c.rot_y & 0xFFF) * 360 + 2048) / 4096 % 360);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::OBJECTS:
+            for (int i = 0; i < ov.n_enemies && i < OverlayVis::MAX_ITEMS; i++) {
+                const RdtEnemySpawn& o = ov.enemies[i];
+                _snprintf(buf, sizeof(buf) - 1, "Type %d  (%d, %d, %d)", o.type, o.px, o.py, o.pz);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::SPAWNS:
+            for (int i = 0; i < ov.n_spawns; i++) {
+                const RdtObjectSpawn& s = ov.spawns[i];
+                _snprintf(buf, sizeof(buf) - 1, "Slot %d  (%d, %d, %d)", s.slot, s.px, s.py, s.pz);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::LIGHTS:
+            for (int i = 0; i < ov.n_lights; i++) {
+                const RdtSceneLight& l = ov.lights[i];
+                if (!l.has_pos) continue;  /* not drawn */
+                _snprintf(buf, sizeof(buf) - 1, "Slot %d  (%d, %d, %d)", l.slot, l.px, l.py, l.pz);
+                OV_ITEM(i);
+            }
+            break;
+        case OverlayVis::FOG:
+            for (int i = 0; i < ov.n_fog; i++) {
+                _snprintf(buf, sizeof(buf) - 1, "#%d  range %d to %d", i + 1, ov.fog[i].dist_near, ov.fog[i].dist_far);
+                OV_ITEM(i);
+            }
+            break;
+        }
+#undef OV_ITEM
+        if (n == 0) { TreeView_DeleteItem(ov_tree, h); continue; }
+        _snprintf(buf, sizeof(buf) - 1, "%s  (%d)", names[t], n);
+        TVITEMA it;
+        memset(&it, 0, sizeof(it));
+        it.mask = TVIF_TEXT;
+        it.hItem = h;
+        it.pszText = buf;
+        SendMessageA(ov_tree, TVM_SETITEMA, 0, (LPARAM)&it);
+    }
+    SendMessageA(ov_tree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ov_tree, NULL, TRUE);
+}
+
+/* The tree sits at the right of the view while the overlay is drawn
+   (not in walk mode); the view's viewport is narrowed by ov_tree_w. */
+void ViewerPanel3D::layout_ov_tree() {
+    if (!ov_tree || !hwnd) { ov_tree_w = 0; return; }
+    RECT rc; GetClientRect(hwnd, &rc);
+    int tw = OV_TREE_W;
+    if (tw > rc.right / 2) tw = rc.right / 2;
+    bool want = show_overlay && gl_overlay_id && has_mesh && !is_emd && !walk_mode && tw >= 120;
+    if (!want) {
+        if (IsWindowVisible(ov_tree)) ShowWindow(ov_tree, SW_HIDE);
+        ov_tree_w = 0;
+        return;
+    }
+    if (ov_tree_dark != (int)T.isDark) {
+        ov_tree_theme(ov_tree);
+        ov_tree_dark = (int)T.isDark;
+    }
+    RECT cur; GetWindowRect(ov_tree, &cur);
+    MapWindowPoints(NULL, hwnd, (POINT*)&cur, 2);
+    if (!IsWindowVisible(ov_tree) || cur.left != rc.right - tw || cur.right != rc.right ||
+        cur.top != 0 || cur.bottom != rc.bottom)
+        SetWindowPos(ov_tree, NULL, rc.right - tw, 0, tw, rc.bottom,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    ov_tree_w = tw;
+}
+
+void ViewerPanel3D::ov_tree_checked(HTREEITEM item) {
+    if (!ov_tree || !item) return;
+    TVITEMA it;
+    memset(&it, 0, sizeof(it));
+    it.mask = TVIF_PARAM | TVIF_STATE;
+    it.hItem = item;
+    it.stateMask = TVIS_STATEIMAGEMASK;
+    if (!SendMessageA(ov_tree, TVM_GETITEMA, 0, (LPARAM)&it) || it.lParam <= 0) return;
+    bool checked = ((it.state & TVIS_STATEIMAGEMASK) >> 12) == 2;
+    int type = (int)(it.lParam / 4096), idx = (int)(it.lParam % 4096) - 1;
+    if (type >= OverlayVis::N_TYPES) return;
+    if (idx < 0) ov_vis.on[type] = checked;
+    else if (idx < OverlayVis::MAX_ITEMS) ov_vis.hidden[type][idx] = !checked;
+    rebuild_overlay();
+}
+
+void ViewerPanel3D::ov_tree_selected(LPARAM lp) {
+    int type = lp > 0 ? (int)(lp / 4096) : -1, idx = lp > 0 ? (int)(lp % 4096) - 1 : -1;
+    if (idx < 0) type = -1;
+    if (type == ov_vis.sel_type && idx == ov_vis.sel_item) return;
+    ov_vis.sel_type = type;
+    ov_vis.sel_item = idx;
+    rebuild_overlay();
+}
+
+void ViewerPanel3D::rebuild_overlay() {
+    if (!hRC || !gl_overlay_id) return;
+    wglMakeCurrent(hDC, hRC);
+    build_overlay_list(gl_overlay_id, cached_overlay, ov_vis);  /* replaces the list */
+    wglMakeCurrent(0, 0);
+    render();
+}
+
 void ViewerPanel3D::set_emd(const EmdModel& emd) {
     if (!hRC) return;
+    cam_sel = -1; n_cams = 0; view_hide = 0; shot_locked = false; shot_kind = 0; shot_cur = -1; shot_zoom = 1;
 
     /* Exit walk mode on model switch */
     if (walk_mode) {
@@ -3454,13 +4066,15 @@ static void draw_mesh_immediate(const MeshVert* verts, int nv,
 
 void ViewerPanel3D::render() {
     if (!hRC || !hwnd) return;
+    layout_ov_tree();
     wglMakeCurrent(hDC, hRC);
 
     RECT rc; GetClientRect(hwnd, &rc);
-    int w = rc.right, h = rc.bottom;
+    int w = view_w(rc.right), h = rc.bottom;
     int bar_h = anim_model ? 66 : 0;
     int vh = h - bar_h;
     if (w < 1) w = 1; if (vh < 1) vh = 1;
+    glViewport(0, bar_h, w, vh);  /* the overlay tree can change the width */
 
     /* Theme-aware clear color */
     if (T.isDark) glClearColor(0.06f, 0.06f, 0.10f, 1.0f);
@@ -3514,7 +4128,7 @@ void ViewerPanel3D::render() {
             if (near_clip < 0.5) near_clip = 0.5;
             far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
         }
-        gluPerspective(45.0, aspect, near_clip, far_clip);
+        gluPerspective(walk_mode ? 45.0 : view_fovy(aspect), aspect, near_clip, far_clip);
     }
 
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
@@ -3763,7 +4377,14 @@ void ViewerPanel3D::render() {
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE);  /* additive: dst + src*α */
                 glDepthMask(GL_FALSE);               /* don't write depth for translucent */
                 glDisable(GL_LIGHTING);               /* STP faces use flat texture color */
+                /* Light patches lie on the floor they light: pull them
+                   forward so they don't z-fight with it */
+                glDepthFunc(GL_LEQUAL);
+                glEnable(GL_POLYGON_OFFSET_FILL);
+                glPolygonOffset(-1.0f, -4.0f);
                 glCallList(gl_blend_id);
+                glDisable(GL_POLYGON_OFFSET_FILL);
+                glDepthFunc(GL_LESS);
                 glDepthMask(GL_TRUE);
                 glDisable(GL_BLEND);
                 if (show_lighting && !sw_renderer) glEnable(GL_LIGHTING);
@@ -3775,7 +4396,12 @@ void ViewerPanel3D::render() {
                 glBlendFunc(GL_ZERO, GL_SRC_COLOR);  /* dst *= src (darken) */
                 glDepthMask(GL_FALSE);
                 glDisable(GL_LIGHTING);
+                glDepthFunc(GL_LEQUAL);
+                glEnable(GL_POLYGON_OFFSET_FILL);
+                glPolygonOffset(-1.0f, -4.0f);
                 glCallList(gl_sub_id);
+                glDisable(GL_POLYGON_OFFSET_FILL);
+                glDepthFunc(GL_LESS);
                 glDepthMask(GL_TRUE);
                 glDisable(GL_BLEND);
                 if (show_lighting && !sw_renderer) glEnable(GL_LIGHTING);
@@ -3972,6 +4598,8 @@ void ViewerPanel3D::render() {
         }
     }
 
+    if (!walk_mode) draw_shot_overlay(w, vh);
+
     /* ── HUD overlay (rendered into back buffer BEFORE swap) ── */
     glDisable(GL_LIGHTING);
     glDisable(GL_TEXTURE_2D);
@@ -4027,6 +4655,17 @@ void ViewerPanel3D::render() {
         int il = (int)strlen(info);
         _snprintf(info + il, 255 - il, " [RoomLit:%d]", n_room_lights);
     }
+    if (cam_sel >= 0 && !is_emd) {
+        int il = (int)strlen(info);
+        const char* how = shot_cur < 0 ? "" :
+                          shot_kind == RDT_SHOT_TRACKING ? " tracking" : " fixed";
+        _snprintf(info + il, 255 - il, " [Cam %d%s%s]", cam_list[cam_sel].cam_id, how,
+                  shot_cur < 0 ? "" : !shot_locked ? ", free view (J: back)" : "");
+        if (shot_locked && shot_zoom != 1) {
+            il = (int)strlen(info);
+            _snprintf(info + il, 255 - il, " [View x%.2f]", shot_zoom);
+        }
+    }
 
     /* Render mode indicator */
     if (sw_renderer) {
@@ -4076,42 +4715,73 @@ void ViewerPanel3D::render() {
     /* Controls line  -  bottom left, dimmed */
     const char* ctrl = walk_mode ?
         "WASD:move  Shift:run  Space:jump  P:noclip  LMB:fireball  Mouse:look  ESC/F:exit walk" :
-        (anim_model ?
+        (cam_sel >= 0 && shot_cur >= 0 ?
+        "K/Shift+K:camera  WASD/Arrows:move player  Shift:run  Scroll:widen view  J:back to shot  LMB:orbit  RMB:pan  R:reset  O:overlay  H:unplaced  T:tex  L:light" :
+        anim_model ?
         "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  W:wire  L:light  T:tex  V:vcol  C:cull  B:bones  U:uv  N:normals  Space:play" :
-        "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  Ctrl+LMB:pick  W:wire  L:light  T:tex  V:vcol  C:cull  U:uv  O:overlay  H:unplaced  I:roomlit  F:walk  N:normals  R:reset  Esc:deselect");
+        "LMB:orbit  RMB:pan  Scroll:zoom  Alt+LMB:snap  Ctrl+LMB:pick  W:wire  L:light  T:tex  V:vcol  C:cull  U:uv  O:overlay  H:unplaced  K:camera  I:roomlit  F:walk  N:normals  R:reset  Esc:deselect");
     if (T.isDark) glColor3f(0.38f, 0.40f, 0.48f);
     else          glColor3f(0.40f, 0.40f, 0.45f);
     glRasterPos2i(8, 6);
     glCallLists((GLsizei)strlen(ctrl), GL_UNSIGNED_BYTE, ctrl);
 
-    /* Overlay legend — right side, only when overlay is visible */
+    /* Overlay legend — right side, only when overlay is visible: the types
+       the room has and the overlay tree shows (zone rows: that zone type) */
     if (show_overlay && gl_overlay_id && !is_emd) {
-        struct LegendRow { float r, g, b; const char* label; };
-        LegendRow rows[] = {
-            { 0.0f, 0.8f, 0.2f, "Green  = Collision rect (ptr[1])" },
-            { 1.0f, 0.4f, 0.1f, "Orange = Zone type 0 (0x28)" },
-            { 0.2f, 0.7f, 1.0f, "LtBlue = Zone type 1 (0x28)" },
-            { 0.9f, 0.9f, 0.2f, "Yellow = Zone type 2/3 (0x28)" },
-            { 0.0f, 0.9f, 0.9f, "Cyan   = Zone type 4 item (0x28)" },
-            { 1.0f, 1.0f, 0.0f, "Yellow = Floor zone" },
-            { 0.6f, 0.3f, 0.85f,"Violet = Camera cut zone" },
-            { 0.9f, 0.85f, 0.5f,"Gold   = Scene light (0x3A)" },
-            { 0.2f, 0.4f, 1.0f, "Blue   = Camera eye" },
-            { 1.0f, 0.2f, 0.2f, "Red pt = Camera target" },
-            { 1.0f, 0.3f, 1.0f, "Pink   = Object spawn" },
-            { 1.0f, 1.0f, 1.0f, "White  = Item pickup (0x5B)" },
-            { 1.0f, 0.6f, 0.0f, "Orange = Character spawn" },
-            { 1.0f, 0.15f,0.1f,"Red X  = Enemy spawn (0x42)" },
-            { 0.5f, 0.6f, 0.8f, "PaleBlue= Fog volume (0x3D)" },
-            { 0.7f, 0.5f, 0.9f, "Dashed = Camera thread zones (ptr[3])" },
+        const RdtSceneOverlay& ov = cached_overlay;
+        struct LegendRow { float r, g, b; int type, zone; const char* label; };
+        static const LegendRow rows[] = {
+            { 0.0f, 0.8f, 0.2f, OverlayVis::RECTS, -1,       "Green  = Collision rect (ptr[1])" },
+            { 1.0f, 0.4f, 0.1f, OverlayVis::TRIGGERS, 0,     "Orange = Zone type 0 (0x28)" },
+            { 0.2f, 0.7f, 1.0f, OverlayVis::TRIGGERS, 1,     "LtBlue = Zone type 1 (0x28)" },
+            { 0.9f, 0.9f, 0.2f, OverlayVis::TRIGGERS, 23,    "Yellow = Zone type 2/3 (0x28)" },
+            { 0.0f, 0.9f, 0.9f, OverlayVis::TRIGGERS, 4,     "Cyan   = Zone type 4 item (0x28)" },
+            { 0.8f, 0.3f, 0.8f, OverlayVis::TRIGGERS, 5,     "Purple = Zone, other type (0x28)" },
+            { 1.0f, 1.0f, 0.0f, OverlayVis::FLOOR_ZONES, -1, "Yellow = Floor zone" },
+            { 0.6f, 0.3f, 0.85f,OverlayVis::CAM_CUTS, -1,    "Violet = Camera cut zone" },
+            { 0.9f, 0.85f, 0.5f,OverlayVis::LIGHTS, -1,      "Gold   = Scene light (0x3A)" },
+            { 0.2f, 0.4f, 1.0f, OverlayVis::SCRIPT_CAMS, -1, "Blue   = Script camera eye" },
+            { 1.0f, 0.2f, 0.2f, OverlayVis::SCRIPT_CAMS, -1, "Red pt = Script camera target" },
+            { 1.0f, 0.3f, 1.0f, OverlayVis::SPAWNS, -1,      "Pink   = Object spawn" },
+            { 1.0f, 1.0f, 1.0f, OverlayVis::OBJECTS, -1,     "White  = Object (0x42)" },
+            { 1.0f, 0.6f, 0.0f, OverlayVis::CHARS, -1,       "Orange = Character spawn" },
+            { 1.0f, 0.15f,0.1f, OverlayVis::ENEMIES, -1,     "Red X  = Enemy spawn (0x5B)" },
+            { 0.5f, 0.6f, 0.8f, OverlayVis::FOG, -1,         "PaleBlue= Fog volume (0x3D)" },
+            { 0.7f, 0.5f, 0.9f, OverlayVis::CAMERAS, -1,     "Dashed = Camera trigger zones (ptr[3])" },
         };
         int n_rows = (int)(sizeof(rows) / sizeof(rows[0]));
         int legend_x = w - 280;
         int legend_y = sh - 18;
+        int shown = 0;
         for (int li = 0; li < n_rows; li++) {
-            glColor3f(rows[li].r, rows[li].g, rows[li].b);
-            glRasterPos2i(legend_x, legend_y - li * 14);
-            glCallLists((GLsizei)strlen(rows[li].label), GL_UNSIGNED_BYTE, rows[li].label);
+            const LegendRow& row = rows[li];
+            if (!ov_vis.on[row.type]) continue;
+            int n = 0;
+            switch (row.type) {
+            case OverlayVis::RECTS:       n = ov.n_collisions; break;
+            case OverlayVis::CAM_CUTS:    n = ov.n_camcuts; break;
+            case OverlayVis::LIGHTS:      for (int i = 0; i < ov.n_lights; i++) n += ov.lights[i].has_pos; break;
+            case OverlayVis::SCRIPT_CAMS: n = ov.n_cameras; break;
+            case OverlayVis::SPAWNS:      n = ov.n_spawns; break;
+            case OverlayVis::OBJECTS:     n = ov.n_enemies; break;
+            case OverlayVis::CHARS:       n = ov.n_chars; break;
+            case OverlayVis::ENEMIES:     n = ov.n_items; break;
+            case OverlayVis::FOG:         n = ov.n_fog; break;
+            case OverlayVis::CAMERAS:     n = ov.n_cam_threads; break;
+            default:
+                for (int i = 0; i < ov.n_zones; i++) {
+                    const RdtFloorZone& z = ov.zones[i];
+                    if ((z.flags == 0x28) != (row.type == OverlayVis::TRIGGERS)) continue;
+                    int zt = z.target_index;
+                    if (row.zone < 0 || zt == row.zone || (row.zone == 23 && (zt == 2 || zt == 3)) ||
+                        (row.zone == 5 && zt > 4)) n++;
+                }
+            }
+            if (n == 0) continue;
+            glColor3f(row.r, row.g, row.b);
+            glRasterPos2i(legend_x, legend_y - shown * 14);
+            glCallLists((GLsizei)strlen(row.label), GL_UNSIGNED_BYTE, row.label);
+            shown++;
         }
     }
 
@@ -4259,6 +4929,7 @@ void ViewerPanel3D::on_mouse_down(int x, int y, int btn) {
     }
     if (btn == 0) { dragging = true; panning = false; }
     else if (btn == 1) { panning = true; dragging = false; }
+    shot_locked = false;  /* orbit on from the shot */
     last_mx = x; last_my = y;
     /* Save screen-space anchor for infinite drag (3ds Max style) */
     warp_anchor.x = x; warp_anchor.y = y;
@@ -4271,7 +4942,7 @@ void ViewerPanel3D::do_pick(int mx, int my) {
     if (!hRC || !hwnd) return;
     wglMakeCurrent(hDC, hRC);
     RECT rc; GetClientRect(hwnd, &rc);
-    int w = rc.right - rc.left;
+    int w = view_w(rc.right - rc.left);
     int h = rc.bottom - rc.top;
     int bar_h = anim_model ? 66 : 0;
     int vh = h - bar_h;
@@ -4287,7 +4958,7 @@ void ViewerPanel3D::do_pick(int mx, int my) {
     double near_clip = cam_dist * 0.005;
     if (near_clip < 0.5) near_clip = 0.5;
     double far_clip = orbit_far_clip(cam_dist, cam_x, cam_y, cam_z, scene_reach);
-    gluPerspective(45.0, aspect, near_clip, far_clip);
+    gluPerspective(view_fovy(aspect), aspect, near_clip, far_clip);
 
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     float yr = cam_yaw * 3.14159f / 180.0f;
@@ -4314,6 +4985,7 @@ void ViewerPanel3D::do_pick(int mx, int my) {
         int id = i + 1;
         const MeshTri& t = im_tris[i];
         if (t.alt && !show_alt_geo) continue;
+        if (!tri_in_view(t)) continue;
         glColor3ub((u8)(id & 0xFF), (u8)((id >> 8) & 0xFF), (u8)((id >> 16) & 0xFF));
         for (int vi = 0; vi < 3; vi++) {
             const MeshVert& v = im_verts[t.idx[vi]];
@@ -4596,6 +5268,15 @@ void ViewerPanel3D::on_mouse_wheel(int delta) {
         render();
         return;
     }
+    if (shot_locked) {
+        /* On a shot the eye stays put: scroll widens or narrows the view
+           around the game's frame */
+        shot_zoom *= 1.0f - delta * 0.001f;
+        if (shot_zoom < 0.25f) shot_zoom = 0.25f;
+        if (shot_zoom > 6.0f) shot_zoom = 6.0f;
+        render();
+        return;
+    }
     cam_dist -= delta * cam_dist * 0.001f;
     if (cam_dist < 10) cam_dist = 10;
     if (cam_dist > 50000) cam_dist = 50000;
@@ -4854,7 +5535,27 @@ void ViewerPanel3D::on_key(int vk) {
             return;
         }
     }
+    /* On a shot, WASD / arrows walk the player while held */
+    if (cam_sel >= 0 && shot_cur >= 0 && !anim_model &&
+        (vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D' ||
+         vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT)) {
+        if (!shot_moving) {
+            shot_moving = true;
+            shot_tick_ms = GetTickCount() - 16;
+            SetTimer(hwnd, 9003, 16, NULL);
+            shot_tick();
+        }
+        return;
+    }
     switch (vk) {
+    case 'J':
+        /* Back onto the shot after orbiting or zooming away */
+        if (cam_sel >= 0 && shot_cur >= 0) {
+            shot_zoom = 1;
+            update_shot(true);
+            render();
+        }
+        break;
     case 'F':
         walk_mode = !walk_mode;
         if (walk_mode) {
@@ -4926,10 +5627,20 @@ void ViewerPanel3D::on_key(int vk) {
     case 'C': show_cull = !show_cull; render(); break;
     case 'G': show_grid = !show_grid; render(); break;
     case 'H': if (gl_alt_id) { show_alt_geo = !show_alt_geo; render(); } break;
+    case 'K':
+        /* Cycle: all slots, then each camera's setup; Shift+K goes back */
+        if (n_cams > 0 && !is_emd) {
+            int v = cam_sel + ((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            if (v >= n_cams) v = -1;
+            if (v < -1) v = n_cams - 1;
+            select_camera(v);
+        }
+        break;
     case 'U': show_uv_editor(); break;
     case 'D': break; /* debug dump removed from hotkey — use Export menu */
     case 'R':
         cam_yaw = 180; cam_pitch = 10; cam_upx = 0; cam_upy = 1; cam_upz = 0;
+        shot_locked = false;
         render();
         break;
     case VK_SPACE:
@@ -5042,12 +5753,36 @@ LRESULT CALLBACK Viewer3DProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == 9002 && g_viewer3d.walk_mode) {
             g_viewer3d.walk_tick();
         }
+        if (wp == 9003) g_viewer3d.shot_tick();
         return 0;
     case WM_HSCROLL:
         if ((HWND)lp == g_viewer3d.anim_track) {
             int pos = (int)SendMessageA(g_viewer3d.anim_track, TBM_GETPOS, 0, 0);
             g_viewer3d.anim_set_frame(pos);
         }
+        return 0;
+    case WM_NOTIFY: {
+        /* Overlay tree: a checkbox changes after NM_CLICK / the space key
+           is handled, so its new state is read from a posted message */
+        NMHDR* nm = (NMHDR*)lp;
+        if (!g_viewer3d.ov_tree || nm->hwndFrom != g_viewer3d.ov_tree) break;
+        if (nm->code == NM_CLICK) {
+            TVHITTESTINFO ht;
+            memset(&ht, 0, sizeof(ht));
+            GetCursorPos(&ht.pt);
+            ScreenToClient(nm->hwndFrom, &ht.pt);
+            HTREEITEM h = TreeView_HitTest(nm->hwndFrom, &ht);
+            if (h && (ht.flags & TVHT_ONITEMSTATEICON)) PostMessageA(hwnd, WM_OV_TREE_CHECK, 0, (LPARAM)h);
+        } else if (nm->code == TVN_KEYDOWN && ((NMTVKEYDOWN*)lp)->wVKey == VK_SPACE) {
+            HTREEITEM h = TreeView_GetSelection(nm->hwndFrom);
+            if (h) PostMessageA(hwnd, WM_OV_TREE_CHECK, 0, (LPARAM)h);
+        } else if (nm->code == TVN_SELCHANGEDA) {
+            g_viewer3d.ov_tree_selected(((NMTREEVIEWA*)lp)->itemNew.lParam);
+        }
+        return 0;
+    }
+    case WM_OV_TREE_CHECK:
+        g_viewer3d.ov_tree_checked((HTREEITEM)lp);
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == 5001 && HIWORD(wp) == CBN_SELCHANGE) {

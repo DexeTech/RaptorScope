@@ -86,7 +86,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x39 */ {  4, "BGM_SET",       "Set background music",                       7 },
  /* 0x3A */ { 12, "LIGHT_SET",     "Scene light (position + color)",             3 },
  /* 0x3B */ {  4, "LIGHT_ADJ",     "Adjust light parameters",                    3 },
- /* 0x3C */ {  8, "LIGHT_COL",     "Set light color RGB",                        3 },
+ /* 0x3C */ {  8, "MODEL_OT",      "Model slot render mode + OT depth",          3 },
  /* 0x3D */ { 12, "UNK_3D",        "Unknown (12 bytes)",                         9 },
  /* 0x3E */ {  4, "ITEM_LOSE",     "Remove item from inventory",                 6 },
  /* 0x3F */ {  8, "ITEM_CK",       "Check item in inventory",                    6 },
@@ -98,7 +98,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x45 */ {  8, "POS_LOAD",      "Load position XYZ",                          4 },
  /* 0x46 */ {  8, "DIR_LOAD",      "Load direction XYZ",                         4 },
  /* 0x47 */ {  4, "ROT_LOAD",      "Load rotation angles",                       4 },
- /* 0x48 */ {  4, "EM_FLAG",       "Set enemy flags",                            4 },
+ /* 0x48 */ {  4, "SHOW",          "Show/hide work object (03 = model slot)",   4 },
  /* 0x49 */ {  4, "UNK_49",        "Unknown (4 bytes)",                          9 },
  /* 0x4A */ {  4, "UNK_4A",        "Unknown (4 bytes)",                          9 },
  /* 0x4B */ { 12, "CK_BIT",        "Check bit flag (conditional)",               0 },
@@ -149,6 +149,35 @@ static const char* g_scd_op28_names[12] = {
     "ZONE_DOOR",   "ZONE_CUT",    "ZONE_T6",     "ZONE_LIGHT",
     "ZONE_T8",     "ZONE_T9",     "ZONE_T10",    "ZONE_T11"
 };
+
+/* Size in bytes of the instruction at scd[pc] (0 = past scd_size). */
+static inline int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
+    if (pc >= scd_size) return 0;
+    u8 op = scd[pc];
+
+    if (op == 0x00) return 1;
+
+    /* 1-byte NOPs / control markers */
+    if (op == 0x10 || op == 0x11) return 1;
+    if (op >= 0x19 && op <= 0x1F) return 1;
+    if (op >= 0x70) return 1;
+
+    /* Relative branch */
+    if (op == 0x0C) return 4;
+    if (op == 0x0E) return 4;
+
+    /* Variable-size 0x28 */
+    if (op == 0x28) {
+        if (pc + 3 > scd_size) return 0;
+        u8 typ = scd[pc + 2];
+        if (typ < 12) return g_scd_op28_sizes[typ];
+        return 32; /* fallback */
+    }
+
+    /* Fixed-size table */
+    if (op < 0x70) return g_scd_opcodes[op].size;
+    return 1;
+}
 
 /* Category names (for color coding) */
 static const char* g_scd_cat_names[] = {

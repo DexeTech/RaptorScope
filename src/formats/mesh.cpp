@@ -2,6 +2,7 @@
  *  RaptorScope  -  3D Mesh Parsers (Room, Door, EMD)
  *═══════════════════════════════════════════════════════════════════*/
 #include "formats/mesh.h"
+#include "formats/scd.h"
 #include "core/lzss.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -586,7 +587,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
                 t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
                 t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
-                t.src_off = xf.section_off;
+                t.src_off = xf.section_off; t.slot = xf.slot;
                 new_tris.push(t);
             }
 
@@ -632,7 +633,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
                 t1.uv[1][0]=uvs[2][0]; t1.uv[1][1]=uvs[2][1];
                 t1.uv[2][0]=uvs[1][0]; t1.uv[2][1]=uvs[1][1];
-                t1.src_off = xf.section_off;
+                t1.src_off = xf.section_off; t1.slot = xf.slot;
                 new_tris.push(t1);
                 MeshTri t2 = {};
                 t2.idx[0]=bi+1; t2.idx[1]=bi+2; t2.idx[2]=bi+3;
@@ -640,7 +641,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
                 t2.uv[1][0]=uvs[2][0]; t2.uv[1][1]=uvs[2][1];
                 t2.uv[2][0]=uvs[3][0]; t2.uv[2][1]=uvs[3][1];
-                t2.src_off = xf.section_off;
+                t2.src_off = xf.section_off; t2.slot = xf.slot;
                 new_tris.push(t2);
             }
             off = quad_end;
@@ -1777,6 +1778,17 @@ bool compute_anim_frame(EmdModel& model, int clip_idx, int frame_idx)
 bool is_mips_code_dec(const u8* dec_data, size_t dec_size)
 {
     if (dec_size < 64) return false;
+
+    /* A room RDT starts with its table pointers (ptr[0..6]), all PSX RAM
+       addresses; as code that would be seven LB instructions in a row.
+       Without this, mesh data after the table that happens to look like
+       branches marked 13 rooms (ST304, ST504, ST611, ...) as code. */
+    int ram_ptrs = 0;
+    for (int i = 0; i < 7; i++) {
+        u32 p = rd_u32(dec_data + i * 4);
+        if (p >= 0x80000000u && p < 0x80200000u) ram_ptrs++;
+    }
+    if (ram_ptrs == 7) return false;
 
     int real_mips = 0;
     int nops = 0;
@@ -2949,6 +2961,97 @@ static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
     return added;
 }
 
+/* Enemy spawns (0x5B, 44 bytes).  The handler (0x42A96D) puts a character
+   into the same 0x260-byte character table as 0x20: byte[1] = character
+   slot, byte[2] = type (+0x27), byte[3] (+0x2F), position at +4/+6/+8,
+   rotation at +10, model and animation pointers at +12/+16; the game
+   writes its spawn progress back into the opcode at +0x22.  Found by
+   scanning the script area, as the walk misses spawns in branches the
+   walk skips (ST309, ST504 and five more).  Both pointers lie in the room
+   data and differ; mesh data that happens to match has them equal or a
+   slot past the table. */
+static int scan_enemy_spawns(const u8* dec, size_t scd_base, size_t scd_end, u32 base,
+                             size_t dec_size, RdtSceneOverlay& ov)
+{
+    int added = 0;
+    for (size_t pc = scd_base; pc + 44 <= scd_end && ov.n_items < 32; pc += 4) {
+        if (dec[pc] != 0x5B || dec[pc + 1] >= 32) continue;
+        u32 m = rd_u32(dec + pc + 12), a = rd_u32(dec + pc + 16);
+        if (m == a || m < base || a < base || m - base >= dec_size || a - base >= dec_size) continue;
+        RdtItemSpawn is;
+        is.slot     = dec[pc + 1];
+        is.type     = dec[pc + 2];
+        is.anim_set = dec[pc + 3];
+        is.px       = rd_s16(dec + pc + 4);
+        is.py       = rd_s16(dec + pc + 6);
+        is.pz       = rd_s16(dec + pc + 8);
+        is.rot_y    = rd_s16(dec + pc + 10);
+        is.mesh_ptr = m;
+        is.anim_ptr = a;
+        bool dup = false;
+        for (int i = 0; i < ov.n_items && !dup; i++) {
+            const RdtItemSpawn& o = ov.items[i];
+            dup = o.slot == is.slot && o.type == is.type && o.px == is.px && o.py == is.py &&
+                  o.pz == is.pz && o.rot_y == is.rot_y;
+        }
+        if (dup) continue;
+        ov.items[ov.n_items++] = is;
+        added++;
+    }
+    return added;
+}
+
+/* Camera setups: the model slots each camera shows and hides.  When the
+   game switches to camera N (cam_id of a ptr[3] descriptor) it runs script
+   thread N, which uses 0x48 03 <slot> <1|0> to set or clear the slot's
+   draw bit (sub_42883F; the room draw loop skips slots without it).  A
+   thread runs to the next thread's start or its 0x04. */
+static void scan_camera_views(const u8* dec, size_t scd_base, size_t scd_end,
+                              RdtSceneOverlay& ov)
+{
+    if (scd_base + 4 > scd_end) return;
+    u32 first = rd_u32(dec + scd_base);
+    if (first < 4 || (first & 3) || scd_base + first > scd_end) return;
+    int n_threads = (int)(first / 4);
+
+    for (int c = 0; c < ov.n_cam_threads && ov.n_cam_views < 32; c++) {
+        int id = ov.cam_threads[c].cam_id;
+        if (id == 0 || id >= n_threads) continue;
+        bool seen = false;
+        for (int v = 0; v < ov.n_cam_views && !seen; v++) seen = ov.cam_views[v].cam_id == id;
+        if (seen) continue;
+
+        size_t pc = scd_base + rd_u32(dec + scd_base + id * 4);
+        size_t end = scd_end;
+        for (int t = 0; t < n_threads; t++) {
+            size_t s = scd_base + rd_u32(dec + scd_base + t * 4);
+            if (s > pc && s < end) end = s;
+        }
+        RdtSceneOverlay::CamView cv;
+        memset(&cv, 0, sizeof(cv));
+        cv.cam_id = (u8)id;
+        while (pc + 4 <= end && dec[pc] != 0x04) {
+            if (dec[pc] == 0x48 && dec[pc + 1] == 3 && dec[pc + 2] < 64) {
+                u64 bit = (u64)1 << dec[pc + 2];
+                if (dec[pc + 3] == 1)      { cv.show_mask |= bit; cv.hide_mask &= ~bit; }
+                else if (dec[pc + 3] == 0) { cv.hide_mask |= bit; cv.show_mask &= ~bit; }
+            }
+            int n = scd_inst_size(dec, end, pc);
+            if (n <= 0) break;
+            pc += (size_t)n;
+        }
+        if (cv.hide_mask) ov.cam_views[ov.n_cam_views++] = cv;
+    }
+
+    /* In camera order, for cycling through them */
+    for (int i = 1; i < ov.n_cam_views; i++)
+        for (int j = i; j > 0 && ov.cam_views[j].cam_id < ov.cam_views[j - 1].cam_id; j--) {
+            RdtSceneOverlay::CamView t = ov.cam_views[j];
+            ov.cam_views[j] = ov.cam_views[j - 1];
+            ov.cam_views[j - 1] = t;
+        }
+}
+
 /* Adds a camera shot unless the same eye and target are already stored.
    The walk follows loops back over the same 0x4C/0x2E opcodes, and
    scripts repeat shots, so without this one shot can fill the table. */
@@ -3110,6 +3213,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     RdtSceneOverlay::CamThread& ct = ov.cam_threads[ov.n_cam_threads++];
                     ct.type = dec[td];
                     ct.cam_id = dec[td + 2];
+                    memcpy(ct.desc, dec + td, 68);
                     for (int c = 0; c < 4; c++) {
                         ct.x[c] = rd_s16(dec + td + 4 + c * 4);
                         ct.z[c] = rd_s16(dec + td + 4 + c * 4 + 2);
@@ -3172,6 +3276,8 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
         for (int i = 0; i < 7; i++)
             if (offs[i] > offs[5] && offs[i] < scd_end) scd_end = offs[i];
         if (scan_trigger_zones(dec, offs[5], scd_end, ov)) found++;
+        if (scan_enemy_spawns(dec, offs[5], scd_end, base, dec_size, ov)) found++;
+        scan_camera_views(dec, offs[5], scd_end, ov);
     }
 
     {
@@ -3213,26 +3319,29 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                    scan_section_placements, and 0x28 zones by
                    scan_trigger_zones, not by this walk.) */
 
-                /* 0x42: Entity spawn (20 bytes).
-                   byte[1]=slot, byte[2]=type, byte[3]=anim_set, byte[16]=entity_type.
-                   bytes[4..15] are 3 × u32 PSX pointers (mesh EMD, animation, spawn-table).
-                   The entity's POSITION is not in the opcode — it comes from an external
-                   type table in the exe (sub_429D3B), with random placement within a zone.
-                   We record the slot and type but do NOT generate spatial markers. */
-                if (op == 0x42 && pc + 20 <= dec_size && ov.n_enemies < 32) {
-                    RdtEnemySpawn& es = ov.enemies[ov.n_enemies];
-                    es.type  = dec[pc + 1];
-                    es.id    = dec[pc + 2];
+                /* 0x42: Object (20 bytes), handler 0x4284AD.  Fills a 0x7C-byte
+                   object record: byte[1] = record index (0xFF: any free one),
+                   byte[2] = object type (+0x27), byte[3] (+0x2F), position
+                   x/y/z = s16 at +4/+6/+8 (+0x20..), byte[10] = model source
+                   (2: room model, 3: model slot byte[11] & 15), u16 at +12
+                   (+0x2A), u32 at +16 (+0x68). */
+                if (op == 0x42 && pc + 20 <= dec_size && ov.n_enemies < RDT_MAX_OBJECTS) {
+                    RdtEnemySpawn es;
+                    es.type  = dec[pc + 2];
+                    es.id    = dec[pc + 1];
                     es.flags = dec[pc + 3];
-                    es.px    = rd_s16(dec + pc + 6);
-                    es.py    = rd_s16(dec + pc + 8);
-                    es.pz    = rd_s16(dec + pc + 10);
+                    es.px    = rd_s16(dec + pc + 4);
+                    es.py    = rd_s16(dec + pc + 6);
+                    es.pz    = rd_s16(dec + pc + 8);
                     es.rot_y = rd_s16(dec + pc + 12);
-                    /* Only add if position looks valid (not zero/garbage) */
-                    if (es.px != 0 || es.py != 0 || es.pz != 0) {
-                        ov.n_enemies++;
-                        found++;
+                    /* the walk can pass the same code more than once */
+                    bool dup = false;
+                    for (int k = 0; k < ov.n_enemies && !dup; k++) {
+                        const RdtEnemySpawn& o = ov.enemies[k];
+                        dup = o.type == es.type && o.id == es.id && o.flags == es.flags &&
+                              o.px == es.px && o.py == es.py && o.pz == es.pz && o.rot_y == es.rot_y;
                     }
+                    if (!dup) { ov.enemies[ov.n_enemies++] = es; found++; }
                 }
 
                 /* 0x3D: Fog/atmosphere effect (12 bytes) */
@@ -3345,23 +3454,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     }
                 }
 
-                /* 0x5B: Item/pickup spawn (44 bytes)
-                   byte[1]=slot, [2]=type, [3]=anim_set
-                   s16[+4]=px, [+6]=py, [+8]=pz, [+10]=rot_y
-                   u32[+12]=mesh_ptr, u32[+16]=anim_ptr */
-                if (op == 0x5B && pc + 44 <= dec_size && ov.n_items < 32) {
-                    RdtItemSpawn& is = ov.items[ov.n_items++];
-                    is.slot     = dec[pc + 1];
-                    is.type     = dec[pc + 2];
-                    is.anim_set = dec[pc + 3];
-                    is.px       = rd_s16(dec + pc + 4);
-                    is.py       = rd_s16(dec + pc + 6);
-                    is.pz       = rd_s16(dec + pc + 8);
-                    is.rot_y    = rd_s16(dec + pc + 10);
-                    is.mesh_ptr = rd_u32(dec + pc + 12);
-                    is.anim_ptr = rd_u32(dec + pc + 16);
-                    found++;
-                }
+                /* 0x5B enemy spawns are found by scan_enemy_spawns */
 
                 pc += (size_t)adv;
                 steps++;
@@ -3373,14 +3466,21 @@ done:
     return found > 0;
 }
 
-/* Zones and collision rects are flat XZ shapes, so the viewer draws them
-   on one floor plane.  Taking the most common vertex height picked the
-   ceiling in rooms like ST105, whose ceiling (raw Y -3000) has more
-   vertices than its floor (raw Y 0).  Only upward-facing horizontal faces
-   count as floor; points spread over each zone and rect vote for every
-   floor height beneath them, so a big platform or yard outside the
-   walkable area (ST613) does not win.  Rooms whose overlay covers no
-   floor fall back to the height with the most floor area. */
+/* Zones and collision rects are flat XZ shapes with no height of their
+   own, so the viewer draws each on the floor beneath it.  Taking the most
+   common vertex height picked the ceiling in rooms like ST105, whose
+   ceiling (raw Y -3000) has more vertices than its floor (raw Y 0).  Only
+   upward-facing horizontal faces count as floor; points spread over each
+   zone and rect vote for every floor height beneath them, so a big
+   platform or yard outside the walkable area (ST613) does not win.  Rooms
+   whose overlay covers no floor fall back to the height with the most
+   floor area.
+
+   That gives the room-wide floor.  A shape keeps it when it lies under at
+   least a third of the shape's points, so a desk or counter inside a zone
+   does not lift it.  Otherwise the shape is on another level (ST201's
+   balcony, ST202's platforms) and takes the floor under most of its
+   points, ties going to the height more shapes vote for. */
 static bool xz_in_tri(f32 px, f32 pz, const MeshVert& a, const MeshVert& b,
                       const MeshVert& c)
 {
@@ -3392,14 +3492,19 @@ static bool xz_in_tri(f32 px, f32 pz, const MeshVert& a, const MeshVert& b,
     return !(neg && pos);
 }
 
-f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& ov)
+void overlay_floor_heights(const Mesh& mesh, RdtSceneOverlay& ov)
 {
-    if (mesh.tri_count <= 0) return 0.0f;
+    ov.floor_y = 0.0f;
+    for (int i = 0; i < 64; i++)  ov.zone_y[i] = 0.0f;
+    for (int i = 0; i < 256; i++) ov.rect_y[i] = 0.0f;
+    for (int i = 0; i < 128; i++) ov.camcut_y[i] = 0.0f;
+    for (int i = 0; i < 32; i++)  ov.cam_thread_y[i] = 0.0f;
+    if (mesh.tri_count <= 0) return;
     int* ftri = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
     int* fh   = (int*)malloc((size_t)mesh.tri_count * sizeof(int));
-    if (!ftri || !fh) { free(ftri); free(fh); return 0.0f; }
+    if (!ftri || !fh) { free(ftri); free(fh); return; }
 
-    int h_y[256], h_votes[256];
+    int h_y[256], h_votes[256], h_cnt[256];
     f32 h_area[256];
     u8  h_hit[256];
     int n_h = 0, n_floor = 0;
@@ -3427,9 +3532,11 @@ f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& ov)
         ftri[n_floor] = fi; fh[n_floor] = hi; n_floor++;
     }
 
-    /* 3x3 sample points across a quad (corners in drawing order) */
-    auto vote = [&](const f32 qx[4], const f32 qz[4]) {
+    /* 3x3 sample points across a quad (corners in drawing order);
+       h_cnt[h] = how many of them have floor height h beneath */
+    auto sample = [&](const f32 qx[4], const f32 qz[4]) {
         static const f32 s[3] = { 0.25f, 0.5f, 0.75f };
+        memset(h_cnt, 0, (size_t)n_h * sizeof(int));
         for (int u = 0; u < 3; u++)
             for (int w = 0; w < 3; w++) {
                 f32 x0 = qx[0] + (qx[1] - qx[0]) * s[u], z0 = qz[0] + (qz[1] - qz[0]) * s[u];
@@ -3442,30 +3549,69 @@ f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& ov)
                     if (xz_in_tri(px, pz, mesh.verts[t.idx[0]], mesh.verts[t.idx[1]],
                                   mesh.verts[t.idx[2]])) {
                         h_hit[fh[k]] = 1;
-                        h_votes[fh[k]]++;
+                        h_cnt[fh[k]]++;
                     }
                 }
             }
     };
-    for (int i = 0; i < ov.n_zones; i++) {
-        f32 qx[4], qz[4];
+    auto zone_quad = [&](int i, f32 qx[4], f32 qz[4]) {
         for (int c = 0; c < 4; c++) { qx[c] = -(f32)ov.zones[i].x[c]; qz[c] = (f32)ov.zones[i].z[c]; }
-        vote(qx, qz);
+    };
+    auto rect_quad = [](s16 x, s16 z, s16 w, s16 h, f32 qx[4], f32 qz[4]) {
+        f32 x0 = -(f32)x, x1 = -(f32)(x + w), z0 = (f32)z, z1 = (f32)(z + h);
+        qx[0] = x0; qx[1] = x1; qx[2] = x1; qx[3] = x0;
+        qz[0] = z0; qz[1] = z0; qz[2] = z1; qz[3] = z1;
+    };
+    f32 qx[4], qz[4];
+    for (int i = 0; i < ov.n_zones; i++) {
+        zone_quad(i, qx, qz);
+        sample(qx, qz);
+        for (int h = 0; h < n_h; h++) h_votes[h] += h_cnt[h];
     }
     for (int i = 0; i < ov.n_collisions; i++) {
         const RdtCollisionRect& r = ov.collisions[i];
-        f32 x0 = -(f32)r.x, x1 = -(f32)(r.x + (s16)r.w);
-        f32 z0 = (f32)r.z,  z1 = (f32)(r.z + (s16)r.h);
-        f32 qx[4] = { x0, x1, x1, x0 }, qz[4] = { z0, z0, z1, z1 };
-        vote(qx, qz);
+        rect_quad(r.x, r.z, (s16)r.w, (s16)r.h, qx, qz);
+        sample(qx, qz);
+        for (int h = 0; h < n_h; h++) h_votes[h] += h_cnt[h];
     }
 
+    auto ranks_above = [&](int a, int b) {
+        return h_votes[a] > h_votes[b] || (h_votes[a] == h_votes[b] && h_area[a] > h_area[b]);
+    };
     int best = -1;
     for (int h = 0; h < n_h; h++)
-        if (best < 0 || h_votes[h] > h_votes[best] ||
-            (h_votes[h] == h_votes[best] && h_area[h] > h_area[best])) best = h;
+        if (best < 0 || ranks_above(h, best)) best = h;
+    if (best < 0) { free(ftri); free(fh); return; }
+    ov.floor_y = (f32)h_y[best];
+
+    auto pick = [&](const f32 px[4], const f32 pz[4]) -> f32 {
+        sample(px, pz);
+        if (h_cnt[best] >= 3) return ov.floor_y;
+        int p = -1;
+        for (int h = 0; h < n_h; h++)
+            if (h_cnt[h] > 0 && (p < 0 || h_cnt[h] > h_cnt[p] ||
+                                 (h_cnt[h] == h_cnt[p] && ranks_above(h, p)))) p = h;
+        return p >= 0 ? (f32)h_y[p] : ov.floor_y;
+    };
+    for (int i = 0; i < ov.n_zones; i++) {
+        zone_quad(i, qx, qz);
+        ov.zone_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_collisions; i++) {
+        const RdtCollisionRect& r = ov.collisions[i];
+        rect_quad(r.x, r.z, (s16)r.w, (s16)r.h, qx, qz);
+        ov.rect_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_camcuts; i++) {
+        const RdtCameraCutZone& cc = ov.camcuts[i];
+        rect_quad(cc.x, cc.z, cc.w, cc.h, qx, qz);
+        ov.camcut_y[i] = pick(qx, qz);
+    }
+    for (int i = 0; i < ov.n_cam_threads; i++) {
+        for (int c = 0; c < 4; c++) { qx[c] = -(f32)ov.cam_threads[i].x[c]; qz[c] = (f32)ov.cam_threads[i].z[c]; }
+        ov.cam_thread_y[i] = pick(qx, qz);
+    }
     free(ftri); free(fh);
-    return best >= 0 ? (f32)h_y[best] : 0.0f;
 }
 
 /*═══════════════════════════════════════════════════════════════════
@@ -3532,6 +3678,95 @@ int collect_texture_usage(const DatArchive& archive, TexFaceUse** out)
 
     *out = faces;
     return count;
+}
+
+/*═══════════════════════════════════════════════════════════════════
+ *  Camera shots (ptr[3] descriptors)
+ *
+ *  Each frame the game calls the handler for the active descriptor's
+ *  type (table at 0x645FA8), which builds a target and an eye and passes
+ *  them to sub_423EB7 in that order.  Angles are 4096 to a turn; the
+ *  rotations are libgte's RotMatrixY (rows c,0,s / 0,1,0 / -s,0,c) and
+ *  RotMatrixX (1,0,0 / 0,c,-s / 0,s,c).  The player position is the one
+ *  at +0x20 of the player work (y = floor height, up is negative).
+ *═══════════════════════════════════════════════════════════════════*/
+static f32 cam_rad(f32 a) { return a * 6.2831853f / 4096.0f; }
+
+/* Ry(yaw) * Rx(pitch) * (0,0,d), as sub_5F3700 + ApplyMatrixSV */
+static void cam_orbit(f32 yaw, f32 pitch, f32 d, f32 out[3])
+{
+    f32 sy = sinf(cam_rad(yaw)), cy = cosf(cam_rad(yaw));
+    f32 sp = sinf(cam_rad(pitch)), cp = cosf(cam_rad(pitch));
+    out[0] = sy * cp * d;
+    out[1] = -sp * d;
+    out[2] = cy * cp * d;
+}
+
+static f32 cam_atan2(f32 y, f32 x) { return atan2f(y, x) * 4096.0f / 6.2831853f; }
+
+int rdt_camera_shot(const u8* d, const f32 p[3], f32 eye[3], f32 tgt[3])
+{
+    #define S16(o) ((f32)rd_s16(d + (o)))
+    #define U16(o) ((f32)rd_u16(d + (o)))
+    f32 v[3];
+    switch (d[0]) {
+    case 1: case 34: case 35:      /* fixed: target +0x2C, eye +0x34 */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        eye[0] = S16(0x34); eye[1] = S16(0x36); eye[2] = S16(0x38);
+        return RDT_SHOT_FIXED;
+    case 3:                        /* fixed eye watching the player */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x34); tgt[2] = p[2];
+        eye[0] = S16(0x2C); eye[1] = S16(0x2E); eye[2] = S16(0x30);
+        return RDT_SHOT_TRACKING;
+    case 4: case 31: {             /* orbit a fixed target, facing the player */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        f32 yaw = cam_atan2(tgt[0] - p[0], tgt[2] - p[2]) + 0x800;
+        if (d[0] == 4) {
+            cam_orbit(yaw, cam_atan2(-S16(0x36), U16(0x34)), -S16(0x34), v);
+        } else {
+            f32 dx = p[0] - tgt[0], dy = p[1] - tgt[1], dz = p[2] - tgt[2];
+            cam_orbit(yaw, cam_atan2(S16(0x36), sqrtf(dx * dx + dy * dy + dz * dz)), S16(0x34), v);
+        }
+        for (int k = 0; k < 3; k++) eye[k] = tgt[k] + v[k];
+        return RDT_SHOT_TRACKING;
+    }
+    case 7:                        /* chase at a fixed yaw */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x2C); tgt[2] = p[2];
+        cam_orbit(S16(0x2A), 0, -S16(0x30), v);
+        eye[0] = p[0] + v[0]; eye[1] = p[1] - S16(0x2E); eye[2] = p[2] + v[2];
+        return RDT_SHOT_TRACKING;
+    case 8: case 9:                /* slide along z (8) or x (9) with the player */
+        if (d[0] == 8) { tgt[0] = S16(0x2C); tgt[2] = p[2]; }
+        else           { tgt[0] = p[0];      tgt[2] = S16(0x2C); }
+        tgt[1] = p[1] - S16(0x32);
+        cam_orbit(-S16(0x30), 0, -S16(0x2E), v);
+        eye[0] = tgt[0] + v[0]; eye[1] = tgt[1] - S16(0x34); eye[2] = tgt[2] + v[2];
+        return RDT_SHOT_TRACKING;
+    case 17: case 18: {            /* side-on: one axis fixed, the other follows */
+        tgt[0] = p[0]; tgt[1] = p[1] - S16(0x32); tgt[2] = p[2];
+        eye[1] = tgt[1] - S16(0x34);
+        int a = rd_u16(d + 0x30) & 0xFFF;
+        if (d[0] == 17) {
+            eye[0] = S16(0x2C);
+            eye[2] = (a > 0x400 && a < 0xC00) ? p[2] + S16(0x2E) : p[2] - S16(0x2E);
+        } else {
+            eye[0] = (rd_u16(d + 0x30) & 0x800) ? p[0] + S16(0x2E) : p[0] - S16(0x2E);
+            eye[2] = S16(0x2C);
+        }
+        return RDT_SHOT_TRACKING;
+    }
+    case 26: {                     /* eye on the rail A-B, in line with target and player */
+        tgt[0] = S16(0x2C); tgt[1] = S16(0x2E); tgt[2] = S16(0x30);
+        f32 a[3] = { S16(0x34), S16(0x36), S16(0x38) }, b[3] = { S16(0x3C), S16(0x3E), S16(0x40) };
+        f32 den = (b[0] - a[0]) * (tgt[2] - p[2]) - (b[2] - a[2]) * (tgt[0] - p[0]);
+        f32 t = den != 0 ? ((tgt[0] - p[0]) * (a[2] - p[2]) - (tgt[2] - p[2]) * (a[0] - p[0])) / den : 0;
+        for (int k = 0; k < 3; k++) eye[k] = a[k] + (b[k] - a[k]) * t;
+        return RDT_SHOT_TRACKING;
+    }
+    }
+    #undef S16
+    #undef U16
+    return RDT_SHOT_NONE;   /* 0 and unused types; 10/11/19-21/32/33 shift the previous shot */
 }
 
 #include "emd_glb.inc"

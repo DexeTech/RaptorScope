@@ -43,11 +43,13 @@ The tool reconstructs the PSX GPU rendering pipeline in software — including 4
 ### 3D Room Viewer
 - **Full room geometry** reconstructed from RDT (Room Data Table) files, including the two rooms that store their RDT uncompressed (ST50B, ST60E)
 - **Mixed BPP rendering**: 4bpp and 8bpp textures coexist in a single atlas via 2D sparse sub-palette allocation
-- **SCD script walker**: Parses bytecode to extract camera shots (0x4C, and its short form 0x2E), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
+- **SCD script walker**: Parses bytecode to extract camera shots (0x4C, and its short form 0x2E), objects (0x42: a type and position for each, mostly effect objects such as the 80 by ST10A's broken window), enemy spawns (0x5B), and scene lights (0x3A)
 - **Trigger zones**: Every 0x28 zone in the script area is found by scanning it, not by the walk, so zones set after an 0x01 (such as ST103's door triggers) are shown
 - **Scripted placement**: The room is built the way the game builds it — only the sections its scripts place into model slots are drawn. Placements (0x23, and item pickup zones 0x28 type 4) are found by scanning the whole script area, then later script writes to the slot (0x2A, 0x36, 0x37) adjust position and rotation, e.g. lifting items onto desks
 - **Item pickup models**: Type-4 zones (0x28) put their item model at the zone centre, as the game does
 - **Unplaced sections (H key)**: Sections the game stores but never places (unused leftovers, such as an unused DDK in ST103) are hidden by default; **H** shows them tinted magenta at their raw positions
+- **Game cameras (K key)**: **K** steps through the room's camera shots (**Shift+K** back). Each shot puts the view where the game puts its camera, with the game's field of view (H=320 on a 320x240 screen); the game's 4:3 frame is outlined with the area outside it dimmed, and the trigger zone that switches to the shot is outlined. Scrolling widens or narrows the view around the frame without moving the eye. Most rooms also keep a separate copy of their walls for each camera, and the camera's setup thread (script thread N for camera N) shows only its own copies with 0x48 03 <slot> <0/1>, so in a shot only that camera's sections are drawn, as in the game. Drawing every section at once, the default, shows details that differ between copies twice, such as ST10A's corkboard
+- **Walking through shots**: Each shot starts with a player marker in the middle of its trigger zone. **WASD** or the **arrow keys** walk it along the floor (**Shift** runs); shots that follow the player (fixed cameras that turn to watch her, cameras that slide along a corridor, side-on, orbiting and rail cameras) follow it as the game's camera handler would, and walking into another shot's trigger zone cuts to that shot. Dragging the view leaves the shot to orbit freely: the game camera is then drawn as its eye and view pyramid, which keeps following the player, and **J** goes back onto the shot. Shots that only shift the previous camera (types 10, 11, 19-21, 32, 33) have no position of their own; K still shows their sections
 - **Outdoor scenes**: Sky domes and sea planes out to ±32,000 units are kept; the camera frames the walkable area and the far clip plane reaches the sky
 - **PSX-accurate transparency**: 0x0000 masking, 0x8000 transparent black, STP semi-transparency for 4bpp decals (blood splatters)
 - **PSX vertex color modulation**: 2x scaling to match hardware `(tex * vtx) / 128` behavior
@@ -75,15 +77,26 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 | Light Blue | Zone type 1 (0x28) |
 | Yellow | Zone types 2/3 (0x28) |
 | Cyan | Item pickup zones, type 4 (0x28) |
-| Purple | Floor elevation zones (ptr[6]) |
+| Purple | Zones of other types (0x28) |
+| Yellow (flat) | Floor zones (ptr[6]) |
 | Violet | Camera cut zones (ptr[2]) |
 | Gold | Scene lights (0x3A + ptr[0]) |
-| Blue dot | Camera eye position (0x4C, 0x2E) |
-| Red dot | Camera target (0x4C, 0x2E) |
-| White diamond | Item pickup (0x5B) |
+| Blue dot | Script camera eye position (0x4C, 0x2E) |
+| Red dot | Script camera target (0x4C, 0x2E) |
+| Dashed | Camera trigger zones (ptr[3]), coloured per camera |
+| Red X | Enemy spawn (0x5B); found by scanning the script area, as some sit in branches the script walk skips |
+| White star | Object (0x42) |
 | Orange dot | Character spawn (0x20) |
+| Pale blue rings | Fog (0x3D) |
 
-Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the height of the upward-facing horizontal faces that lie under them (a ceiling never counts, even when it has more geometry than the floor, as in ST105).
+Zones and rectangles carry only X/Z, so each is drawn on the floor beneath it: the height of the upward-facing horizontal faces that lie under it (a ceiling never counts, even when it has more geometry than the floor, as in ST105). A shape over the room's main floor stays on it, so a desk or counter inside a zone does not lift it; a shape on another level, such as ST201's balcony or ST202's platforms, is drawn at that level.
+
+**Overlay elements panel**: while the overlay is on, a panel on the right of the view lists the room's overlay elements by type, with a count for each:
+- Untick a type to hide all of it, such as every camera or every enemy spawn.
+- Expand a type to tick or untick single elements, such as only Camera 3 in ST10A. Cameras are listed by the number **K** shows, and each covers the trigger zones that switch the game to it.
+- Click a row to highlight that element in white, with a tall pin above it.
+- The legend lists only the types that are shown and present in the room.
+- A hidden type stays hidden when you open another room; single elements are shown again.
 
 ### Character Model Viewer
 - EMD model parsing with skeletal hierarchy
@@ -215,7 +228,7 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 The room initialization script (ptr[5]) uses a multi-threaded virtual machine:
 
 - **Thread table**: Array of u32 offsets from SCD base; the first offset / 4 is the thread count
-- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x42 (entity spawn), 0x4C (camera entry), 0x5B (item pickup)
+- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x3C (model slot render mode and OT depth), 0x48 (show/hide; type 3 = model slot), 0x42 (object: type at +2, position at +4/+6/+8), 0x4C (camera entry), 0x5B (enemy spawn: character slot +1, type +2, position +4/+6/+8, rotation +10, model and animation +12/+16; handler 0x42A96D)
 - **Opcode 0x23** (32 bytes): Places a mesh section into a model slot at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe; the opcode dispatch table starts at VA `0x006576A0` (the two words before it are 0 and 1)
 - **Opcode 0x28** (size by type): a zone's four XZ corners at +4..+19; a real zone repeats its type at +20 and has 1 at +23, which no other 0x28 byte in the scripts does
 - **Opcode 0x28 type 4** (44 bytes): Item pickup zone. Its model (slot at +34, section at +36) is placed on the floor at the zone centre (`sub_426DFC` → `sub_448E3B`) and spins while the item is there
@@ -257,8 +270,11 @@ The tool composites all archive textures into a single OpenGL atlas using 2D spa
 | **T** | Toggle textured rendering |
 | **V** | Toggle vertex colors |
 | **C** | Toggle backface culling (see-through room faces such as fences and the signs painted on them are always drawn from both sides, as the game does) |
-| **O** | Toggle overlay visualization |
+| **O** | Toggle overlay visualization and its elements panel |
 | **H** | Show/hide unplaced (unused) room sections |
+| **K** / **Shift+K** | Next / previous game camera shot (its view, field of view and sections) |
+| **WASD** / **Arrow keys** | On a shot, walk the player the camera follows (**Shift**: run); W toggles wireframe only when no shot is selected |
+| **J** | Back onto the shot after orbiting away or scrolling |
 | **I** | Toggle room scene lights |
 | **N** | Toggle vertex normal display |
 | **G** | Toggle ground grid |

@@ -12,35 +12,6 @@ static u16 rd16(const u8* p) { return p[0] | (p[1] << 8); }
 static u32 rd32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 static s16 rs16(const u8* p) { return (s16)rd16(p); }
 
-/* Get instruction size for a given opcode at pc (0 = past the end). */
-static int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
-    if (pc >= scd_size) return 0;
-    u8 op = scd[pc];
-
-    if (op == 0x00) return 1;
-
-    /* 1-byte NOPs / control markers */
-    if (op == 0x10 || op == 0x11) return 1;
-    if (op >= 0x19 && op <= 0x1F) return 1;
-    if (op >= 0x70) return 1;
-
-    /* Relative branch */
-    if (op == 0x0C) return 4;
-    if (op == 0x0E) return 4;
-
-    /* Variable-size 0x28 */
-    if (op == 0x28) {
-        if (pc + 3 > scd_size) return 0;
-        u8 typ = scd[pc + 2];
-        if (typ < 12) return g_scd_op28_sizes[typ];
-        return 32; /* fallback */
-    }
-
-    /* Fixed-size table */
-    if (op < 0x70) return g_scd_opcodes[op].size;
-    return 1;
-}
-
 /* Format hex bytes */
 static void fmt_hex(char* buf, size_t bufsz, const u8* data, int len) {
     buf[0] = 0;
