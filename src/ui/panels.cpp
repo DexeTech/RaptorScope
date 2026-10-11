@@ -586,7 +586,7 @@ void ImagePanel::paint(HDC hdc, RECT& rc) {
             int pct = (int)(zoom * 100.0 + 0.5);
             const char* face_hint = (!face_cluts && n_face_uses > 0) ? "  [C: room CLUTs]" : "";
             if (showing_face_cluts)
-                _snprintf(info, 127, "%dx%d  %d%%  CLUTs from room faces, unused areas dimmed [C: single CLUT]",
+                _snprintf(info, 127, "%dx%d  %d%%  CLUTs from room faces, areas no 3D face uses dimmed [C: single CLUT]",
                           img_w, img_h, pct);
             else if (max_pal_rows > 1)
                 _snprintf(info, 127, "%dx%d  %d%%  CLUT %d/%d [Up/Down]%s",
