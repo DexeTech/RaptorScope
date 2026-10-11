@@ -178,7 +178,6 @@ Ordered with memory safety and data loss first.
 - **B25** **An empty placed section draws its neighbour (verify).**
   - The one-section loop in `mesh_apply_xforms` `continue`s past an empty header, so the next section is drawn with that placement.
   - Only the Y rotation is applied. The rx/rz values set by 0x23, 0x2A fields 6/8 and 0x37 are ignored.
-- **B26** **Zone kind depends on a data byte.** ptr[6] floor zones and 0x28 trigger zones share `RdtSceneOverlay::zones[64]` and are told apart by `flags == 0x28`. Floor zones copy `flags` from data byte +18, so a floor zone with 0x28 there shows as a trigger zone.
 - **B27** **Door meshes may render inside out (verify).**
   - `parse_door_mesh_dec` keeps the source winding, while the room parsers reverse it for the same axis flip.
   - Doors render through `set_mesh` with counter-clockwise culling, so their front faces may be culled.
@@ -261,7 +260,7 @@ Ordered with memory safety and data loss first.
 - **P4** **UV editor sort is quadratic.** `ShowUVEditor` uses an O(n²) insertion sort, commented "small N", though rooms have 10K+ faces.
 - **P5** **Fixed limits drop data silently.** The limits are:
   - 64 placements/sections (slot masks are u64)
-  - 64 zones shared by two kinds (B26)
+  - 64 zones shared by floor zones and 0x28 trigger zones
   - 32 cameras and 16 characters
   - 16 textures and 16 palettes in the atlas and the face-CLUT renderer
   - 16 EMDs per entry, and 64 `g_emd_info` entries (beyond that, selecting EMD n shows EMD 1)

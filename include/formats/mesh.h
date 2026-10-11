@@ -321,15 +321,17 @@ const char* get_bone_name(int bone_count, int bone_idx);
  *    op 0x28 (var) – collision zone setup
  *═══════════════════════════════════════════════════════════════════*/
 
-/*─── Floor zone (trigger/transition quad) ──────────────────────*/
+/*─── Zone: a ptr[6] floor zone or an SCD 0x28 trigger zone ─────*/
+enum { RDT_ZONE_FLOOR = 0, RDT_ZONE_TRIGGER = 1 };
+
 struct RdtFloorZone {
     s16 x[4], z[4];          /* 4 corner XZ coords (world-space) */
     s16 y;                    /* floor Y position */
     s16 height;               /* zone height above Y (0 = flat) */
-    u8  collision_group;
-    u8  target_index;         /* type for 0x28 zones */
-    u8  flags;                /* 0x28 = SCD trigger zone */
-    u8  pad;
+    u8  collision_group;      /* floor zone: level, matched against the walker's +0x48; 0x28 zone: zone slot */
+    u8  target_index;         /* floor zone: footstep step (sound 0xB0 + 2 * step); 0x28 zone: type */
+    u8  flags;                /* floor zone: record byte +18 (0 in every room); 0x28 zone: 0 */
+    u8  kind;                 /* RDT_ZONE_FLOOR or RDT_ZONE_TRIGGER, set by the parser that adds it */
 };
 
 /*─── Collision rectangle ───────────────────────────────────────*/

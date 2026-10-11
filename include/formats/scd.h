@@ -126,7 +126,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x61 */ {  4, "UNK_61",        "Unknown (4 bytes)",                          9 },
  /* 0x62 */ {  8, "UNK_62",        "Unknown (8 bytes)",                          9 },
  /* 0x63 */ {  8, "UNK_63",        "Unknown (8 bytes)",                          9 },
- /* 0x64 */ {  4, "UNK_64",        "Unknown (4 bytes)",                          9 },
+ /* 0x64 */ {  4, "FLOOR_STEP",    "Set floor zone +1's footstep step to +2",    3 },
  /* 0x65 */ {  4, "UNK_65",        "Unknown (4 bytes)",                          9 },
  /* 0x66 */ {  4, "UNK_66",        "Unknown (4 bytes)",                          9 },
  /* 0x67 */ {  8, "SYS_A",         "System command A",                           9 },

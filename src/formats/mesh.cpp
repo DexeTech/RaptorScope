@@ -3053,11 +3053,11 @@ static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
         }
         z.collision_group = dec[pc + 1];   /* zone slot */
         z.target_index    = typ;
-        z.flags           = 0x28;
+        z.kind            = RDT_ZONE_TRIGGER;
         bool dup = false;
         for (int i = 0; i < ov.n_zones && !dup; i++) {
             const RdtFloorZone& o = ov.zones[i];
-            dup = o.flags == 0x28 && o.target_index == typ &&
+            dup = o.kind == RDT_ZONE_TRIGGER && o.target_index == typ &&
                   memcmp(o.x, z.x, sizeof(z.x)) == 0 && memcmp(o.z, z.z, sizeof(z.z)) == 0;
         }
         if (dup) continue;
@@ -3301,7 +3301,16 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
         }
     }
 
-    /* ─── Floor Zones (ptr[6]) ─── */
+    /* ─── Floor Zones (ptr[6]) ───
+     * Areas where footsteps play another sound.  The room loader copies
+     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a u32 count, then 20-byte
+     * records of four XZ corners, a level at +16 and a step at +17.  The
+     * footstep player (0x40B8A9, called from the walk code at 0x45ACA0 with
+     * sound 0xB0 or 0xB1) adds 2 * step to the sound when the walker's +0x48
+     * equals the level and its position is inside the quad.  Opcode 0x64
+     * (0x42BE92) sets record N's step, as ST100 does to turn its two zones on.
+     * ST300's one zone switches to sounds 0xB2/0xB3, which the PC build's
+     * sound list for that room (DINO.exe 0x62A4C8) does not have. */
     {
         size_t zo = offs[6];
         if (zo + 4 <= dec_size) {
@@ -3320,6 +3329,7 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                     z.collision_group = dec[rec + 16];
                     z.target_index    = dec[rec + 17];
                     z.flags           = dec[rec + 18];
+                    z.kind            = RDT_ZONE_FLOOR;
                 }
                 found++;
             }

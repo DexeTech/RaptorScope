@@ -2473,7 +2473,7 @@ static void ov_pin(f32 x, f32 y, f32 z) {
 
 static void ov_draw_zone(const RdtSceneOverlay& ov, int i) {
     const RdtFloorZone& z = ov.zones[i];
-    if (z.flags == 0x28) {
+    if (z.kind == RDT_ZONE_TRIGGER) {
         /* SCD 0x28 zone — color by type number.
            Type only determines data layout size, not gameplay role.
            Only type 4 is confirmed as door (exe calls sub_426DFC). */
@@ -2494,7 +2494,7 @@ static void ov_draw_zone(const RdtSceneOverlay& ov, int i) {
     f32 y0 = ov.zone_y[i] + -(f32)z.y;
     f32 y1 = y0 + (f32)z.height;
 
-    if (z.height > 0 && z.flags == 0x28) {
+    if (z.height > 0 && z.kind == RDT_ZONE_TRIGGER) {
         /* 3D wireframe box: floor quad + ceiling quad + verticals */
         /* Floor */
         glBegin(GL_LINE_LOOP);
@@ -2786,7 +2786,7 @@ static void build_overlay_list(int list_id, const RdtSceneOverlay& ov, const Ove
 
     /* Drawn in this order, later types on top (no depth test) */
     for (int i = 0; i < ov.n_zones; i++) {
-        int t = ov.zones[i].flags == 0x28 ? OverlayVis::TRIGGERS : OverlayVis::FLOOR_ZONES;
+        int t = ov.zones[i].kind == RDT_ZONE_TRIGGER ? OverlayVis::TRIGGERS : OverlayVis::FLOOR_ZONES;
         if (vis.shown(t, i)) ov_draw(ov, t, i);
     }
     static const int order[] = {
@@ -3506,12 +3506,12 @@ void ViewerPanel3D::fill_ov_tree() {
         case OverlayVis::FLOOR_ZONES:
             for (int i = 0; i < ov.n_zones; i++) {
                 const RdtFloorZone& z = ov.zones[i];
-                if ((z.flags == 0x28) != (t == OverlayVis::TRIGGERS)) continue;
+                if ((z.kind == RDT_ZONE_TRIGGER) != (t == OverlayVis::TRIGGERS)) continue;
                 if (t == OverlayVis::TRIGGERS)
                     _snprintf(buf, sizeof(buf) - 1, "#%d  type %d%s", n + 1, z.target_index,
                               z.target_index == 4 ? " (item)" : "");
                 else
-                    _snprintf(buf, sizeof(buf) - 1, "#%d", n + 1);
+                    _snprintf(buf, sizeof(buf) - 1, "#%d  step %d", n + 1, z.target_index);
                 OV_ITEM(i);
             }
             break;
@@ -4829,7 +4829,7 @@ void ViewerPanel3D::render() {
             default:
                 for (int i = 0; i < ov.n_zones; i++) {
                     const RdtFloorZone& z = ov.zones[i];
-                    if ((z.flags == 0x28) != (row.type == OverlayVis::TRIGGERS)) continue;
+                    if ((z.kind == RDT_ZONE_TRIGGER) != (row.type == OverlayVis::TRIGGERS)) continue;
                     int zt = z.target_index;
                     if (row.zone < 0 || zt == row.zone || (row.zone == 23 && (zt == 2 || zt == 3)) ||
                         (row.zone == 5 && zt > 4)) n++;
