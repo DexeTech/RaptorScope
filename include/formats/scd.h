@@ -86,7 +86,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x39 */ {  4, "BGM_SET",       "Set background music",                       7 },
  /* 0x3A */ { 12, "LIGHT_SET",     "Scene light (position + color)",             3 },
  /* 0x3B */ {  4, "LIGHT_ADJ",     "Adjust light parameters",                    3 },
- /* 0x3C */ {  8, "LIGHT_COL",     "Set light color RGB",                        3 },
+ /* 0x3C */ {  8, "MODEL_OT",      "Model slot render mode + OT depth",          3 },
  /* 0x3D */ { 12, "UNK_3D",        "Unknown (12 bytes)",                         9 },
  /* 0x3E */ {  4, "ITEM_LOSE",     "Remove item from inventory",                 6 },
  /* 0x3F */ {  8, "ITEM_CK",       "Check item in inventory",                    6 },
@@ -98,7 +98,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x45 */ {  8, "POS_LOAD",      "Load position XYZ",                          4 },
  /* 0x46 */ {  8, "DIR_LOAD",      "Load direction XYZ",                         4 },
  /* 0x47 */ {  4, "ROT_LOAD",      "Load rotation angles",                       4 },
- /* 0x48 */ {  4, "EM_FLAG",       "Set enemy flags",                            4 },
+ /* 0x48 */ {  4, "SHOW",          "Show/hide work object (03 = model slot)",   4 },
  /* 0x49 */ {  4, "UNK_49",        "Unknown (4 bytes)",                          9 },
  /* 0x4A */ {  4, "UNK_4A",        "Unknown (4 bytes)",                          9 },
  /* 0x4B */ { 12, "CK_BIT",        "Check bit flag (conditional)",               0 },
@@ -126,7 +126,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x61 */ {  4, "UNK_61",        "Unknown (4 bytes)",                          9 },
  /* 0x62 */ {  8, "UNK_62",        "Unknown (8 bytes)",                          9 },
  /* 0x63 */ {  8, "UNK_63",        "Unknown (8 bytes)",                          9 },
- /* 0x64 */ {  4, "UNK_64",        "Unknown (4 bytes)",                          9 },
+ /* 0x64 */ {  4, "FLOOR_STEP",    "Set floor zone +1's footstep step to +2",    3 },
  /* 0x65 */ {  4, "UNK_65",        "Unknown (4 bytes)",                          9 },
  /* 0x66 */ {  4, "UNK_66",        "Unknown (4 bytes)",                          9 },
  /* 0x67 */ {  8, "SYS_A",         "System command A",                           9 },
@@ -149,6 +149,69 @@ static const char* g_scd_op28_names[12] = {
     "ZONE_DOOR",   "ZONE_CUT",    "ZONE_T6",     "ZONE_LIGHT",
     "ZONE_T8",     "ZONE_T9",     "ZONE_T10",    "ZONE_T11"
 };
+
+/* Size in bytes of the instruction at scd[pc] (0 = past scd_size). */
+static inline int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
+    if (pc >= scd_size) return 0;
+    u8 op = scd[pc];
+
+    if (op == 0x00) return 1;
+
+    /* 1-byte NOPs / control markers */
+    if (op == 0x10 || op == 0x11) return 1;
+    if (op >= 0x19 && op <= 0x1F) return 1;
+    if (op >= 0x70) return 1;
+
+    /* Relative branch */
+    if (op == 0x0C) return 4;
+    if (op == 0x0E) return 4;
+
+    /* Variable-size 0x28 */
+    if (op == 0x28) {
+        if (pc + 3 > scd_size) return 0;
+        u8 typ = scd[pc + 2];
+        if (typ < 12) return g_scd_op28_sizes[typ];
+        return 32; /* fallback */
+    }
+
+    /* Fixed-size table */
+    if (op < 0x70) return g_scd_opcodes[op].size;
+    return 1;
+}
+
+/* End of the thread that starts at start; offsets are from the SCD start.
+   0x01 and 0x0A are ordinary 4-byte opcodes, not thread ends: every
+   thread in the game decodes straight through to the start of the next
+   one, and every thread finishes with 0x04 00 00 00.  So a thread runs to
+   the next thread's start.  The last thread has message text after it in
+   the same block; it ends at the first 0x04 that no earlier jump
+   (0x0C/0x0D/0x0E) lands beyond.  On the other threads, whose ends are
+   known, that rule is exact for 2713 of 2735. */
+static inline size_t scd_thread_end(const u8* scd, size_t scd_size,
+                                    const u32* thread_offsets, int n_threads,
+                                    size_t start)
+{
+    size_t next = scd_size;
+    for (int i = 0; i < n_threads; i++)
+        if (thread_offsets[i] > start && thread_offsets[i] < next)
+            next = thread_offsets[i];
+    if (next < scd_size) return next;
+
+    size_t pc = start, reach = start;
+    while (pc < scd_size) {
+        int sz = scd_inst_size(scd, scd_size, pc);
+        if (sz == 0) break;
+        u8 op = scd[pc];
+        if ((op == 0x0C || op == 0x0D || op == 0x0E) && pc + 4 <= scd_size) {
+            long tgt = (long)pc + (long)(s16)(scd[pc + 2] | (scd[pc + 3] << 8));
+            if (tgt > (long)reach) reach = (size_t)tgt;
+        }
+        if (op == 0x04 && reach <= pc)
+            return (pc + sz < scd_size) ? pc + sz : scd_size;
+        pc += sz;
+    }
+    return scd_size;
+}
 
 /* Category names (for color coding) */
 static const char* g_scd_cat_names[] = {

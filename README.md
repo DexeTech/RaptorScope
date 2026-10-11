@@ -43,14 +43,17 @@ The tool reconstructs the PSX GPU rendering pipeline in software — including 4
 ### 3D Room Viewer
 - **Full room geometry** reconstructed from RDT (Room Data Table) files, including the two rooms that store their RDT uncompressed (ST50B, ST60E)
 - **Mixed BPP rendering**: 4bpp and 8bpp textures coexist in a single atlas via 2D sparse sub-palette allocation
-- **SCD script walker**: Parses bytecode to extract camera shots (0x4C, and its short form 0x2E), entity spawns (0x42), item pickups (0x5B), and scene lights (0x3A)
+- **SCD script walker**: Decodes every script thread straight through, both sides of each branch, to extract camera shots (0x4C, and its short form 0x2E), objects (0x42: a type and position for each, mostly effect objects such as the 80 by ST10A's broken window), enemy spawns (0x5B), and scene lights (0x3A)
 - **Trigger zones**: Every 0x28 zone in the script area is found by scanning it, not by the walk, so zones set after an 0x01 (such as ST103's door triggers) are shown
 - **Scripted placement**: The room is built the way the game builds it — only the sections its scripts place into model slots are drawn. Placements (0x23, and item pickup zones 0x28 type 4) are found by scanning the whole script area, then later script writes to the slot (0x2A, 0x36, 0x37) adjust position and rotation, e.g. lifting items onto desks
 - **Item pickup models**: Type-4 zones (0x28) put their item model at the zone centre, as the game does
 - **Unplaced sections (H key)**: Sections the game stores but never places (unused leftovers, such as an unused DDK in ST103) are hidden by default; **H** shows them tinted magenta at their raw positions
+- **Game cameras (K key)**: **K** steps through the room's camera shots (**Shift+K** back). Each shot puts the view where the game puts its camera, with the game's field of view (H=320 on a 320x240 screen); the game's 4:3 frame is outlined with the area outside it dimmed, and the trigger zone that switches to the shot is outlined. Scrolling widens or narrows the view around the frame without moving the eye. Most rooms also keep a separate copy of their walls for each camera, and the camera's setup thread (script thread N for camera N) shows only its own copies with 0x48 03 <slot> <0/1>, so in a shot only that camera's sections are drawn, as in the game. Drawing every section at once, the default, shows details that differ between copies twice, such as ST10A's corkboard
+- **Walking through shots**: Each shot starts with a player marker in the middle of its trigger zone. **WASD** or the **arrow keys** walk it along the floor (**Shift** runs); shots that follow the player (fixed cameras that turn to watch her, cameras that slide along a corridor, side-on, orbiting and rail cameras) follow it as the game's camera handler would, and walking into another shot's trigger zone cuts to that shot. Dragging the view leaves the shot to orbit freely: the game camera is then drawn as its eye and view pyramid, which keeps following the player, and **J** goes back onto the shot. Shots that only shift the previous camera (types 10, 11, 19-21, 32, 33) have no position of their own; K still shows their sections
 - **Outdoor scenes**: Sky domes and sea planes out to ±32,000 units are kept; the camera frames the walkable area and the far clip plane reaches the sky
 - **PSX-accurate transparency**: 0x0000 masking, 0x8000 transparent black, STP semi-transparency for 4bpp decals (blood splatters)
-- **PSX vertex color modulation**: 2x scaling to match hardware `(tex * vtx) / 128` behavior
+- **PSX vertex color modulation**: Room and door faces are Gouraud-shaded from their corner colours, scaled 2x to match hardware `(tex * vtx) / 128` behavior, so shading baked into a face shows as it does in game (ST108's wall box). Colours above 128, which brighten the texture on the PSX, stop at the texture's own colour
+- **Draw order inside a section**: The game draws some model slots (0x23 render mode 2 or 3) with no depth sorting inside the section: the first quad is drawn last, on top. Rooms rely on it for windows, signs and floor markings set a little behind the surface they show on, without a hole cut for them, such as ST101's restroom windows 22 units behind the wall. The viewer moves each such face 2 units in front of the face covering it, so it shows as it does in game. GLB, OBJ and SMD exports include the move
 
 ### Walk-Through Mode
 - First-person camera with WASD movement, mouse look, jump, and sprint
@@ -75,15 +78,27 @@ Toggle with **O key** to see all parsed SCD data as colored wireframe overlays:
 | Light Blue | Zone type 1 (0x28) |
 | Yellow | Zone types 2/3 (0x28) |
 | Cyan | Item pickup zones, type 4 (0x28) |
-| Purple | Floor elevation zones (ptr[6]) |
+| Purple | Zones of other types (0x28) |
+| Yellow (flat) | Floor zones (ptr[6]), where footsteps sound different |
 | Violet | Camera cut zones (ptr[2]) |
 | Gold | Scene lights (0x3A + ptr[0]) |
-| Blue dot | Camera eye position (0x4C, 0x2E) |
-| Red dot | Camera target (0x4C, 0x2E) |
-| White diamond | Item pickup (0x5B) |
+| Blue dot | Script camera eye position (0x4C, 0x2E) |
+| Red dot | Script camera target (0x4C, 0x2E) |
+| Dashed | Camera trigger zones (ptr[3]), coloured per camera |
+| Red X | Enemy spawn (0x5B), found by scanning the script area; one parked off stage for a cutscene (ST100) is shown where the cutscene moves it |
+| White star | Object (0x42) |
 | Orange dot | Character spawn (0x20) |
+| Pale blue rings | Fog (0x3D) |
 
-Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the height of the upward-facing horizontal faces that lie under them (a ceiling never counts, even when it has more geometry than the floor, as in ST105).
+Zones and rectangles carry only X/Z, so each is drawn on the floor beneath it: the height of the upward-facing horizontal faces that lie under it (a ceiling never counts, even when it has more geometry than the floor, as in ST105). A shape over the room's main floor stays on it, so a desk or counter inside a zone does not lift it; a shape on another level, such as ST201's balcony or ST202's platforms, is drawn at that level.
+
+**Overlay elements panel**: while the overlay is on, a panel on the right of the view lists the room's overlay elements by type, with a count for each:
+- Untick a type to hide all of it, such as every camera or every enemy spawn.
+- Expand a type to tick or untick single elements, such as only Camera 3 in ST10A. Cameras are listed by the number **K** shows, and each covers the trigger zones that switch the game to it.
+- Floor zones show their footstep step as the room starts. Step 0 changes nothing until a script raises it, as with ST100's two zones.
+- Click a row to highlight that element in white, with a tall pin above it.
+- The legend lists only the types that are shown and present in the room.
+- A hidden type stays hidden when you open another room; single elements are shown again.
 
 ### Character Model Viewer
 - EMD model parsing with skeletal hierarchy
@@ -93,6 +108,7 @@ Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the 
 ### Texture and Palette Viewer
 - 4bpp, 8bpp, and 16bpp texture preview
 - **Face-based decoding** for room textures: each area is decoded with the bit depth and CLUT its faces actually use, so pages that mix 4bpp and 8bpp display correctly (**C** switches to the single-CLUT view)
+- Areas that no 3D face in the archive uses are dimmed and decoded with their page's most common CLUT. They are not necessarily unused: the game also draws 2D screens straight from the texture, such as ST300's code-input screen (BACK/OK buttons, letter tiles and labels), and those can show in the wrong colours
 - Multi-row CLUT visualization with sub-palette cycling (**Up/Down**)
 - VRAM deswizzle (64x32 block tiling) for raw PS1 texture data
 - UV editor overlay for texture coordinate inspection
@@ -110,7 +126,7 @@ Zones and rectangles carry only X/Z, so they are drawn on the room's floor: the 
 
 ### Additional Features
 - **Dark theme**: Automatic Windows 10/11 dark mode detection with dark title bar
-- **Export formats**: OBJ, SMD (Source engine), GLB (Models & Animations) BMP texture export
+- **Export formats**: OBJ, SMD (Source engine), GLB (characters with animations, and textured rooms), BMP texture export
 - **Hex viewer**: Raw binary inspection of any archive entry with offset display
 - **Software renderer fallback**: GDI Generic compatibility for VMs without GPU acceleration
 - **F11 render mode cycling**: Normal / VM GPU / Software rendering
@@ -207,7 +223,7 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 - **ptr[2]**: Camera cut trigger zones
 - **ptr[3]**: Camera thread zones
 - **ptr[5]**: SCD bytecode (room initialization scripts)
-- **ptr[6]**: Floor elevation zones
+- **ptr[6]**: Floor zones, where footsteps play a different sound: a u32 count, then 20-byte records of four XZ corners, a level at +16 (matched against the walker) and a step at +17. Inside a zone the footstep sound is 0xB0 + 2 × step instead of 0xB0 (`sub_40B8A9`). Opcode 0x64 changes a zone's step: ST100 starts its two zones at 0 and turns them on mid-room
 - **Mesh sections**: Starting at offset 0x1C, sequential 12-byte headers (tri_ptr, quad_ptr, tri_count, quad_count). Sections are only drawn where a script places them; some rooms carry unused leftovers
 
 ### SCD Bytecode
@@ -215,11 +231,12 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 The room initialization script (ptr[5]) uses a multi-threaded virtual machine:
 
 - **Thread table**: Array of u32 offsets from SCD base; the first offset / 4 is the thread count
-- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x42 (entity spawn), 0x4C (camera entry), 0x5B (item pickup)
+- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x3C (model slot render mode and OT depth), 0x48 (show/hide; type 3 = model slot), 0x42 (object: type at +2, position at +4/+6/+8), 0x4C (camera entry), 0x5B (enemy spawn: character slot +1, type +2, position +4/+6/+8, rotation +10, model and animation +12/+16; handler 0x42A96D), 0x64 (sets floor zone +1's footstep step to +2; handler 0x42BE92)
 - **Opcode 0x23** (32 bytes): Places a mesh section into a model slot at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe; the opcode dispatch table starts at VA `0x006576A0` (the two words before it are 0 and 1)
 - **Opcode 0x28** (size by type): a zone's four XZ corners at +4..+19; a real zone repeats its type at +20 and has 1 at +23, which no other 0x28 byte in the scripts does
 - **Opcode 0x28 type 4** (44 bytes): Item pickup zone. Its model (slot at +34, section at +36) is placed on the floor at the zone centre (`sub_426DFC` → `sub_448E3B`) and spins while the item is there
-- **Work target**: 0x22 03 `<slot>` selects a model slot; 0x2A sets one of its fields (3/4/5 = x/y/z, 6/7/8 = rotation, via `sub_47416C`), 0x36 sets x/y/z and 0x37 the rotation
+- **Opcode 0x5B** (44 bytes): Enemy spawn. A cutscene can spawn its enemy off stage and move it in later: ST100's raptor is spawned at x = z = 0x7000 and appears where the cutscene moves it, (2024, 0, 3008). Every other spawn lies within ±15104, so the overlay shows a spawn beyond ±20000 where its thread first moves it on stage
+- **Work target**: 0x22 03 `<slot>` selects a model slot and 0x22 02 `<slot>` a character (the entry that 0x20 or 0x5B filled); 0x2A sets one of its fields (3/4/5 = x/y/z, 6/7/8 = rotation, via `sub_47416C`), 0x36 sets x/y/z and 0x37 the rotation
 - **Control flow**: 0x0C (unconditional jump), 0x0E (conditional relative jump), 0x04 (end of thread; every thread finishes with `04 00 00 00`). 0x01 and 0x0A are 4-byte opcodes that scripts continue past; decoding each script straight through with the opcode sizes lands exactly on the next script in every room. Message text follows the last thread in the same block
 
 ### PSX Transparency Rules
@@ -257,8 +274,11 @@ The tool composites all archive textures into a single OpenGL atlas using 2D spa
 | **T** | Toggle textured rendering |
 | **V** | Toggle vertex colors |
 | **C** | Toggle backface culling (see-through room faces such as fences and the signs painted on them are always drawn from both sides, as the game does) |
-| **O** | Toggle overlay visualization |
+| **O** | Toggle overlay visualization and its elements panel |
 | **H** | Show/hide unplaced (unused) room sections |
+| **K** / **Shift+K** | Next / previous game camera shot (its view, field of view and sections) |
+| **WASD** / **Arrow keys** | On a shot, walk the player the camera follows (**Shift**: run); W toggles wireframe only when no shot is selected |
+| **J** | Back onto the shot after orbiting away or scrolling |
 | **I** | Toggle room scene lights |
 | **N** | Toggle vertex normal display |
 | **G** | Toggle ground grid |

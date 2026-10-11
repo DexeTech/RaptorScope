@@ -10,6 +10,7 @@
 #include "formats/video.h"
 #include "core/audio.h"
 #include "formats/save_editor.h"
+#include <string.h>
 
 struct HexPanel {
     HWND   hwnd;
@@ -45,10 +46,15 @@ struct ImagePanel {
     int     bpp, pal_row, sub_pal;
     int     max_pal_rows;          /* available palette rows for current texture */
 
-    /* Cached references for re-rendering on palette row change */
+    /* What was last rendered, for re-rendering on palette row change.
+       cur_tex/cur_pal point at the copies in src_*: callers may pass an
+       entry on their stack, or one whose data they free afterwards
+       (LZSS0 textures, item bank CLUTs). */
     const DatEntry* cur_tex;
     const DatEntry* cur_pal;
     bool    cur_is_linear;         /* true = render_linear, false = render_entry */
+    DatEntry src_tex, src_pal;
+    Buffer   src_tex_data, src_pal_data;
 
     /* zoom / pan state */
     double  zoom;          /* current zoom factor (1.0 = 1 texel = 1 pixel) */
@@ -79,6 +85,7 @@ struct ImagePanel {
     ~ImagePanel() { if (hBmp) DeleteObject(hBmp); free(face_uses); }
 
     void clear_face_usage();               /* call when the archive changes */
+    void keep_source(const DatEntry& tex, const DatEntry* pal);  /* copy into src_* */
     void render_entry(const DatEntry& tex, const DatEntry* pal, bool do_deswizzle = true);
     void render_linear(const DatEntry& tex, const DatEntry* pal);
     void rerender();                           /* re-render with current pal_row */
@@ -180,6 +187,24 @@ struct AudioPanel {
     int  wav_total_samples;  /* total sample count for duration calc */
 };
 
+/* Which overlay elements are drawn: the checkbox tree beside the 3D view
+   while the overlay is on.  A type's checkbox hides all of that type and
+   each instance has its own.  Cameras are indexed by camera number
+   (cam_id, as K shows it), every other type by its RdtSceneOverlay index. */
+struct OverlayVis {
+    enum { CAMERAS, SCRIPT_CAMS, CAM_CUTS, TRIGGERS, FLOOR_ZONES, RECTS,
+           ENEMIES, CHARS, OBJECTS, SPAWNS, LIGHTS, FOG, N_TYPES };
+    enum { MAX_ITEMS = 512 };
+    bool on[N_TYPES];               /* kept from room to room */
+    u8   hidden[N_TYPES][MAX_ITEMS];  /* cleared for each room */
+    int  sel_type, sel_item;        /* tree selection, drawn highlighted; -1 = none */
+    OverlayVis() : sel_type(-1), sel_item(-1) {
+        for (int t = 0; t < N_TYPES; t++) on[t] = true;
+        memset(hidden, 0, sizeof(hidden));
+    }
+    bool shown(int t, int i) const { return on[t] && (i < 0 || i >= MAX_ITEMS || !hidden[t][i]); }
+};
+
 struct ViewerPanel3D {
     HWND    hwnd;
     HDC     hDC;
@@ -208,7 +233,27 @@ struct ViewerPanel3D {
     bool    show_textured;
     bool    show_vcolors;   /* vertex / face colors */
     bool    show_overlay;   /* RDT scene overlay */
+    OverlayVis ov_vis;      /* overlay elements shown */
+    HWND    ov_tree;        /* checkbox tree of overlay elements, right of the view */
+    int     ov_tree_w;      /* width the tree takes from the view, 0 = hidden */
+    int     ov_tree_dark;   /* theme the tree's colours were set for, -1 = none */
     bool    show_alt_geo;   /* show unplaced sections (H) */
+    /* Game cameras (K).  Each entry is a camera shot (a ptr[3] descriptor
+       that places the camera) or, for cameras with no such shot, just the
+       model slots the camera's setup thread hides. */
+    struct CamEntry { int shot; u8 cam_id; u64 hide; };  /* shot = cached_overlay.cam_threads index, -1 = none */
+    CamEntry cam_list[64];
+    int     n_cams;
+    int     cam_sel;        /* index into cam_list, -1 = every slot, free camera */
+    u64     view_hide;      /* model slots hidden in the selected camera */
+    bool    shot_locked;    /* view follows the selected shot (mouse frees it) */
+    int     shot_kind;      /* RDT_SHOT_* of the selected shot */
+    int     shot_cur;       /* cached_overlay.cam_threads index of the shot in use, -1 = none */
+    f32     shot_player[3]; /* player position the shot tracks, raw game coordinates */
+    f32     shot_eye[3], shot_tgt[3];  /* the shot's eye and target, raw game coordinates */
+    f32     shot_zoom;      /* scroll on a shot: field of view as a multiple of the game's */
+    bool    shot_moving;    /* WASD / arrow timer running */
+    DWORD   shot_tick_ms;
     bool    show_normals;   /* debug: draw vertex normal lines */
     bool    show_cull;      /* backface culling toggle (C key) */
     bool    show_grid;      /* ground grid toggle (G key) */
@@ -352,7 +397,7 @@ struct ViewerPanel3D {
                       tri_count(0), vert_count(0), bone_count(0),
                       show_wireframe(false), show_lighting(true),
                       show_bones(false), show_bone_labels(false), show_textured(true),
-                      show_vcolors(false), show_overlay(false), show_alt_geo(false), show_normals(false),
+                      show_vcolors(false), show_overlay(false), ov_tree(0), ov_tree_w(0), ov_tree_dark(-1), show_alt_geo(false), n_cams(0), cam_sel(-1), view_hide(0), shot_locked(false), shot_kind(0), shot_cur(-1), shot_player(), shot_eye(), shot_tgt(), shot_zoom(1), shot_moving(false), shot_tick_ms(0), show_normals(false),
                       show_cull(true),
                       show_grid(true), show_hud(true),
                       walk_mode(false), walk_noclip(false), walk_x(0), walk_y(-1500), walk_z(0),
@@ -391,6 +436,26 @@ struct ViewerPanel3D {
     void resize(int w, int h);
     void set_mesh(const Mesh& mesh);
     void set_overlay(const RdtSceneOverlay& overlay);
+    void select_camera(int sel);   /* K: -1 = every slot, free camera */
+    void set_view_hide(u64 hide);  /* rebuild the display lists without these slots */
+    void update_shot(bool lock);   /* recompute the shot; lock = put the view on it */
+    void move_shot_player(f32 fwd, f32 right);
+    int  shot_zone_at(const f32 p[3]) const;  /* shot whose trigger zone holds p, -1 = none */
+    void shot_tick();              /* WASD / arrows held: walk the player */
+    f32  floor_below(f32 vx, f32 vz, f32 vy) const;  /* viewer coords */
+    double view_fovy(double aspect) const;
+    void draw_shot_overlay(int w, int vh);
+    void build_mesh_lists(const Mesh& mesh);  /* solid/blend/wire lists, GL context current */
+    /* Overlay element tree */
+    void fill_ov_tree();           /* list the room's overlay elements */
+    void layout_ov_tree();         /* show it beside the view while the overlay is on */
+    void ov_tree_checked(HTREEITEM item);   /* a checkbox changed */
+    void ov_tree_selected(LPARAM lp);       /* the selection changed */
+    void rebuild_overlay();        /* overlay display list for ov_vis */
+    int  view_w(int client_w) const { int v = client_w - ov_tree_w; return v < 1 ? 1 : v; }
+    bool tri_in_view(const MeshTri& t) const {
+        return !view_hide || t.alt || t.slot >= 64 || !((view_hide >> t.slot) & 1);
+    }
     RdtSceneOverlay cached_overlay;  /* copy for export access */
     void set_emd(const EmdModel& emd);
     void set_emd_anim(EmdModel* emd);  /* set up animation controls */
@@ -522,17 +587,20 @@ struct WeaponPanel {
         HWND labels[10];    /* field name labels */
     };
     RecordUI rec_ui[WEP_MAX_RECORDS];
+    int     aim_off;      /* aim/camera block after the pointer tables, -1 = none */
+    HWND    aim_ui[14];   /* 8 aim edits, then 6 camera offset edits */
     HWND    save_btn;
     HWND    status_lbl;
     int     scroll_y;
     int     content_h;
 
     WeaponPanel() : hwnd(0), data(0), data_size(0), code_end(0),
-                    ptrtbl_start(0), n_records(0), save_btn(0),
+                    ptrtbl_start(0), n_records(0), aim_off(-1), save_btn(0),
                     status_lbl(0), scroll_y(0), content_h(0) {
         memset(filename, 0, sizeof(filename));
         memset(records, 0, sizeof(records));
         memset(rec_ui, 0, sizeof(rec_ui));
+        memset(aim_ui, 0, sizeof(aim_ui));
     }
     ~WeaponPanel() { free(data); }
 

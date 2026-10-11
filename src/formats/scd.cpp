@@ -12,35 +12,6 @@ static u16 rd16(const u8* p) { return p[0] | (p[1] << 8); }
 static u32 rd32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 static s16 rs16(const u8* p) { return (s16)rd16(p); }
 
-/* Get instruction size for a given opcode at pc (0 = past the end). */
-static int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
-    if (pc >= scd_size) return 0;
-    u8 op = scd[pc];
-
-    if (op == 0x00) return 1;
-
-    /* 1-byte NOPs / control markers */
-    if (op == 0x10 || op == 0x11) return 1;
-    if (op >= 0x19 && op <= 0x1F) return 1;
-    if (op >= 0x70) return 1;
-
-    /* Relative branch */
-    if (op == 0x0C) return 4;
-    if (op == 0x0E) return 4;
-
-    /* Variable-size 0x28 */
-    if (op == 0x28) {
-        if (pc + 3 > scd_size) return 0;
-        u8 typ = scd[pc + 2];
-        if (typ < 12) return g_scd_op28_sizes[typ];
-        return 32; /* fallback */
-    }
-
-    /* Fixed-size table */
-    if (op < 0x70) return g_scd_opcodes[op].size;
-    return 1;
-}
-
 /* Format hex bytes */
 static void fmt_hex(char* buf, size_t bufsz, const u8* data, int len) {
     buf[0] = 0;
@@ -185,37 +156,6 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
     }
 }
 
-/* End of thread ti.  0x01 and 0x0A are ordinary 4-byte opcodes, not thread
-   ends: every thread in the game decodes straight through to the start of
-   the next one, and every thread finishes with 0x04 00 00 00.  So a thread
-   runs to the next thread's start.  The last thread has message text after
-   it in the same block; it ends at the first 0x04 that no earlier jump
-   (0x0C/0x0D/0x0E) lands beyond.  On the other threads, whose ends are
-   known, that rule is exact for 2713 of 2735. */
-static size_t scd_thread_end(const u8* scd, size_t scd_size, const ScdDisasm& out, int ti)
-{
-    size_t start = out.thread_offsets[ti], next = scd_size;
-    for (int i = 0; i < out.n_threads; i++)
-        if (out.thread_offsets[i] > start && out.thread_offsets[i] < next)
-            next = out.thread_offsets[i];
-    if (next < scd_size) return next;
-
-    size_t pc = start, far = start;
-    while (pc < scd_size) {
-        int sz = scd_inst_size(scd, scd_size, pc);
-        if (sz == 0) break;
-        u8 op = scd[pc];
-        if ((op == 0x0C || op == 0x0D || op == 0x0E) && pc + 4 <= scd_size) {
-            long tgt = (long)pc + (long)rs16(scd + pc + 2);
-            if (tgt > (long)far) far = (size_t)tgt;
-        }
-        if (op == 0x04 && far <= pc)
-            return (pc + sz < scd_size) ? pc + sz : scd_size;
-        pc += sz;
-    }
-    return scd_size;
-}
-
 bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
                      ScdDisasm& out)
 {
@@ -287,7 +227,7 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
     size_t code_end = 0;
     for (int ti = 0; ti < n_threads; ti++) {
         size_t pc = out.thread_offsets[ti];
-        size_t end = scd_thread_end(scd, scd_size, out, ti);
+        size_t end = scd_thread_end(scd, scd_size, out.thread_offsets, out.n_threads, out.thread_offsets[ti]);
         if (end > code_end) code_end = end;
         while (pc < end) {
             int sz = scd_inst_size(scd, scd_size, pc);
@@ -316,7 +256,7 @@ bool scd_disassemble(const u8* dec, size_t dec_size, u32 base_addr,
         }
 
         size_t pc = out.thread_offsets[ti];
-        size_t end = scd_thread_end(scd, scd_size, out, ti);
+        size_t end = scd_thread_end(scd, scd_size, out.thread_offsets, out.n_threads, out.thread_offsets[ti]);
         int indent = 0;
 
         while (pc < end) {

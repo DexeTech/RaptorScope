@@ -77,7 +77,9 @@ void texture_pixel_dims(int vram_w, int vram_h, int bpp,
 /* Render a texture the way the game's faces sample it: every texel a face
    covers is decoded with that face's colour depth (4/8bpp) and CLUT, looked
    up in the archive's palette entries.  Texels no face covers use the most
-   common setting of their texture page and are drawn dimmed.
+   common setting of their texture page and are drawn dimmed.  Some are
+   still used: the game draws 2D screens, such as ST300's code input,
+   straight from the texture, and no face records that.
    pixels = decompressed, still swizzled texture data at VRAM (vram_x,
    vram_y) of vram_w x vram_h halfwords.  Output is 4 px per halfword when
    any 4bpp face samples the texture (8bpp texels doubled), else 2.

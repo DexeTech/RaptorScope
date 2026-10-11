@@ -17,6 +17,9 @@ struct MeshTri {
     u16  clut;         /* PS1 CLUT field (bits 0-5=X/16, bits 6-14=Y) */
     u8   uv[3][2];    /* (u, v) per vertex corner */
     u8   alt;          /* 1 = conditional variant geometry (SCD branch) */
+    u8   slot;         /* room model slot the section is placed in (0x23) */
+    u8   gouraud;      /* 1 = vcol holds the face's corner colours */
+    u8   vcol[3][3];   /* RGB per corner as stored (128 = texture as is), in uv order */
     u32  src_off;      /* section header offset in RDT (0=unknown), for object picking */
 };
 
@@ -286,6 +289,11 @@ struct EmdExportAtlas {
 };
 bool export_emd_glb(const char* path, const EmdModel& model,
                     const EmdExportAtlas* atlas = 0, f32 fps = 30.0f);
+/* Static room mesh as shown in the viewer: one node per section, textured
+   from the atlas when given.  Faces flagged alt are skipped. */
+bool export_room_glb(const char* path, const MeshVert* verts, int vert_count,
+                     const MeshTri* tris, int tri_count,
+                     const EmdExportAtlas* atlas = 0, const char* name = 0);
 
 bool export_emd_smd(const char* path, const EmdModel& emd);
 bool export_mesh_smd(const char* path, const Mesh& mesh);
@@ -313,15 +321,17 @@ const char* get_bone_name(int bone_count, int bone_idx);
  *    op 0x28 (var) – collision zone setup
  *═══════════════════════════════════════════════════════════════════*/
 
-/*─── Floor zone (trigger/transition quad) ──────────────────────*/
+/*─── Zone: a ptr[6] floor zone or an SCD 0x28 trigger zone ─────*/
+enum { RDT_ZONE_FLOOR = 0, RDT_ZONE_TRIGGER = 1 };
+
 struct RdtFloorZone {
     s16 x[4], z[4];          /* 4 corner XZ coords (world-space) */
     s16 y;                    /* floor Y position */
     s16 height;               /* zone height above Y (0 = flat) */
-    u8  collision_group;
-    u8  target_index;         /* type for 0x28 zones */
-    u8  flags;                /* 0x28 = SCD trigger zone */
-    u8  pad;
+    u8  collision_group;      /* floor zone: level, matched against the walker's +0x48; 0x28 zone: zone slot */
+    u8  target_index;         /* floor zone: footstep step (sound 0xB0 + 2 * step); 0x28 zone: type */
+    u8  flags;                /* floor zone: record byte +18 (0 in every room); 0x28 zone: 0 */
+    u8  kind;                 /* RDT_ZONE_FLOOR or RDT_ZONE_TRIGGER, set by the parser that adds it */
 };
 
 /*─── Collision rectangle ───────────────────────────────────────*/
@@ -359,7 +369,7 @@ struct RdtSectionXform {
     u32 section_off;          /* file offset of inline section header */
     u8  slot;
     u8  flags;                /* byte[2] */
-    u8  render_mode;          /* byte[3]: 0=opaque, 1=semi-trans, 2=fixed-depth, 3=mirror */
+    u8  render_mode;          /* byte[3]: face sort (DINO.exe 0x44DA6D): 0=nearest vertex, 1=farthest vertex, 2/3=whole section at one depth */
     u8  pad;
     u16 ot_depth;             /* bytes[4..5]: OT depth for mode 2/3 (w74) */
     s16 px, py, pz;
@@ -380,7 +390,7 @@ struct RdtObjectSpawn {
     s16 rot_y;
 };
 
-/*─── SCD opcode 0x5B: item/pickup spawn (44B) ─────────────────*/
+/*─── SCD opcode 0x5B: enemy spawn (44B) ──────────────────────*/
 struct RdtItemSpawn {
     u8  slot;
     u8  type;
@@ -413,13 +423,14 @@ struct RdtSceneLight {
     u8  has_color;            /* set if color was parsed */
 };
 
-/*─── SCD opcode 0x42: enemy/entity spawn (20B) ───────────────*/
+/*─── SCD opcode 0x42: object (20B) ───────────────────────────*/
+#define RDT_MAX_OBJECTS 512
 struct RdtEnemySpawn {
-    u8  type;                 /* entity type ID */
-    u8  id;                   /* entity slot ID */
-    u8  flags;
-    s16 px, py, pz;           /* world-space position */
-    s16 rot_y;
+    u8  type;                 /* object type (byte[2]) */
+    u8  id;                   /* object record, 0xFF = any free one (byte[1]) */
+    u8  flags;                /* byte[3] */
+    s16 px, py, pz;           /* world-space position (+4/+6/+8) */
+    s16 rot_y;                /* u16 at +12 */
 };
 
 /*─── SCD opcode 0x3D: fog/atmosphere effect (12B) ────────────*/
@@ -448,7 +459,7 @@ struct RdtSceneOverlay {
     RdtSceneLight     lights[8];       int n_lights;
     u8  ambient_r, ambient_g, ambient_b;  /* room ambient from ptr[0]+8 */
     RdtItemSpawn      items[32];       int n_items;
-    RdtEnemySpawn     enemies[32];     int n_enemies;
+    RdtEnemySpawn     enemies[RDT_MAX_OBJECTS]; int n_enemies;
     RdtFogParams      fog[8];          int n_fog;
     RdtLightColor     light_cols[64];  int n_light_cols;
 
@@ -459,10 +470,25 @@ struct RdtSceneOverlay {
         s16 x[4], z[4];      /* activation quad corners */
         u8  type;             /* thread type (byte[0]) */
         u8  cam_id;           /* camera ID (byte[2]) */
+        u8  desc[68];         /* whole descriptor, for rdt_camera_shot */
     };
     CamThread  cam_threads[32]; int n_cam_threads;
 
-    f32 floor_y;  /* rendered Y of the floor plane (from mesh data) */
+    /* Camera setups.  When the game switches to camera N (a ptr[3]
+       cam_id) it runs script thread N, which shows or hides model slots
+       with 0x48 03 <slot> <1|0>.  Rooms keep a copy of their walls per
+       camera (ST10A's corkboard sits at a different spot in slots 2 and
+       4), so drawing every slot at once doubles such details. */
+    struct CamView {
+        u8  cam_id;
+        u64 show_mask, hide_mask;   /* bit = model slot */
+    };
+    CamView    cam_views[32]; int n_cam_views;
+
+    /* Viewer Y of the floor under each flat shape (from mesh data), set by
+       overlay_floor_heights; floor_y is the room-wide floor. */
+    f32 floor_y;
+    f32 zone_y[64], rect_y[256], camcut_y[128], cam_thread_y[32];
 
     RdtSceneOverlay() { memset(this, 0, sizeof(*this)); }
 };
@@ -471,9 +497,18 @@ struct RdtSceneOverlay {
 bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
                        RdtSceneOverlay& overlay);
 
-/* Floor height (viewer Y) for the overlay's flat zones and rects, found
-   from the upward-facing horizontal faces of the placed room mesh. */
-f32 overlay_floor_y(const Mesh& mesh, const RdtSceneOverlay& overlay);
+/* Floor heights (viewer Y) for the overlay's flat shapes, found from the
+   upward-facing horizontal faces of the placed room mesh: sets floor_y,
+   zone_y, rect_y, camcut_y and cam_thread_y. */
+void overlay_floor_heights(const Mesh& mesh, RdtSceneOverlay& overlay);
+
+/* Camera shot of a ptr[3] descriptor with the player at player[3]: eye and
+   target in raw game coordinates (y down), as DINO.exe's per-type camera
+   handlers (table at 0x645FA8) place them.  The game projects with H=320
+   on a 320x240 screen.  Returns RDT_SHOT_NONE for types that set no
+   camera of their own (none, or relative to the previous shot). */
+enum { RDT_SHOT_NONE = 0, RDT_SHOT_FIXED = 1, RDT_SHOT_TRACKING = 2 };
+int rdt_camera_shot(const u8* desc, const f32 player[3], f32 eye[3], f32 tgt[3]);
 
 /*─── Texture usage ──────────────────────────────────────────────*/
 /* How one textured face samples VRAM: page and colour depth (tpage),
