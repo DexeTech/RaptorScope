@@ -2917,7 +2917,69 @@ static int scan_trigger_zones(const u8* dec, size_t scd_base, size_t scd_end,
    scanning the script area rather than by the walk, which used to skip
    the branches that hold them (ST309, ST504 and five more).  Both pointers lie in the room
    data and differ; mesh data that happens to match has them equal or a
-   slot past the table. */
+   slot past the table.
+
+   A cutscene can spawn its enemy off stage and bring it on later: ST100's
+   raptor (thread 6) is spawned at x = z = 0x7000, far outside the room,
+   and appears when the cutscene moves it to (2024, 0, 3008).  Every other
+   spawn in the game lies within +/-15104, so one beyond +/-20000 is shown
+   where its thread first moves it on stage (enemy_spawn_entrance), or
+   left out if it never does. */
+static bool spawn_on_stage(s16 x, s16 z)
+{
+    return x > -20000 && x < 20000 && z > -20000 && z < 20000;
+}
+
+/* The first move of a parked 0x5B spawn's enemy onto the stage by the
+   rest of its thread; scd/scd_size are the script area and pc is the
+   spawn's offset in it.  0x22 02 <slot> selects entry <slot> of the
+   character table, the one the spawn filled, as the work target
+   (sub_47416C, work type 2: +0x288 + slot * 0x260).  0x36 then sets x/y/z
+   (fields 3-5, entry +0x20/+0x22/+0x24, where 0x5B puts its position),
+   0x2A one field, and 0x37 the rotation (fields 6-8; field 7 is the Y
+   angle 0x5B sets).  The writes of the first work-target block that
+   leaves the enemy on stage are applied to es. */
+static bool enemy_spawn_entrance(const u8* scd, size_t scd_size, size_t pc, RdtItemSpawn& es)
+{
+    u32 thr[64];
+    int n_thr = 0;
+    u32 first = rd_u32(scd);
+    if (first >= 4 && !(first & 3) && first <= scd_size)
+        for (; n_thr < (int)(first / 4) && n_thr < 64; n_thr++) thr[n_thr] = rd_u32(scd + n_thr * 4);
+    size_t end = scd_thread_end(scd, scd_size, thr, n_thr, pc);
+
+    bool sel = false, moved = false;
+    s16 x = 0, y = 0, z = 0, ry = 0;
+    for (size_t q = pc + 44; ; ) {
+        bool last = q + 8 > end;
+        if (last || scd[q] == 0x22) {
+            if (sel && moved && spawn_on_stage(x, z)) {
+                es.px = x; es.py = y; es.pz = z; es.rot_y = ry;
+                return true;
+            }
+            if (last) return false;
+            sel = scd[q + 1] == 2 && scd[q + 2] == es.slot;
+            moved = false;
+            x = es.px; y = es.py; z = es.pz; ry = es.rot_y;
+        } else if (sel && scd[q] == 0x36) {
+            x = rd_s16(scd + q + 2); y = rd_s16(scd + q + 4); z = rd_s16(scd + q + 6);
+            moved = true;
+        } else if (sel && scd[q] == 0x37) {
+            ry = rd_s16(scd + q + 4);
+        } else if (sel && scd[q] == 0x2A) {
+            s16 v = rd_s16(scd + q + 4);
+            switch (scd[q + 2]) {
+            case 3: x = v; moved = true; break;
+            case 4: y = v; moved = true; break;
+            case 5: z = v; moved = true; break;
+            case 7: ry = v; break;
+            }
+        }
+        int adv = scd_inst_size(scd, scd_size, q);
+        q = adv ? q + (size_t)adv : end;
+    }
+}
+
 static int scan_enemy_spawns(const u8* dec, size_t scd_base, size_t scd_end, u32 base,
                              size_t dec_size, RdtSceneOverlay& ov)
 {
@@ -2936,6 +2998,9 @@ static int scan_enemy_spawns(const u8* dec, size_t scd_base, size_t scd_end, u32
         is.rot_y    = rd_s16(dec + pc + 10);
         is.mesh_ptr = m;
         is.anim_ptr = a;
+        if (!spawn_on_stage(is.px, is.pz) &&
+            !enemy_spawn_entrance(dec + scd_base, scd_end - scd_base, pc - scd_base, is))
+            continue;
         bool dup = false;
         for (int i = 0; i < ov.n_items && !dup; i++) {
             const RdtItemSpawn& o = ov.items[i];
