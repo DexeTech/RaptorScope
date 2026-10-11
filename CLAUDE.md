@@ -160,6 +160,7 @@ Ordered with memory safety and data loss first.
   - The viewer (`build_mesh_lists`) and room GLB export (`export_room_glb`) treat ABR 0 as always opaque and ABR 1–3 as always blended.
   - On the PSX, a polygon is only semi-transparent if its command byte also has the semi-transparency bit; for room triangles that is byte +31, which `parse_rdt_layout` reads but no parser keeps.
   - ABR 0 is the 50/50 blend mode, so semi-transparent ABR 0 faces are drawn opaque.
+  - A semi-transparent polygon blends only the texels whose STP bit is set and draws the rest opaque. ST108's lit wall plate (slot 2, face 7) is ABR 1 on a palette with no STP entries, so the viewer adds it to the scene where the game should draw it solid.
 - **B19** **Character GLBs come out tinted.** `export_emd_glb` writes the per-part debug colours (`pcols` from `parse_emd_model_dec`) as `COLOR_0`, and glTF multiplies `COLOR_0` into the base colour. Room GLBs double `avg_colors`, which is already ×1.6, so they mostly saturate.
 - **B20** **EMD hierarchies with a parent after its child.**
   - `parse_emd_model_dec` and the bind-pose restore in `anim_select_clip` read `abs_pos[parent]` before it is written when a parent's index is higher than its child's (uninitialised stack).
@@ -224,7 +225,7 @@ Ordered with memory safety and data loss first.
   - Its step 4 says local × parent, while the code computes parent × local.
   - The "uv0→idx1, uv1→idx2, uv2→idx0" note in `parse_emd_model_dec` doesn't match the mapping the code uses (uv1→idx0, uv2→idx1, uv0→idx2).
   - The angle-sign flip applied when `n_anim_bones < n_parts` depends on the frame size that `extract_emd_anims` guessed.
-- **C7** **Vertex colours are scaled more than README says.** README says 2× (`(tex*vtx)/128`). `avg_colors` (`mesh.cpp`) already multiplies by 1.6 and averages the Gouraud vertex colours into one face colour, and `build_solid_list` then doubles that. The result is about 3.2× and flat-shaded.
+- **C7** **Face colours are scaled more than README says.** README says 2× (`(tex*vtx)/128`), which the textured viewer now uses on each corner's colour (`MeshTri::vcol`). `avg_colors` (`mesh.cpp`) still multiplies by 1.6 and averages the corners into `MeshTri::color`, which the wireframe, the VM fallback path, faces without corner colours and room GLB export (B19) use, flat-shaded at about 1.6× or 3.2×.
 - **C8** **Overlay colours don't match README and the legend.**
   - Zone type 3 is drawn mint, but README and the HUD legend say yellow.
   - Floor zones and type-2 zones are both yellow.
@@ -253,7 +254,7 @@ Ordered with memory safety and data loss first.
   - The first texture view runs `collect_texture_usage` on the UI thread, which fully parses every mesh and EMD in the archive (copying data and extracting clips).
 - **P3** **The texture atlas is large and handled inefficiently.**
   - It is `width × 512·slices` RGBA and can exceed 100 MB.
-  - It is uploaded with `GL_LINEAR`, which blurs PSX textures and bleeds between the stacked CLUT slices; GLB export uses nearest filtering.
+  - It is uploaded with `GL_LINEAR`, which blurs PSX textures (the PSX point-samples); GLB export uses nearest filtering.
   - Its width is never checked against `GL_MAX_TEXTURE_SIZE`, and it is copied a second time into `uv_atlas_rgba`.
   - The viewer also holds each mesh three times: `im_*`, `uv_*` and the caller's copy.
 - **P4** **UV editor sort is quadratic.** `ShowUVEditor` uses an O(n²) insertion sort, commented "small N", though rooms have 10K+ faces.

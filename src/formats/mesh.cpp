@@ -29,6 +29,21 @@ static RGBA8 avg_colors(const u8 cols[][3], int n)
     return RGBA8((u8)r, (u8)g, (u8)b, 255);
 }
 
+/*─── Gouraud corner colours ─────────────────────────────────────
+   Room and door faces are Gouraud-textured (command 0x34/0x3C, 0x36/0x3E
+   semi-transparent; 41% of placed faces across the game vary corner to
+   corner) and store an RGB per vertex; the GPU tints each texel by the
+   colour interpolated across the face.  c0..c2 are the source vertices of the
+   tri's corners, in the same order as its uv.  ST108's wall box is one
+   grey texel shaded by corner colours 30..121. */
+static void set_vcols(MeshTri& t, const u8 cols[][3], int c0, int c1, int c2)
+{
+    const int src[3] = { c0, c1, c2 };
+    for (int k = 0; k < 3; k++)
+        for (int ch = 0; ch < 3; ch++) t.vcol[k][ch] = cols[src[k]][ch];
+    t.gouraud = 1;
+}
+
 /*═══════════════════════════════════════════════════════════════════
  *  Smooth Normal Computation
  *
@@ -403,6 +418,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t = {};
             t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
             t.color = avg_colors(cols, 3);
+            set_vcols(t, cols, 0, 2, 1);
             t.tpage = tp; t.clut = cl;
             t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
             t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
@@ -448,6 +464,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t1 = {};
             t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;
             t1.color = c; t1.tpage = tp; t1.clut = cl;
+            set_vcols(t1, cols, 0, 2, 1);
             t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
             t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
             t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
@@ -456,6 +473,7 @@ bool parse_room_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
             MeshTri t2 = {};
             t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;
             t2.color = c; t2.tpage = tp; t2.clut = cl;
+            set_vcols(t2, cols, 1, 2, 3);
             t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
             t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
             t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];
@@ -583,6 +601,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 MeshTri t = {};
                 t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
                 t.color = avg_colors(cols, 3);
+                set_vcols(t, cols, 0, 2, 1);
                 t.tpage = tp; t.clut = cl;
                 t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
                 t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
@@ -630,6 +649,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 MeshTri t1 = {};
                 t1.idx[0]=bi; t1.idx[1]=bi+2; t1.idx[2]=bi+1;
                 t1.color=c; t1.tpage=tp; t1.clut=cl;
+                set_vcols(t1, cols, 0, 2, 1);
                 t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
                 t1.uv[1][0]=uvs[2][0]; t1.uv[1][1]=uvs[2][1];
                 t1.uv[2][0]=uvs[1][0]; t1.uv[2][1]=uvs[1][1];
@@ -638,6 +658,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 MeshTri t2 = {};
                 t2.idx[0]=bi+1; t2.idx[1]=bi+2; t2.idx[2]=bi+3;
                 t2.color=c; t2.tpage=tp; t2.clut=cl;
+                set_vcols(t2, cols, 1, 2, 3);
                 t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
                 t2.uv[1][0]=uvs[2][0]; t2.uv[1][1]=uvs[2][1];
                 t2.uv[2][0]=uvs[3][0]; t2.uv[2][1]=uvs[3][1];
@@ -730,6 +751,7 @@ bool parse_door_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
         MeshTri t = {};
         t.idx[0] = bi; t.idx[1] = bi+1; t.idx[2] = bi+2;
         t.color = avg_colors(cols, 3); t.tpage = tp; t.clut = cl;
+        set_vcols(t, cols, 0, 1, 2);
         for (int vi = 0; vi < 3; vi++) {
             t.uv[vi][0] = uvs[vi][0]; t.uv[vi][1] = uvs[vi][1];
         }
@@ -771,12 +793,14 @@ bool parse_door_mesh_dec(const u8* dec_data, size_t dec_size, u32 base_addr, Mes
         }
         MeshTri t1 = {}, t2 = {};
         t1.idx[0]=bi; t1.idx[1]=bi+1; t1.idx[2]=bi+2; t1.color=c; t1.tpage=tp; t1.clut=cl;
+        set_vcols(t1, cols, 0, 1, 2);
         t1.uv[0][0]=uvs[0][0]; t1.uv[0][1]=uvs[0][1];
         t1.uv[1][0]=uvs[1][0]; t1.uv[1][1]=uvs[1][1];
         t1.uv[2][0]=uvs[2][0]; t1.uv[2][1]=uvs[2][1];
         tris.push(t1);
 
         t2.idx[0]=bi+1; t2.idx[1]=bi+3; t2.idx[2]=bi+2; t2.color=c; t2.tpage=tp; t2.clut=cl;
+        set_vcols(t2, cols, 1, 3, 2);
         t2.uv[0][0]=uvs[1][0]; t2.uv[0][1]=uvs[1][1];
         t2.uv[1][0]=uvs[3][0]; t2.uv[1][1]=uvs[3][1];
         t2.uv[2][0]=uvs[2][0]; t2.uv[2][1]=uvs[2][1];
@@ -2188,6 +2212,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t.src_off = (u32)off;
             t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;  /* reversed for X negate */
             t.color = avg_colors(cols, 3);
+            set_vcols(t, cols, 0, 2, 1);
             t.tpage = tp; t.clut = cl;
             t.uv[0][0] = uvs[0][0]; t.uv[0][1] = uvs[0][1];
             t.uv[1][0] = uvs[2][0]; t.uv[1][1] = uvs[2][1];
@@ -2242,6 +2267,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t1.src_off = (u32)off;
             t1.idx[0] = bi; t1.idx[1] = bi+2; t1.idx[2] = bi+1;  /* reversed for X negate */
             t1.color = c; t1.tpage = tp; t1.clut = cl;
+            set_vcols(t1, cols, 0, 2, 1);
             t1.uv[0][0] = uvs[0][0]; t1.uv[0][1] = uvs[0][1];
             t1.uv[1][0] = uvs[2][0]; t1.uv[1][1] = uvs[2][1];
             t1.uv[2][0] = uvs[1][0]; t1.uv[2][1] = uvs[1][1];
@@ -2251,6 +2277,7 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
             t2.src_off = (u32)off;
             t2.idx[0] = bi+1; t2.idx[1] = bi+2; t2.idx[2] = bi+3;  /* reversed */
             t2.color = c; t2.tpage = tp; t2.clut = cl;
+            set_vcols(t2, cols, 1, 2, 3);
             t2.uv[0][0] = uvs[1][0]; t2.uv[0][1] = uvs[1][1];
             t2.uv[1][0] = uvs[2][0]; t2.uv[1][1] = uvs[2][1];
             t2.uv[2][0] = uvs[3][0]; t2.uv[2][1] = uvs[3][1];

@@ -2273,6 +2273,13 @@ static void build_solid_list(int list_id, const Mesh& mesh,
         if (t.alt) { cr = 255; cg = 96; cb = 255; }  /* unplaced: magenta tint */
         glColor3ub(cr, cg, cb);
 
+        /* Room and door faces are Gouraud-shaded from their corner colours,
+           taken as stored rather than from the brightened face average in
+           t.color.  The GPU brightens a texel up to 2x for colours above 128;
+           GL_MODULATE stops at 1x, so those clamp.  ST108's wall box is one
+           grey texel shaded 30..121 corner to corner, flat white without. */
+        bool gouraud = t.gouraud && !t.alt;
+
         /* PS1 tpage UV mapping */
         int tx = t.tpage & 0xF;
         int ty = (t.tpage >> 4) & 1;
@@ -2294,10 +2301,24 @@ static void build_solid_list(int list_id, const Mesh& mesh,
             v_off = v_off * ((float)single_h / th);
         }
 
+        /* Sample texel centres.  The PSX reads texel (u, v) at UV (u, v);
+           bilinear filtering does so only at the texel's centre, and at its
+           corner takes a quarter from each of the texels around it.  Shifted
+           by half a texel, a face blends only texels inside its own UV
+           range.  Unshifted, a face mapped to one texel at the corner of a
+           solid patch took in the masked texels beside it and came out see-
+           through: ST108's wall box samples (240, 176) of a grey patch with
+           0x0000 left of and above it. */
         for (int vi = 0; vi < 3; vi++) {
-            float u = u_off + (float)t.uv[vi][0] * u_scl;
-            float v = clut_v_off + v_off + (float)t.uv[vi][1] / th;
+            float u = u_off + ((float)t.uv[vi][0] + 0.5f) * u_scl;
+            float v = clut_v_off + v_off + ((float)t.uv[vi][1] + 0.5f) / th;
             glTexCoord2f(u, v);
+            if (gouraud) {
+                const u8* c = t.vcol[vi];
+                glColor3ub((u8)(c[0] < 128 ? c[0] * 2 : 255),
+                           (u8)(c[1] < 128 ? c[1] * 2 : 255),
+                           (u8)(c[2] < 128 ? c[2] * 2 : 255));
+            }
             const MeshVert& vv = mesh.verts[t.idx[vi]];
             if (has_vnorms) {
                 float vnx = vv.nx, vny = vv.ny, vnz = vv.nz;

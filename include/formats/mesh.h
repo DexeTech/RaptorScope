@@ -18,6 +18,8 @@ struct MeshTri {
     u8   uv[3][2];    /* (u, v) per vertex corner */
     u8   alt;          /* 1 = conditional variant geometry (SCD branch) */
     u8   slot;         /* room model slot the section is placed in (0x23) */
+    u8   gouraud;      /* 1 = vcol holds the face's corner colours */
+    u8   vcol[3][3];   /* RGB per corner as stored (128 = texture as is), in uv order */
     u32  src_off;      /* section header offset in RDT (0=unknown), for object picking */
 };
 
