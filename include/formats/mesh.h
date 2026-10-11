@@ -367,7 +367,7 @@ struct RdtSectionXform {
     u32 section_off;          /* file offset of inline section header */
     u8  slot;
     u8  flags;                /* byte[2] */
-    u8  render_mode;          /* byte[3]: 0=opaque, 1=semi-trans, 2=fixed-depth, 3=mirror */
+    u8  render_mode;          /* byte[3]: face sort (DINO.exe 0x44DA6D): 0=nearest vertex, 1=farthest vertex, 2/3=whole section at one depth */
     u8  pad;
     u16 ot_depth;             /* bytes[4..5]: OT depth for mode 2/3 (w74) */
     s16 px, py, pz;

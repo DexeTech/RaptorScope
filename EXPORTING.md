@@ -21,6 +21,7 @@ Open a room (an RDT scene entry) in the 3D viewer and choose the same **Export G
 - Opaque faces use an alpha-masked material (`opaque`). Faces with a PS1 semi-transparency mode get a 50% blended material named after the mode (`semi_additive`, `semi_subtractive`, `semi_quarter_additive`), because glTF has no additive or subtractive blending; the mode number is kept in the material's `extras`.
 - All materials are double-sided, as the game draws room faces.
 - Sections no script places (shown magenta with **H**) are left out, as are the overlay markers.
+- Windows, signs and floor markings that the game draws over a surface in front of them (such as ST101's restroom windows, 22 units behind the wall) are moved 2 units in front of that surface, as in the viewer, so they show in any renderer with a depth buffer.
 
 Coordinates are the viewer's (Y up), converted from game units to metres, the same axes and scale as character exports.
 

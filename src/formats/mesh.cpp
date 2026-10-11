@@ -498,6 +498,130 @@ bool parse_room_mesh(const u8* data, size_t size, u32 base_addr, Mesh& mesh)
     return parse_room_mesh_dec(dec.data, dec.size, base_addr, mesh);
 }
 
+/*─── Faces the game draws over a face in front of them ──────────
+   The game sorts a model slot's faces by its render mode (0x23 byte 3;
+   DINO.exe 0x44DA6D): mode 0 by each face's nearest vertex, mode 1 by its
+   farthest, and modes 2 and 3 put the whole section at one depth (0x5F1AE0).
+   0x5F2DD0 inserts each face at the head of its ordering-table bucket, and
+   the quads go in before the triangles, so in a mode 2/3 section the first
+   face is drawn last, on top, whatever its depth.  ST101's windows are quads
+   30-37 of slot 0, 22 units behind wall quads (193 on) that have no hole for
+   them: the game draws the windows, a depth buffer hides them.  Each face
+   that lies just behind a parallel face the game draws before it, and is
+   mostly covered by it, is moved 2 units in front of it.  Only gaps up to 40
+   units and a quarter of the face's width count: ST30A's 25-wide strips 50
+   apart sit side by side on screen, not over each other.  f lists the
+   section's faces in the order the game adds them; v holds their vertices in
+   viewer space, a quad's in PSX order (0 1 / 2 3). */
+struct SecFace { u32 v0, nv; };
+
+static void raise_recessed_faces(MeshVert* v, const SecFace* f, int n)
+{
+    if (n < 2) return;
+    struct Plane { f32 n[3], d, width, c[3]; bool ok; };
+    Plane* pl   = (Plane*)calloc(n, sizeof(Plane));
+    f32*   push = (f32*)calloc(n, sizeof(f32));
+    if (!pl || !push) { free(pl); free(push); return; }
+    static const int loop3[3] = { 0, 1, 2 }, loop4[4] = { 0, 1, 3, 2 };
+
+    for (int i = 0; i < n; i++) {
+        Plane& p = pl[i];
+        const MeshVert* q = v + f[i].v0;
+        const int* loop = f[i].nv == 4 ? loop4 : loop3;
+        /* Front normal: the triangles wind v0, v2, v1 */
+        f32 e1[3] = { q[2].x - q[0].x, q[2].y - q[0].y, q[2].z - q[0].z };
+        f32 e2[3] = { q[1].x - q[0].x, q[1].y - q[0].y, q[1].z - q[0].z };
+        p.n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        p.n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        p.n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        f32 area = sqrtf(p.n[0] * p.n[0] + p.n[1] * p.n[1] + p.n[2] * p.n[2]);
+        if (area < 0.001f) continue;
+        for (int k = 0; k < 3; k++) p.n[k] /= area;
+        p.d = p.n[0] * q[0].x + p.n[1] * q[0].y + p.n[2] * q[0].z;
+        area *= 0.5f;
+        if (f[i].nv == 4) {
+            f32 g1[3] = { q[1].x - q[3].x, q[1].y - q[3].y, q[1].z - q[3].z };
+            f32 g2[3] = { q[2].x - q[3].x, q[2].y - q[3].y, q[2].z - q[3].z };
+            f32 cx = g1[1] * g2[2] - g1[2] * g2[1];
+            f32 cy = g1[2] * g2[0] - g1[0] * g2[2];
+            f32 cz = g1[0] * g2[1] - g1[1] * g2[0];
+            area += 0.5f * sqrtf(cx * cx + cy * cy + cz * cz);
+        }
+        /* Width: area over the longest edge (a rectangle's shorter side) */
+        f32 longest = 0;
+        p.ok = true;
+        for (u32 k = 0; k < f[i].nv; k++) {
+            const MeshVert& a = q[loop[k]];
+            const MeshVert& b = q[loop[(k + 1) % f[i].nv]];
+            f32 dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+            f32 e = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (e > longest) longest = e;
+            if (fabsf(p.n[0] * a.x + p.n[1] * a.y + p.n[2] * a.z - p.d) > 1.0f) p.ok = false;
+            p.c[0] += a.x / f[i].nv; p.c[1] += a.y / f[i].nv; p.c[2] += a.z / f[i].nv;
+        }
+        p.width = area / longest;
+    }
+
+    for (int i = 0; i < n; i++) {
+        const Plane& a = pl[i];
+        if (!a.ok) continue;
+        f32 limit = a.width / 4.0f;
+        if (limit > 40.0f) limit = 40.0f;
+        if (limit < 1.0f) continue;
+        for (int j = i + 1; j < n; j++) {
+            const Plane& b = pl[j];
+            if (!b.ok) continue;
+            if (a.n[0] * b.n[0] + a.n[1] * b.n[1] + a.n[2] * b.n[2] < 0.999f) continue;
+            /* Behind b: every vertex 0.5..limit units on b's back side */
+            f32 nearest = -1e9f, deepest = 1e9f;
+            for (u32 k = 0; k < f[i].nv; k++) {
+                const MeshVert& q = v[f[i].v0 + k];
+                f32 s = b.n[0] * q.x + b.n[1] * q.y + b.n[2] * q.z - b.d;
+                if (s > nearest) nearest = s;
+                if (s < deepest) deepest = s;
+            }
+            if (nearest > -0.5f || deepest < -limit) continue;
+            /* ...and mostly covered by b: of its centre and the points halfway
+               to its corners, at least half on the inner side of b's edges */
+            const MeshVert* q = v + f[j].v0;
+            const int* loop = f[j].nv == 4 ? loop4 : loop3;
+            u32 hits = 0;
+            for (u32 s = 0; s <= f[i].nv; s++) {
+                f32 pt[3] = { a.c[0], a.c[1], a.c[2] };
+                if (s < f[i].nv) {
+                    const MeshVert& w = v[f[i].v0 + s];
+                    pt[0] = (pt[0] + w.x) * 0.5f; pt[1] = (pt[1] + w.y) * 0.5f; pt[2] = (pt[2] + w.z) * 0.5f;
+                }
+                bool inside = true;
+                for (u32 k = 0; k < f[j].nv && inside; k++) {
+                    const MeshVert& e0 = q[loop[k]];
+                    const MeshVert& e1 = q[loop[(k + 1) % f[j].nv]];
+                    f32 ex = e1.x - e0.x, ey = e1.y - e0.y, ez = e1.z - e0.z;
+                    f32 px = pt[0] - e0.x, py = pt[1] - e0.y, pz = pt[2] - e0.z;
+                    f32 side = b.n[0] * (ey * pz - ez * py) + b.n[1] * (ez * px - ex * pz) +
+                               b.n[2] * (ex * py - ey * px);
+                    if (side > 0) inside = false;
+                }
+                if (inside) hits++;
+            }
+            if (hits * 2 <= f[i].nv + 1) continue;
+            if (2.0f - deepest > push[i]) push[i] = 2.0f - deepest;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (push[i] <= 0) continue;
+        for (u32 k = 0; k < f[i].nv; k++) {
+            MeshVert& q = v[f[i].v0 + k];
+            q.x += pl[i].n[0] * push[i];
+            q.y += pl[i].n[1] * push[i];
+            q.z += pl[i].n[2] * push[i];
+        }
+    }
+    free(pl);
+    free(push);
+}
+
 /*═══════════════════════════════════════════════════════════════════
  *  Apply 0x23 Section Transforms (Instancing)
  *
@@ -514,6 +638,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
     /* Temporary buffers for new geometry */
     Array<MeshVert> new_verts;
     Array<MeshTri>  new_tris;
+    Array<SecFace>  sec_faces;
     new_verts.reserve(8192);
     new_tris.reserve(8192);
 
@@ -563,54 +688,8 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
             if (tri_end > dec_size || quad_end > dec_size) break;
             if (c1 == 0 && c2 == 0) { off += 12; continue; }
 
-            /* Parse triangles with offset */
-            for (int i = 0; i < (int)c1; i++) {
-                size_t o = p1 + (size_t)i * 40;
-                if (o + 40 > dec_size) break;
-                s16 vs[3][3]; u8 uvs[3][2];
-                for (int vi = 0; vi < 3; vi++) {
-                    vs[vi][0] = rd_s16(dec + o + vi*8);
-                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
-                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
-                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
-                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
-                    uvs[vi][1] = (u8)(uv_raw >> 8);
-                }
-                u16 tp = rd_u16(dec + o + 24);
-                u16 cl = rd_u16(dec + o + 26);
-                u8 cols[3][3];
-                for (int ci = 0; ci < 3; ci++) {
-                    cols[ci][0] = dec[o+28+ci*4]; cols[ci][1] = dec[o+28+ci*4+1]; cols[ci][2] = dec[o+28+ci*4+2];
-                }
-                u32 bi = (u32)new_verts.count;
-                for (int vi = 0; vi < 3; vi++) {
-                    f32 lx = (f32)vs[vi][0];
-                    f32 ly = (f32)vs[vi][1];
-                    f32 lz = (f32)vs[vi][2];
-                    if (has_rot) {
-                        f32 rx2 = cr * lx + sr * lz;
-                        f32 rz2 = -sr * lx + cr * lz;
-                        lx = rx2; lz = rz2;
-                    }
-                    MeshVert mv = {};
-                    mv.x = -lx + ox;
-                    mv.y = -ly + oy;
-                    mv.z =  lz + oz;
-                    new_verts.push(mv);
-                }
-                MeshTri t = {};
-                t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
-                t.color = avg_colors(cols, 3);
-                set_vcols(t, cols, 0, 2, 1);
-                t.tpage = tp; t.clut = cl;
-                t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
-                t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
-                t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
-                t.src_off = xf.section_off; t.slot = xf.slot;
-                new_tris.push(t);
-            }
-
-            /* Parse quads with offset */
+            /* Quads before triangles, the order the game adds them in */
+            sec_faces.clear();
             for (int i = 0; i < (int)c2; i++) {
                 size_t o = p2 + (size_t)i * 52;
                 if (o + 52 > dec_size) break;
@@ -630,6 +709,7 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                     cols[ci][0] = dec[o+36+ci*4]; cols[ci][1] = dec[o+36+ci*4+1]; cols[ci][2] = dec[o+36+ci*4+2];
                 }
                 u32 bi = (u32)new_verts.count;
+                SecFace sf = { bi, 4 }; sec_faces.push(sf);
                 RGBA8 c = avg_colors(cols, 4);
                 for (int vi = 0; vi < 4; vi++) {
                     f32 lx = (f32)vs[vi][0];
@@ -665,6 +745,57 @@ void mesh_apply_xforms(Mesh& mesh, const u8* dec, size_t dec_size, u32 base,
                 t2.src_off = xf.section_off; t2.slot = xf.slot;
                 new_tris.push(t2);
             }
+
+            /* Then triangles */
+            for (int i = 0; i < (int)c1; i++) {
+                size_t o = p1 + (size_t)i * 40;
+                if (o + 40 > dec_size) break;
+                s16 vs[3][3]; u8 uvs[3][2];
+                for (int vi = 0; vi < 3; vi++) {
+                    vs[vi][0] = rd_s16(dec + o + vi*8);
+                    vs[vi][1] = rd_s16(dec + o + vi*8+2);
+                    vs[vi][2] = rd_s16(dec + o + vi*8+4);
+                    u16 uv_raw = rd_u16(dec + o + vi*8+6);
+                    uvs[vi][0] = (u8)(uv_raw & 0xFF);
+                    uvs[vi][1] = (u8)(uv_raw >> 8);
+                }
+                u16 tp = rd_u16(dec + o + 24);
+                u16 cl = rd_u16(dec + o + 26);
+                u8 cols[3][3];
+                for (int ci = 0; ci < 3; ci++) {
+                    cols[ci][0] = dec[o+28+ci*4]; cols[ci][1] = dec[o+28+ci*4+1]; cols[ci][2] = dec[o+28+ci*4+2];
+                }
+                u32 bi = (u32)new_verts.count;
+                SecFace sf = { bi, 3 }; sec_faces.push(sf);
+                for (int vi = 0; vi < 3; vi++) {
+                    f32 lx = (f32)vs[vi][0];
+                    f32 ly = (f32)vs[vi][1];
+                    f32 lz = (f32)vs[vi][2];
+                    if (has_rot) {
+                        f32 rx2 = cr * lx + sr * lz;
+                        f32 rz2 = -sr * lx + cr * lz;
+                        lx = rx2; lz = rz2;
+                    }
+                    MeshVert mv = {};
+                    mv.x = -lx + ox;
+                    mv.y = -ly + oy;
+                    mv.z =  lz + oz;
+                    new_verts.push(mv);
+                }
+                MeshTri t = {};
+                t.idx[0] = bi; t.idx[1] = bi+2; t.idx[2] = bi+1;
+                t.color = avg_colors(cols, 3);
+                set_vcols(t, cols, 0, 2, 1);
+                t.tpage = tp; t.clut = cl;
+                t.uv[0][0]=uvs[0][0]; t.uv[0][1]=uvs[0][1];
+                t.uv[1][0]=uvs[2][0]; t.uv[1][1]=uvs[2][1];
+                t.uv[2][0]=uvs[1][0]; t.uv[2][1]=uvs[1][1];
+                t.src_off = xf.section_off; t.slot = xf.slot;
+                new_tris.push(t);
+            }
+
+            if (xf.render_mode == 2 || xf.render_mode == 3)
+                raise_recessed_faces(new_verts.items, sec_faces.items, (int)sec_faces.count);
             off = quad_end;
             sec_done++;
         }

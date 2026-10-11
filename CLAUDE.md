@@ -192,6 +192,7 @@ Ordered with memory safety and data loss first.
   - `render_16bpp` takes no buffer size, so `render_texture`'s 16bpp branch can't pass one.
   - `render_4bpp` without deswizzle checks `total_bytes` but not `pix_size`; `render_8bpp` checks both.
 - **B32** **Camera-cut table overlap (verify).** `parse_rdt_overlay` reads 17 group descriptors (16 + 17×16 = 288 bytes) but takes zone data from `ptr[2] + 272`, which falls inside group 16.
+- **B33** **Faces just behind another face in depth-sorted slots (verify).** `raise_recessed_faces` handles only render modes 2 and 3, where list order decides what is on top. In modes 0 and 1 the game sorts each face by its nearest or farthest vertex (DINO.exe 0x44DA6D), so whether a face slightly behind a larger parallel one shows depends on the camera; mode 1 likely shows it. The viewer always hides those faces. A rough survey of axis-aligned faces found up to 130 candidate pairs in mode 1 sections and 30 in mode 0.
 
 ### Contradictions (code vs README, comments or other code)
 

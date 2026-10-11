@@ -2215,10 +2215,11 @@ static void build_solid_list(int list_id, const Mesh& mesh,
 
     glNewList(list_id, GL_COMPILE);
     glBegin(GL_TRIANGLES);
-    /* Within a section, last face first: the game adds a section's faces to
-       its ordering table in file order and each one goes in front of its
-       bucket, so of two faces at the same depth the earlier one is drawn
-       last and ends up on top.  Signs are coplanar quads over fence quads
+    /* Within a section, last face first: the game adds a section's quads and
+       then its triangles to its ordering table (DINO.exe 0x44DA6D), each at
+       the head of its bucket (0x5F2DD0), so of two faces at the same depth
+       the earlier one is drawn last and ends up on top.  mesh_apply_xforms
+       emits faces in that order.  Signs are coplanar quads over fence quads
        (ST112), and the passes draw with GL_LEQUAL, where the face drawn last
        wins the tie.  Sections keep their order. */
     for (int run = 0; run < mesh.tri_count; ) {
