@@ -219,7 +219,8 @@ Ordered with memory safety and data loss first.
   - The banner above `decode_emd_pose` says the bitstream order is rx, rz, ry, that bytes 0–5 hold the root rotation, and that bones 1..N−1 are encoded. The code reads rx, ry, rz for bones 0..N−1 and ignores bytes 0–5.
   - Its step 4 says local × parent, while the code computes parent × local.
   - The "uv0→idx1, uv1→idx2, uv2→idx0" note in `parse_emd_model_dec` doesn't match the mapping the code uses (uv1→idx0, uv2→idx1, uv0→idx2).
-  - The angle-sign flip applied when `n_anim_bones < n_parts` depends on the frame size that `extract_emd_anims` guessed.
+  - The angle-sign flip applied when `n_anim_bones < n_parts` depends on the frame size that `extract_emd_anims` guessed, and nothing shows the `(4096 - v)` negation is right.
+  - A clip's frame count is the stored count + 1 (in ST603, 48 of 48 gaps between the Therizinosaurus's 49 clips are exactly one frame). 71 of the 7081 clips in the 148 rooms (62 rooms; 56 are 4-frame clips such as ST100's at 0x1BDAC) have no valid extra frame and keep the stored count. Whether they are real clips, or their frame size is right, is unknown (verify). The frame size is still the largest candidate whose headers pass, and 123 clips changed size with the extra frame to validate (for example ST100's 2-frame clips at 104 or 84 bytes now read as 3 frames of 80).
 - **C7** **Face colours are scaled more than README says.** README says 2× (`(tex*vtx)/128`), which the textured viewer now uses on each corner's colour (`MeshTri::vcol`). `avg_colors` (`mesh.cpp`) still multiplies by 1.6 and averages the corners into `MeshTri::color`, which the wireframe, the VM fallback path, faces without corner colours and room GLB export (B19) use, flat-shaded at about 1.6× or 3.2×.
 - **C8** **Overlay colours don't match README and the legend.**
   - Zone type 3 is drawn mint, but README and the HUD legend say yellow.

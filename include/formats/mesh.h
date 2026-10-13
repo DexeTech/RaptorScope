@@ -80,7 +80,8 @@ struct EmdSkeleton {
 struct EmdAnimClip {
     int  offset;       /* offset in decompressed data of clip header */
     int  frame_data;   /* offset to first frame */
-    int  frames;       /* number of frames in this clip */
+    int  frames;       /* frames in this clip: the stored count + 1, or the
+                          stored count for the few clips with no valid extra frame */
     int  frame_size;   /* bytes per frame (from pointer table) */
 };
 

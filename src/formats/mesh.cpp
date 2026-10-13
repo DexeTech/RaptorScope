@@ -1607,6 +1607,27 @@ bool parse_emd_model(const u8* entry_data, size_t entry_size,
 /*═══════════════════════════════════════════════════════════════════
  *  EMD Animation Extraction
  *═══════════════════════════════════════════════════════════════════*/
+/* True when nframes frames of fs bytes at target fit in the decompressed
+   buffer and every frame header passes: bytes 0-5 are s16 root
+   position/rotation values that should be bounded. */
+static bool emd_clip_frames_ok(const u8* dec, size_t dsz, size_t target,
+                               int fs, u32 nframes)
+{
+    /* All frames must fit within the decompressed buffer */
+    if (target + (size_t)nframes * (size_t)fs > dsz) return false;
+    for (u32 fi = 0; fi < nframes; fi++) {
+        size_t foff = target + (size_t)fi * (size_t)fs;
+        s16 h0 = rd_s16(dec + foff);
+        s16 h1 = rd_s16(dec + foff + 2);
+        s16 h2 = rd_s16(dec + foff + 4);
+        if (h0 < -4000 || h0 > 4000 ||
+            h1 < -4000 || h1 > 4000 ||
+            h2 < -4000 || h2 > 4000)
+            return false;
+    }
+    return true;
+}
+
 void extract_emd_anims(EmdModel& model)
 {
     if (!model.raw_dec || model.raw_dec_size < 12) return;
@@ -1644,39 +1665,33 @@ void extract_emd_anims(EmdModel& model)
         u32 target = ptr - base;
         if (target != scan + 8 + ((size_t)count + 1) * 4) continue;
 
-        /* Try candidate frame sizes (largest first = most bones) and
+        /* The stored count is one less than the number of frames: the
+           index table has count + 1 words, and in ST603's Therizinosaurus
+           the next clip's head follows the last frame by exactly one more
+           frame's worth of bytes, for all 48 gaps between its 49 clips.
+           A few clips have no valid extra frame, with the next head right
+           after count frames (a held pose of 4 frames in ST100); those
+           keep count frames, as before.
+
+           Try candidate frame sizes (largest first = most bones) and
            pick the largest where ALL frame headers pass validation. */
         int best_fs = 0;
-        for (int ci = n_cands - 1; ci >= 0; ci--) {
-            int fs = cand_fsizes[ci];
-            /* All frames must fit within the decompressed buffer */
-            if (target + (size_t)count * (size_t)fs > dsz) continue;
-
-            /* Validate EVERY frame header: bytes 0-5 are s16 root
-               position/rotation values that should be bounded. */
-            bool all_ok = true;
-            for (u32 fi = 0; fi < count; fi++) {
-                size_t foff = target + (size_t)fi * (size_t)fs;
-                if (foff + 6 > dsz) { all_ok = false; break; }
-                s16 h0 = rd_s16(dec + foff);
-                s16 h1 = rd_s16(dec + foff + 2);
-                s16 h2 = rd_s16(dec + foff + 4);
-                if (h0 < -4000 || h0 > 4000 ||
-                    h1 < -4000 || h1 > 4000 ||
-                    h2 < -4000 || h2 > 4000)
-                    { all_ok = false; break; }
+        u32 nframes = count;
+        for (int extra = 1; extra >= 0 && best_fs == 0; extra--) {
+            nframes = count + (u32)extra;
+            for (int ci = n_cands - 1; ci >= 0; ci--) {
+                if (emd_clip_frames_ok(dec, dsz, target, cand_fsizes[ci], nframes)) {
+                    best_fs = cand_fsizes[ci];
+                    break;  /* take largest valid size */
+                }
             }
-            if (!all_ok) continue;
-
-            best_fs = fs;
-            break;  /* take largest valid size */
         }
         if (best_fs == 0) continue;
 
         EmdAnimClip c;
         c.offset = (int)scan;
         c.frame_data = (int)target;
-        c.frames = (int)count;
+        c.frames = (int)nframes;
         c.frame_size = best_fs;
         clips.push(c);
     }
