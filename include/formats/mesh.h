@@ -80,7 +80,8 @@ struct EmdSkeleton {
 struct EmdAnimClip {
     int  offset;       /* offset in decompressed data of clip header */
     int  frame_data;   /* offset to first frame */
-    int  frames;       /* number of frames in this clip */
+    int  frames;       /* frames in this clip: the stored count + 1, or the
+                          stored count for the few clips with no valid extra frame */
     int  frame_size;   /* bytes per frame (from pointer table) */
 };
 
@@ -309,7 +310,7 @@ const char* get_bone_name(int bone_count, int bone_idx);
  *    ptr[1] = Collision rectangles  (gs+336, 8-byte index + 48-byte rects)
  *    ptr[2] = Camera cut table      (gs+340, 16-byte groups + 20-byte zones)
  *    ptr[3] = Script thread table   (gs+356)
- *    ptr[4] = Door/transition zones (gs+488)
+ *    ptr[4] = Runtime slot table    (gs+488, 10 u32 slots)
  *    ptr[5] = SCD bytecode base     (gs+616)
  *    ptr[6] = Floor zones           (gs+620, 20-byte quads)
  *

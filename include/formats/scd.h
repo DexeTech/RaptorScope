@@ -24,27 +24,27 @@ struct ScdOpcodeInfo {
 
 /* DC1 SCD opcode table — 112 entries (0x00..0x6F) + 0x70..0xFF = NOP(1)
    Sizes from DINO.exe analysis. Names from decompiled handler behavior.
-   0x28 is variable-size (not in this table — handled specially). */
+   0x28 and 0x5A are variable-size (size 0 here — handled specially). */
 static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x00 */ {  1, "NOP",           "No operation",                               9 },
  /* 0x01 */ {  4, "UNK_01",        "Unknown (4 bytes; not a thread end)",        0 },
  /* 0x02 */ {  4, "EVT_NEXT",      "Yield to next frame",                        1 },
  /* 0x03 */ {  4, "EVT_CHAIN",     "Chain to event (conditional)",               0 },
  /* 0x04 */ {  4, "EVT_END",       "End of thread",                              0 },
- /* 0x05 */ {  4, "EVT_KILL",      "Kill event thread",                          1 },
+ /* 0x05 */ {  4, "EVT_JUMP",      "Jump to another event subroutine",           0 },
  /* 0x06 */ {  4, "IF_END",        "End if block (pop cond stack)",              0 },
  /* 0x07 */ {  4, "GOTO",          "Goto (absolute via ptr table)",              0 },
  /* 0x08 */ {  4, "THREAD_CLR",    "Clear/kill thread slot",                     1 },
  /* 0x09 */ {  8, "THREAD_CTRL",   "Thread state control",                       1 },
- /* 0x0A */ {  4, "UNK_0A",        "Unknown (4 bytes)",                          1 },
+ /* 0x0A */ {  4, "LOOP_NEXT",     "Loop next (pairs with LOOP_SET)",            0 },
  /* 0x0B */ {  4, "LOOP_SET",      "Set loop counter and target",                0 },
- /* 0x0C */ {  0, "LOOP_BACK",     "Decrement loop, branch if >0",              0 },
- /* 0x0D */ {  4, "CALL",          "Push return addr, call subroutine",          0 },
- /* 0x0E */ {  4, "JUMP_REL",      "Relative jump (s16 offset)",                 0 },
- /* 0x0F */ {  4, "JUMP_SKIP",     "Skip next (advance 4)",                      0 },
- /* 0x10 */ {  1, "CK_FLAG_A",     "Check flag type A",                          0 },
- /* 0x11 */ {  1, "CK_FLAG_B",     "Check flag type B",                          0 },
- /* 0x12 */ {  4, "RETURN",        "Return from subroutine",                     0 },
+ /* 0x0C */ {  0, "JUMP",          "Unconditional relative jump (s16 offset)",   0 },
+ /* 0x0D */ {  4, "NOP_0D",        "No-op: the handler only advances pc by 4",   9 },
+ /* 0x0E */ {  4, "JUMP_IF",       "Relative jump on the last test result",      0 },
+ /* 0x0F */ {  4, "GOSUB",         "Gosub: push pc+4 and jump",                  0 },
+ /* 0x10 */ {  1, "RETURN",        "Return: pop the saved pc",                   0 },
+ /* 0x11 */ {  1, "HALT",          "Empty handler; pc never advances",           0 },
+ /* 0x12 */ {  4, "MSG_WAIT",      "Wait on the two message flags",              7 },
  /* 0x13 */ {  4, "UNK_13",        "Unknown (4 bytes)",                           9 },
  /* 0x14 */ {  4, "CK_GAME",       "Check game state flag",                      0 },
  /* 0x15 */ {  8, "CALC_OP",       "Arithmetic / variable calc",                 2 },
@@ -68,7 +68,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x27 */ {  4, "MAP_OPEN",      "Open map / area transition",                 3 },
  /* 0x28 */ {  0, "ZONE_DEF",      "Zone definition (variable size)",            3 },
  /* 0x29 */ {  8, "RAND",          "Random number generator",                    2 },
- /* 0x2A */ {  8, "UNK_2A",        "Unknown (8 bytes)",                          9 },
+ /* 0x2A */ {  8, "WORK_FIELD",    "Set a work target field (3-5 xyz, 6-8 rot)", 4 },
  /* 0x2B */ {  8, "CK_VAR",        "Check variable (conditional)",               2 },
  /* 0x2C */ {  4, "SET_TIMER",     "Set countdown timer",                        2 },
  /* 0x2D */ {  4, "CK_TIMER",      "Check timer expired",                        2 },
@@ -80,8 +80,8 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x33 */ {  4, "FADE_ADJ",      "Adjust fade parameters",                     8 },
  /* 0x34 */ {  4, "SHAKE",         "Camera shake effect",                        5 },
  /* 0x35 */ {  8, "POS_SET",       "Set entity position",                        4 },
- /* 0x36 */ {  8, "SPD_ADD",       "Add speed to entity",                        4 },
- /* 0x37 */ {  8, "SND_PLAY",      "Play sound effect",                          7 },
+ /* 0x36 */ {  8, "WORK_POS",      "Set the work target's position (x, y, z)",   4 },
+ /* 0x37 */ {  8, "WORK_ROT",      "Set the work target's rotation",             4 },
  /* 0x38 */ {  4, "SND_STOP",      "Stop sound",                                 7 },
  /* 0x39 */ {  4, "BGM_SET",       "Set background music",                       7 },
  /* 0x3A */ { 12, "LIGHT_SET",     "Scene light (position + color)",             3 },
@@ -92,7 +92,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x3F */ {  8, "ITEM_CK",       "Check item in inventory",                    6 },
  /* 0x40 */ { 12, "EM_CTRL",       "Enemy control command",                      4 },
  /* 0x41 */ {  4, "EM_KILL",       "Kill / remove enemy",                        4 },
- /* 0x42 */ { 20, "EM_SET",        "Spawn enemy / entity",                       4 },
+ /* 0x42 */ { 20, "OBJ_SET",       "Object record (type +2, position +4/+6/+8)", 4 },
  /* 0x43 */ {  8, "EM_POS",        "Set enemy position",                         4 },
  /* 0x44 */ {  8, "EM_DIR",        "Set enemy facing direction",                 4 },
  /* 0x45 */ {  8, "POS_LOAD",      "Load position XYZ",                          4 },
@@ -115,9 +115,9 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x56 */ { 28, "CUTSCENE",      "Cutscene / cinematic data",                  8 },
  /* 0x57 */ {  8, "EFFECT_A",      "Visual effect type A",                       8 },
  /* 0x58 */ {  8, "EFFECT_B",      "Visual effect type B",                       8 },
- /* 0x59 */ { 20, "EFFECT_C",      "Visual effect type C",                       8 },
- /* 0x5A */ {  8, "MODEL_SET",     "Set model display parameters",               3 },
- /* 0x5B */ { 44, "ITEM_SET",      "Item pickup definition",                     6 },
+ /* 0x59 */ { 20, "CHAR_PLACE",    "Character placement (category +2, model +4)", 4 },
+ /* 0x5A */ {  0, "MODEL_SET",     "Set model display parameters (4 + 8 x byte 3)",3 },
+ /* 0x5B */ { 44, "EM_SET",        "Spawn enemy (type +2, pos +4, model +12)",   4 },
  /* 0x5C */ {  4, "ITEM_FLAG",     "Item flag / state",                          6 },
  /* 0x5D */ {  4, "UNK_5D",        "Unknown (4 bytes)",                          9 },
  /* 0x5E */ { 20, "CK_ENEMY",      "Check enemy state (conditional)",            4 },
@@ -145,8 +145,8 @@ static const int g_scd_op28_sizes[12] = {
     48, 40, 32, 36, 44, 32, 32, 52, 32, 32, 32, 32
 };
 static const char* g_scd_op28_names[12] = {
-    "ZONE_ENTER",  "ZONE_FLOOR",  "ZONE_EXEC",   "ZONE_LADDER",
-    "ZONE_DOOR",   "ZONE_CUT",    "ZONE_T6",     "ZONE_LIGHT",
+    "ZONE_DOOR",   "ZONE_FLOOR",  "ZONE_EXEC",   "ZONE_LADDER",
+    "ZONE_ITEM",   "ZONE_CUT",    "ZONE_T6",     "ZONE_LIGHT",
     "ZONE_T8",     "ZONE_T9",     "ZONE_T10",    "ZONE_T11"
 };
 
@@ -172,6 +172,14 @@ static inline int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
         u8 typ = scd[pc + 2];
         if (typ < 12) return g_scd_op28_sizes[typ];
         return 32; /* fallback */
+    }
+
+    /* Variable-size 0x5A: a 4-byte head whose byte 3 counts the 8-byte
+       entries that follow it.  ST205's has two (20 bytes in all) and
+       ST400's has six (52). */
+    if (op == 0x5A) {
+        if (pc + 4 > scd_size) return 0;
+        return 4 + 8 * scd[pc + 3];
     }
 
     /* Fixed-size table */

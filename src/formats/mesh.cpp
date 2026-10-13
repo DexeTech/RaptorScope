@@ -1607,6 +1607,27 @@ bool parse_emd_model(const u8* entry_data, size_t entry_size,
 /*═══════════════════════════════════════════════════════════════════
  *  EMD Animation Extraction
  *═══════════════════════════════════════════════════════════════════*/
+/* True when nframes frames of fs bytes at target fit in the decompressed
+   buffer and every frame header passes: bytes 0-5 are s16 root
+   position/rotation values that should be bounded. */
+static bool emd_clip_frames_ok(const u8* dec, size_t dsz, size_t target,
+                               int fs, u32 nframes)
+{
+    /* All frames must fit within the decompressed buffer */
+    if (target + (size_t)nframes * (size_t)fs > dsz) return false;
+    for (u32 fi = 0; fi < nframes; fi++) {
+        size_t foff = target + (size_t)fi * (size_t)fs;
+        s16 h0 = rd_s16(dec + foff);
+        s16 h1 = rd_s16(dec + foff + 2);
+        s16 h2 = rd_s16(dec + foff + 4);
+        if (h0 < -4000 || h0 > 4000 ||
+            h1 < -4000 || h1 > 4000 ||
+            h2 < -4000 || h2 > 4000)
+            return false;
+    }
+    return true;
+}
+
 void extract_emd_anims(EmdModel& model)
 {
     if (!model.raw_dec || model.raw_dec_size < 12) return;
@@ -1644,39 +1665,33 @@ void extract_emd_anims(EmdModel& model)
         u32 target = ptr - base;
         if (target != scan + 8 + ((size_t)count + 1) * 4) continue;
 
-        /* Try candidate frame sizes (largest first = most bones) and
+        /* The stored count is one less than the number of frames: the
+           index table has count + 1 words, and in ST603's Therizinosaurus
+           the next clip's head follows the last frame by exactly one more
+           frame's worth of bytes, for all 48 gaps between its 49 clips.
+           A few clips have no valid extra frame, with the next head right
+           after count frames (a held pose of 4 frames in ST100); those
+           keep count frames, as before.
+
+           Try candidate frame sizes (largest first = most bones) and
            pick the largest where ALL frame headers pass validation. */
         int best_fs = 0;
-        for (int ci = n_cands - 1; ci >= 0; ci--) {
-            int fs = cand_fsizes[ci];
-            /* All frames must fit within the decompressed buffer */
-            if (target + (size_t)count * (size_t)fs > dsz) continue;
-
-            /* Validate EVERY frame header: bytes 0-5 are s16 root
-               position/rotation values that should be bounded. */
-            bool all_ok = true;
-            for (u32 fi = 0; fi < count; fi++) {
-                size_t foff = target + (size_t)fi * (size_t)fs;
-                if (foff + 6 > dsz) { all_ok = false; break; }
-                s16 h0 = rd_s16(dec + foff);
-                s16 h1 = rd_s16(dec + foff + 2);
-                s16 h2 = rd_s16(dec + foff + 4);
-                if (h0 < -4000 || h0 > 4000 ||
-                    h1 < -4000 || h1 > 4000 ||
-                    h2 < -4000 || h2 > 4000)
-                    { all_ok = false; break; }
+        u32 nframes = count;
+        for (int extra = 1; extra >= 0 && best_fs == 0; extra--) {
+            nframes = count + (u32)extra;
+            for (int ci = n_cands - 1; ci >= 0; ci--) {
+                if (emd_clip_frames_ok(dec, dsz, target, cand_fsizes[ci], nframes)) {
+                    best_fs = cand_fsizes[ci];
+                    break;  /* take largest valid size */
+                }
             }
-            if (!all_ok) continue;
-
-            best_fs = fs;
-            break;  /* take largest valid size */
         }
         if (best_fs == 0) continue;
 
         EmdAnimClip c;
         c.offset = (int)scan;
         c.frame_data = (int)target;
-        c.frames = (int)count;
+        c.frames = (int)nframes;
         c.frame_size = best_fs;
         clips.push(c);
     }
@@ -2160,6 +2175,8 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                         else if (op == 0x05 || op == 0x0F) adv = 4;
                         else if (op == 0x28 && pc + 3 <= dec_size)
                             adv = (dec_data[pc+2] < 12) ? op28sz[dec_data[pc+2]] : 32;
+                        else if (op == 0x5A && pc + 4 <= dec_size)
+                            adv = 4 + 8 * dec_data[pc+3];
                         else if (op < 0x70) adv = opsz[op];
                         if (adv <= 0) break;
 
@@ -2899,7 +2916,7 @@ const char* get_bone_name(int bone_count, int bone_idx)
  *    - Floor zones (ptr[6])     → trigger/transition quads
  *    - Collision rects (ptr[1]) → walkable area rectangles
  *    - Camera data (ptr[2])     → camera eye/target positions
- *    - Door zones (ptr[4])      → room transition triggers
+ *    - Slot table (ptr[4])      → 10 runtime slots, no static data
  *    - SCD opcodes (ptr[5])     → model transforms, object spawns,
  *                                  character placements
  *═══════════════════════════════════════════════════════════════════*/
@@ -3303,8 +3320,11 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 
     /* ─── Floor Zones (ptr[6]) ───
      * Areas where footsteps play another sound.  The room loader copies
-     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a u32 count, then 20-byte
-     * records of four XZ corners, a level at +16 and a step at +17.  The
+     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a count byte and three
+     * bytes of padding, then 20-byte records of four XZ corners, a level at
+     * +16 and a step at +17.  Count and records end exactly at ptr[5]
+     * (ptr[6] + 4 + 20 * count) in 147 of the 148 rooms, ST60E being the
+     * exception; ST206 has 0x24 in the padding, so it is not a u32.  The
      * footstep player (0x40B8A9, called from the walk code at 0x45ACA0 with
      * sound 0xB0 or 0xB1) adds 2 * step to the sound when the walker's +0x48
      * equals the level and its position is inside the quad.  Opcode 0x64
@@ -3372,8 +3392,10 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
         if (ov.n_collisions > 0) found++;
     }
 
-    /* ptr[4] is a runtime pointer table (16 × u32 slots) filled by SCD opcode 0x28.
-       The static data here is just uninitialized slot storage — not zone geometry.
+    /* ptr[4] is a runtime pointer table (10 × u32 slots, 40 bytes: ptr[6] - ptr[4]
+       is 40 in 147 of the 148 rooms, ST60E being the exception) filled by SCD
+       opcode 0x28.  The static data here is just uninitialized slot storage — not
+       zone geometry.
        Door zones come from 0x28 type 4 in the SCD walk below. */
 
     /* ─── Camera Thread Zones (ptr[3]) ───
