@@ -310,7 +310,7 @@ const char* get_bone_name(int bone_count, int bone_idx);
  *    ptr[1] = Collision rectangles  (gs+336, 8-byte index + 48-byte rects)
  *    ptr[2] = Camera cut table      (gs+340, 16-byte groups + 20-byte zones)
  *    ptr[3] = Script thread table   (gs+356)
- *    ptr[4] = Door/transition zones (gs+488)
+ *    ptr[4] = Runtime slot table    (gs+488, 10 u32 slots)
  *    ptr[5] = SCD bytecode base     (gs+616)
  *    ptr[6] = Floor zones           (gs+620, 20-byte quads)
  *

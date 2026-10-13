@@ -2916,7 +2916,7 @@ const char* get_bone_name(int bone_count, int bone_idx)
  *    - Floor zones (ptr[6])     → trigger/transition quads
  *    - Collision rects (ptr[1]) → walkable area rectangles
  *    - Camera data (ptr[2])     → camera eye/target positions
- *    - Door zones (ptr[4])      → room transition triggers
+ *    - Slot table (ptr[4])      → 10 runtime slots, no static data
  *    - SCD opcodes (ptr[5])     → model transforms, object spawns,
  *                                  character placements
  *═══════════════════════════════════════════════════════════════════*/
@@ -3320,8 +3320,11 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
 
     /* ─── Floor Zones (ptr[6]) ───
      * Areas where footsteps play another sound.  The room loader copies
-     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a u32 count, then 20-byte
-     * records of four XZ corners, a level at +16 and a step at +17.  The
+     * ptr[6] to work +0x26C (DINO.exe 0x42C975): a count byte and three
+     * bytes of padding, then 20-byte records of four XZ corners, a level at
+     * +16 and a step at +17.  Count and records end exactly at ptr[5]
+     * (ptr[6] + 4 + 20 * count) in 147 of the 148 rooms, ST60E being the
+     * exception; ST206 has 0x24 in the padding, so it is not a u32.  The
      * footstep player (0x40B8A9, called from the walk code at 0x45ACA0 with
      * sound 0xB0 or 0xB1) adds 2 * step to the sound when the walker's +0x48
      * equals the level and its position is inside the quad.  Opcode 0x64
@@ -3389,8 +3392,10 @@ bool parse_rdt_overlay(const u8* dec, size_t dec_size, u32 base_addr,
         if (ov.n_collisions > 0) found++;
     }
 
-    /* ptr[4] is a runtime pointer table (16 × u32 slots) filled by SCD opcode 0x28.
-       The static data here is just uninitialized slot storage — not zone geometry.
+    /* ptr[4] is a runtime pointer table (10 × u32 slots, 40 bytes: ptr[6] - ptr[4]
+       is 40 in 147 of the 148 rooms, ST60E being the exception) filled by SCD
+       opcode 0x28.  The static data here is just uninitialized slot storage — not
+       zone geometry.
        Door zones come from 0x28 type 4 in the SCD walk below. */
 
     /* ─── Camera Thread Zones (ptr[3]) ───

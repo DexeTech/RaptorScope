@@ -209,7 +209,7 @@ Ordered with memory safety and data loss first.
   - The 0x28 size table exists twice (`g_scd_op28_sizes` and `op28sz`), and the 0x5A rule (4 + 8 × byte 3) is now written out in both walkers.
 - **C5** **Stale comments.**
   - `mesh.h`'s RDT block calls ptr[0] the "SCD main script table"; it holds lights and ambient.
-  - `parse_rdt_overlay` has two stacked banners, one listing ptr[2] as camera data and ptr[4] as door zones.
+  - `parse_rdt_overlay` has two stacked banners, one listing ptr[2] as camera data.
   - `MeshTri::alt` says "SCD branch variant"; it now means an unplaced section.
   - `ov_draw_zone` calls type 4 a door; it is an item pickup.
   - `mesh_apply_xforms` says it only adds non-zero placements on top of `parse_room_mesh_dec`.
