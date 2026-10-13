@@ -9,7 +9,9 @@
 #include "core/types.h"
 
 #define DC_SAVE_SIZE   2432
-#define DC_GS_OFFSET   0x100   /* game state starts here */
+#define DC_GS_OFFSET   0x100   /* game state starts here; it is a straight memory
+                                  image, so the room at gs+8 and the inventory at
+                                  gs+1044 are one consecutive RAM region in the game */
 #define DC_GS_SIZE     (DC_SAVE_SIZE - DC_GS_OFFSET)  /* 2176 */
 
 /* ── Item definitions ── */

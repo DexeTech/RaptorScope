@@ -152,7 +152,8 @@ bool dc_save_parse(const u8* data, u32 size, DcSave& out) {
     const u8* g = data + DC_GS_OFFSET;
 
     /* CK1 = checksum of full game state: gs+8 for (GS_SIZE - 8) bytes
-       CK2 = checksum of game state header: gs+8 for 120 bytes */
+       CK2 = checksum of game state header: gs+8 for 120 bytes
+       CK1 is stored at gs+0 and CK2 at gs+4, so neither covers a checksum. */
     out.ck1_ok = (r32(g) == dc_checksum(data, DC_GS_OFFSET+8, DC_GS_SIZE-8));
     out.ck2_ok = (r32(g+4) == dc_checksum(data, DC_GS_OFFSET+8, 120));
 
@@ -245,7 +246,8 @@ void dc_save_build(DcSave& s) {
 
     /* Recalculate checksums:
        CK2 first (covers gs+8..gs+127, 120 bytes)
-       CK1 second (covers gs+8..end, DC_GS_SIZE-8 bytes - includes CK2 area) */
+       CK1 second (covers gs+8..end, DC_GS_SIZE-8 bytes; that takes in the 120
+       bytes CK2 covers, but not CK2 itself, which is stored at gs+4) */
     w32(g+4, dc_checksum(s.raw, DC_GS_OFFSET+8, 120));
     w32(g, dc_checksum(s.raw, DC_GS_OFFSET+8, DC_GS_SIZE-8));
 }
