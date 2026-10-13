@@ -223,7 +223,7 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 - **ptr[2]**: Camera cut trigger zones
 - **ptr[3]**: Camera thread zones
 - **ptr[5]**: SCD bytecode (room initialization scripts)
-- **ptr[6]**: Floor zones, where footsteps play a different sound: a u32 count, then 20-byte records of four XZ corners, a level at +16 (matched against the walker) and a step at +17. Inside a zone the footstep sound is 0xB0 + 2 × step instead of 0xB0 (`sub_40B8A9`). Opcode 0x64 changes a zone's step: ST100 starts its two zones at 0 and turns them on mid-room
+- **ptr[6]**: Floor zones, where footsteps play a different sound: a count byte and three bytes of padding, then 20-byte records of four XZ corners, a level at +16 (matched against the walker) and a step at +17. Inside a zone the footstep sound is 0xB0 + 2 × step instead of 0xB0 (`sub_40B8A9`). Opcode 0x64 changes a zone's step: ST100 starts its two zones at 0 and turns them on mid-room
 - **Mesh sections**: Starting at offset 0x1C, sequential 12-byte headers (tri_ptr, quad_ptr, tri_count, quad_count). Sections are only drawn where a script places them; some rooms carry unused leftovers
 
 ### SCD Bytecode
@@ -231,13 +231,14 @@ Type 7 entries decompress via LZSS to an RDT structure (ST50B and ST60E store th
 The room initialization script (ptr[5]) uses a multi-threaded virtual machine:
 
 - **Thread table**: Array of u32 offsets from SCD base; the first offset / 4 is the thread count
-- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x3C (model slot render mode and OT depth), 0x48 (show/hide; type 3 = model slot), 0x42 (object: type at +2, position at +4/+6/+8), 0x4C (camera entry), 0x5B (enemy spawn: character slot +1, type +2, position +4/+6/+8, rotation +10, model and animation +12/+16; handler 0x42A96D), 0x64 (sets floor zone +1's footstep step to +2; handler 0x42BE92)
+- **Key opcodes**: 0x20 (character spawn), 0x23 (section instance), 0x28 (zone definition), 0x2E (camera eye + target, short form of 0x4C), 0x3A (scene light), 0x3C (model slot render mode and OT depth), 0x48 (show/hide; type 3 = model slot), 0x42 (object: type at +2, position at +4/+6/+8), 0x4C (camera entry), 0x5B (enemy spawn: character slot +1, type +2, position +4/+6/+8, rotation +10, model and animation +12/+16; handler 0x42A96D), 0x59 (second character placement, 20 bytes: category +2, model +4, motion +8, a third pointer +12, instance index +16; it places the raptor in 52 rooms and the Therizinosaurus in 15), 0x5A (4 + 8 × byte 3 bytes), 0x64 (sets floor zone +1's footstep step to +2; handler 0x42BE92)
 - **Opcode 0x23** (32 bytes): Places a mesh section into a model slot at a world position with rotation and render mode. Verified against `sub_426806` in DINO.exe; the opcode dispatch table starts at VA `0x006576A0` (the two words before it are 0 and 1)
 - **Opcode 0x28** (size by type): a zone's four XZ corners at +4..+19; a real zone repeats its type at +20 and has 1 at +23, which no other 0x28 byte in the scripts does
 - **Opcode 0x28 type 4** (44 bytes): Item pickup zone. Its model (slot at +34, section at +36) is placed on the floor at the zone centre (`sub_426DFC` → `sub_448E3B`) and spins while the item is there
 - **Opcode 0x5B** (44 bytes): Enemy spawn. A cutscene can spawn its enemy off stage and move it in later: ST100's raptor is spawned at x = z = 0x7000 and appears where the cutscene moves it, (2024, 0, 3008). Every other spawn lies within ±15104, so the overlay shows a spawn beyond ±20000 where its thread first moves it on stage
 - **Work target**: 0x22 03 `<slot>` selects a model slot and 0x22 02 `<slot>` a character (the entry that 0x20 or 0x5B filled); 0x2A sets one of its fields (3/4/5 = x/y/z, 6/7/8 = rotation, via `sub_47416C`), 0x36 sets x/y/z and 0x37 the rotation
-- **Control flow**: 0x0C (unconditional jump), 0x0E (conditional relative jump), 0x04 (end of thread; every thread finishes with `04 00 00 00`). 0x01 and 0x0A are 4-byte opcodes that scripts continue past; decoding each script straight through with the opcode sizes lands exactly on the next script in every room. Message text follows the last thread in the same block
+- **Control flow**: 0x0C (unconditional jump), 0x0E (conditional relative jump on the last test result), 0x0F (gosub: pushes pc+4 and jumps) and 0x10 (return), 0x05 (jump to another event subroutine), 0x04 (end of thread; every thread finishes with `04 00 00 00`). 0x01 and 0x0A are 4-byte opcodes that scripts continue past; decoding each script straight through with the opcode sizes lands exactly on the next script in every room. Message text follows the last thread in the same block
+- **Exe build**: the DINO.exe addresses in this document and in the source come from a different build than the GOG "Classic REbirth" exe. In that exe, code in 0x422000-0x42BE92 sits 0x160 lower (the 0x42A96D above is 0x42A80D), and the data addresses do not carry over
 
 ### PSX Transparency Rules
 
