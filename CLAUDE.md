@@ -141,7 +141,10 @@ Entries are confirmed by reading the code unless tagged **(verify)**. A (verify)
 
 Ordered with memory safety and data loss first.
 
-- **B3** **Weapon aim values may be 32-bit (verify).** The weapon editor reads the 8 aim values every 4 bytes but only as the low s16, and writes back only that half. If they are s32, editing a negative value to a positive one (or the reverse) leaves the old sign in the high half.
+- **B3** **Weapon aim block is read as the wrong shape (verify).**
+  - The block is four 8-byte vectors `{x, y, z, pad}` that form a trapezoid in x and z. The editor reads the low s16 of each 4-byte slot, so it shows x and z; the halves it skips are y and the pad, not a sign extension, and it writes back only the halves it read.
+  - Its labels (`aim_neg_x`, `aim_base`, `aim_far`…) are guesses.
+  - The six "camera offset" values start 6 bytes before where the panel reads them (`aim_off + 26`, not `aim_off + 32`).
 - **B4** **Save editor out-of-bounds read.** `dc_save_build` indexes its 10-entry digit table with `hours/10`. The Play Time edit has no length limit, so 100+ hours reads past the table.
 - **B5** **`new[]`/`free` mismatch.** `parse_standalone_emd_mesh_dec` fills `mesh.verts/tris` with `new[]`, but `Mesh` frees with `free`, and existing arrays are overwritten without being freed. Use `mesh.alloc`.
 - **B6** **Dangling pointer after a failed `realloc`.** `mesh_apply_xforms` returns without storing the moved pointer when one of its two `realloc`s fails after the other succeeded. `mesh.verts` or `mesh.tris` is then left dangling.
@@ -190,10 +193,17 @@ Ordered with memory safety and data loss first.
 - **B31** **Latent out-of-bounds reads in texture rendering.**
   - `render_16bpp` takes no buffer size, so `render_texture`'s 16bpp branch can't pass one.
   - `render_4bpp` without deswizzle checks `total_bytes` but not `pix_size`; `render_8bpp` checks both.
-- **B32** **Camera-cut table overlap (verify).** `parse_rdt_overlay` reads 17 group descriptors (16 + 17×16 = 288 bytes) but takes zone data from `ptr[2] + 272`, which falls inside group 16.
+- **B32** **Camera-cut zone layout fits no room (verify).** `parse_rdt_overlay` reads a 16-byte header, 17 group descriptors of 16 bytes (288 bytes in all) and 20-byte zones from `ptr[2] + 272`, which also falls inside group 16. `ptr[3] - ptr[2] == 288 + 20 × (sum of the 17 group counts)` holds in none of the 148 rooms, so the camera-cut zones the overlay draws may not be zones.
 - **B33** **Faces just behind another face in depth-sorted slots (verify).** `raise_recessed_faces` handles only render modes 2 and 3, where list order decides what is on top. In modes 0 and 1 the game sorts each face by its nearest or farthest vertex (DINO.exe 0x44DA6D), so whether a face slightly behind a larger parallel one shows depends on the camera; mode 1 likely shows it. The viewer always hides those faces. A rough survey of axis-aligned faces found up to 130 candidate pairs in mode 1 sections and 30 in mode 0.
 - **B34** **Slots that only native code shows are drawn (verify).** Thread 0 (room start) hides some model slots with `48 03 <slot> 00`, and no script shows them again, so only DINO.exe's room code can. The viewer draws them anyway, at the position 0x23 gives. ST300's six card boards (slots 0–5, letters A–F) are hidden this way: card A is placed on a wall and cards B–F at (0,0,0), so B–F show stacked at the room origin, half under the floor. The native code that positions and shows them has not been found. 21 slots in 11 rooms are hidden like this (ST10F, ST205, ST300, ST30B, ST502, ST511, ST601, ST606, ST802, ST906, STC06).
 - **B35** **Texture view dims texels that only 2D screens use (verify).** `render_texture_by_faces` dims every texel no face in the archive samples. Screens that DINO.exe draws in 2D, such as ST300's code-input screen (BACK/OK buttons, INPUT CODE / DISPLAYING THE CODE, letter tiles, a font, the blue band at the top of texture page 8 and all of page 9), have no faces, so they are dimmed and decoded with a guessed CLUT. Which draw code samples them, and with which CLUTs, has not been found.
+- **B36** **0x3A is not a scene light (verify).** Across the 637 uses in the 148 rooms' threads, byte 1 is always 0 and byte 2 is 1–15 (214 of them have 1). The handler installs a behaviour on the bound character. `parse_rdt_overlay` still builds lights from it (slot = byte 1, subtype = byte 2), and `ViewerPanel3D` caches them as room lights. Because the slot is always 0 and only subtype 1 gets through, a room whose ptr[0] already gives a light 0 has that light's colour overwritten with bytes +4/+6/+8, and otherwise gets a positionless light.
+- **B37** **Collision rect stride is unsettled (verify).** The 128-byte group index (16 × 8 bytes) fits, but `parse_rdt_overlay` reads 48-byte rects and the section lengths do not agree. `ptr[2] - ptr[1] == 128 + stride × (sum of the group counts)` holds in 52 rooms for 48 bytes and in 65 for 52, but 52 rooms have no rects at all and fit any stride; of the other 96, 48 bytes fits 5, 52 fits 18 and 56 fits 12. ST100 has one rect in a 180-byte section, which is 52 bytes.
+- **B38** **Weapon editor records are shot entries, not weapon stats (verify).**
+  - The 32-byte records are per-projectile entries. The game's fire routine spawns one projectile per record while the 32-bit word at record +4 equals a byte on the player, starting at an index held on the player. It reads only +0 (byte), +4 (word) and the halfwords at +0xC, +0xE, +0x10, +0x12, +0x16, +0x18 and +0x1A.
+  - The panel's field names (Fire Mode, Ammo Type, Spread, Recoil, Power, Range, Blast…) and its per-record weapon names are therefore unsupported.
+  - wep10–13 have a second record table after the pointer table, which the panel never shows.
+- **B39** **Save editor key-item flags use the wrong store (verify).** `DC_FLAG_ITEMS` sets bit groups in the 96-byte event-flag window at gs+72. Held items are stored one bit per item id in a 32-byte bank at gs+240, outside that window. The listed bit sets are event flags that happen to change at those points in the game, so toggling one may not give or remove the item.
 
 ### Contradictions (code vs README, comments or other code)
 
@@ -202,7 +212,7 @@ Ordered with memory safety and data loss first.
   - `mesh.h` calls 0x3C a light colour, where README and `scd.h` say it is the model slot render mode. `scd.h` calls 0x3D unknown, where the overlay treats it as fog.
 - **C3** **Operand decoding in `fmt_operands` (`scd.cpp`) disagrees with the overlay parser and README.**
   - 0x20: position at +4 instead of +8.
-  - 0x3A: the subtype is ignored and xyz is read at +2 instead of +4.
+  - 0x3A: the subtype is ignored and xyz is read at +2 instead of +4 (and it is not a light at all, B36).
 - **C4** **Two opcode-size tables disagree.**
   - The tables are `scd_inst_size`/`g_scd_opcodes` (`scd.h`) and `opsz` in `parse_rdt_scene_dec` (`mesh.cpp`).
   - `opsz` gives 0x04 one byte and treats 0x0A as a script end, where `scd_inst_size` gives both 4 bytes.
@@ -220,6 +230,7 @@ Ordered with memory safety and data loss first.
   - Its step 4 says local × parent, while the code computes parent × local.
   - The "uv0→idx1, uv1→idx2, uv2→idx0" note in `parse_emd_model_dec` doesn't match the mapping the code uses (uv1→idx0, uv2→idx1, uv0→idx2).
   - The angle-sign flip applied when `n_anim_bones < n_parts` depends on the frame size that `extract_emd_anims` guessed, and nothing shows the `(4096 - v)` negation is right.
+  - The six s16 before the rotations in an animation frame (bytes 0–11) look like root translation (words 0–2 follow the root bone's bind height) and accumulated travel (words 3–5 grow linearly from frame to frame, for example by −105 per frame in a walk clip of ST603's Therizinosaurus), not the entity rotation and velocity that the `decode_emd_pose` comment says. GLB export drops them (verify).
   - A clip's frame count is the stored count + 1 (in ST603, 48 of 48 gaps between the Therizinosaurus's 49 clips are exactly one frame). 71 of the 7081 clips in the 148 rooms (62 rooms; 56 are 4-frame clips such as ST100's at 0x1BDAC) have no valid extra frame and keep the stored count. Whether they are real clips, or their frame size is right, is unknown (verify). The frame size is still the largest candidate whose headers pass, and 123 clips changed size with the extra frame to validate (for example ST100's 2-frame clips at 104 or 84 bytes now read as 3 frames of 80).
 - **C7** **Face colours are scaled more than README says.** README says 2× (`(tex*vtx)/128`), which the textured viewer now uses on each corner's colour (`MeshTri::vcol`). `avg_colors` (`mesh.cpp`) still multiplies by 1.6 and averages the corners into `MeshTri::color`, which the wireframe, the VM fallback path, faces without corner colours and room GLB export (B19) use, flat-shaded at about 1.6× or 3.2×.
 - **C8** **Overlay colours don't match README and the legend.**
@@ -241,6 +252,9 @@ Ordered with memory safety and data loss first.
   - TODO.md lists Import/Replace, PNG export and entry ownership as missing, but all three exist. "Export as PNG" actually writes BMP.
   - EXPORTING.md, which ships in the release zip, says the zip contains a `source/` folder, which it doesn't. It also says the Windows build is cross-compiled and has never been run on Windows; releases are now MSVC builds made and checked on Windows.
   - The window title and class (`Dino Crisis Archive Tool v2.2`, `DCArchiveToolMain`) and the VS target `DC_Archive_Tool` predate the RaptorScope name.
+- **C13** **Cited DINO.exe addresses are from another build (verify).** The handler addresses in comments and README come from a build other than the GOG "Classic REbirth" exe. In that exe, code in 0x422000–0x42BE92 is 0x160 lower than the cited address (0x42A96D is 0x42A80D), and the data addresses (0x657698/0x6576A0, 0x645FA8, 0x62A4C8) do not carry over. Check which build an address is from before looking it up.
+- **C14** **`P40` is labelled "T-Rex Boss" (verify).** `app.cpp`'s character name table calls P40 that, but the developer path manifest lists 186 player-style motions for it, and the T-Rex is E10/E11.
+- **C15** **DAT entry type 5 is labelled "SEQ music sequence" (verify).** `dat.h`, `dat.cpp` and the tree label say so, but the label rests on `parse_seq_header` accepting a non-zero resolution and a plausible tempo. In the 464 DAT files of the PC game, all 294 type 5 entries pass that test and none contains a SEQ magic.
 
 ### Performance and silent limits
 
