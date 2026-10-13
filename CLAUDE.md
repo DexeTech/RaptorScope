@@ -213,7 +213,7 @@ Ordered with memory safety and data loss first.
 - **C4** **Two opcode-size tables disagree.**
   - The tables are `scd_inst_size`/`g_scd_opcodes` (`scd.h`) and `opsz` in `parse_rdt_scene_dec` (`mesh.cpp`).
   - `opsz` gives 0x04 one byte and treats 0x0A as a script end, where `scd_inst_size` gives both 4 bytes.
-  - The 0x28 size table exists twice (`g_scd_op28_sizes` and `op28sz`).
+  - The 0x28 size table exists twice (`g_scd_op28_sizes` and `op28sz`), and the 0x5A rule (4 + 8 × byte 3) is now written out in both walkers.
 - **C5** **Stale comments.**
   - `mesh.h`'s RDT block calls ptr[0] the "SCD main script table"; it holds lights and ambient.
   - `parse_rdt_overlay` has two stacked banners, one listing ptr[2] as camera data and ptr[4] as door zones.

@@ -24,7 +24,7 @@ struct ScdOpcodeInfo {
 
 /* DC1 SCD opcode table — 112 entries (0x00..0x6F) + 0x70..0xFF = NOP(1)
    Sizes from DINO.exe analysis. Names from decompiled handler behavior.
-   0x28 is variable-size (not in this table — handled specially). */
+   0x28 and 0x5A are variable-size (size 0 here — handled specially). */
 static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x00 */ {  1, "NOP",           "No operation",                               9 },
  /* 0x01 */ {  4, "UNK_01",        "Unknown (4 bytes; not a thread end)",        0 },
@@ -116,7 +116,7 @@ static const ScdOpcodeInfo g_scd_opcodes[0x70] = {
  /* 0x57 */ {  8, "EFFECT_A",      "Visual effect type A",                       8 },
  /* 0x58 */ {  8, "EFFECT_B",      "Visual effect type B",                       8 },
  /* 0x59 */ { 20, "EFFECT_C",      "Visual effect type C",                       8 },
- /* 0x5A */ {  8, "MODEL_SET",     "Set model display parameters",               3 },
+ /* 0x5A */ {  0, "MODEL_SET",     "Set model display parameters",               3 },
  /* 0x5B */ { 44, "ITEM_SET",      "Item pickup definition",                     6 },
  /* 0x5C */ {  4, "ITEM_FLAG",     "Item flag / state",                          6 },
  /* 0x5D */ {  4, "UNK_5D",        "Unknown (4 bytes)",                          9 },
@@ -172,6 +172,14 @@ static inline int scd_inst_size(const u8* scd, size_t scd_size, size_t pc) {
         u8 typ = scd[pc + 2];
         if (typ < 12) return g_scd_op28_sizes[typ];
         return 32; /* fallback */
+    }
+
+    /* Variable-size 0x5A: a 4-byte head whose byte 3 counts the 8-byte
+       entries that follow it.  ST205's has two (20 bytes in all) and
+       ST400's has six (52). */
+    if (op == 0x5A) {
+        if (pc + 4 > scd_size) return 0;
+        return 4 + 8 * scd[pc + 3];
     }
 
     /* Fixed-size table */

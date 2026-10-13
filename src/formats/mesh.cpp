@@ -2160,6 +2160,8 @@ bool parse_rdt_scene_dec(const u8* dec_data, size_t dec_size, u32 base_addr,
                         else if (op == 0x05 || op == 0x0F) adv = 4;
                         else if (op == 0x28 && pc + 3 <= dec_size)
                             adv = (dec_data[pc+2] < 12) ? op28sz[dec_data[pc+2]] : 32;
+                        else if (op == 0x5A && pc + 4 <= dec_size)
+                            adv = 4 + 8 * dec_data[pc+3];
                         else if (op < 0x70) adv = opsz[op];
                         if (adv <= 0) break;
 
