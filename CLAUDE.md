@@ -199,17 +199,10 @@ Ordered with memory safety and data loss first.
 
 - **C1** **Swapped struct names.** `RdtItemSpawn`/`ov.items` holds 0x5B enemy spawns, and `RdtEnemySpawn`/`ov.enemies` holds 0x42 objects.
 - **C2** **Wrong opcode names in `g_scd_opcodes` (`scd.h`).**
-  - 0x42 `EM_SET` is an object, and 0x5B `ITEM_SET` is an enemy spawn.
-  - 0x2A/0x36/0x37 (`UNK_2A`/`SPD_ADD`/`SND_PLAY`) set a work target's field, position and rotation.
-  - 0x0C `LOOP_BACK` is README's unconditional jump, and 0x0E `JUMP_REL` its conditional one.
   - `mesh.h` calls 0x3C a light colour, where README and `scd.h` say it is the model slot render mode. `scd.h` calls 0x3D unknown, where the overlay treats it as fog.
 - **C3** **Operand decoding in `fmt_operands` (`scd.cpp`) disagrees with the overlay parser and README.**
   - 0x20: position at +4 instead of +8.
-  - 0x42: type and id swapped; position at +6 instead of +4.
-  - 0x5B: position at +8 instead of +4.
   - 0x3A: the subtype is ignored and xyz is read at +2 instead of +4.
-  - 0x37 is shown as a sound.
-  - 0x28 type 4 is shown as a door, with a "destination" read from corner bytes.
 - **C4** **Two opcode-size tables disagree.**
   - The tables are `scd_inst_size`/`g_scd_opcodes` (`scd.h`) and `opsz` in `parse_rdt_scene_dec` (`mesh.cpp`).
   - `opsz` gives 0x04 one byte and treats 0x0A as a script end, where `scd_inst_size` gives both 4 bytes.

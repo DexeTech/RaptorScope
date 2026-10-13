@@ -38,7 +38,7 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         return;
     case 0x04: /* EVT_END */
         return; /* no operands worth showing */
-    case 0x05: /* EVT_KILL */
+    case 0x05: /* EVT_JUMP */
         _snprintf(buf, bufsz, "thread=%d", data[1]);
         return;
     case 0x07: /* GOTO */
@@ -53,15 +53,13 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
     case 0x0B: /* LOOP_SET */
         _snprintf(buf, bufsz, "count=%d", rs16(data + 2));
         return;
-    case 0x0C: /* LOOP_BACK */
+    case 0x0C: /* JUMP */
         _snprintf(buf, bufsz, "offset=%d → @0x%04X", rs16(data + 2),
                   (int)inst_off + (int)rs16(data + 2));
         return;
-    case 0x0D: /* CALL */
-        _snprintf(buf, bufsz, "offset=%d → @0x%04X", rs16(data + 2),
-                  (int)inst_off + (int)rs16(data + 2));
+    case 0x0D: /* NOP_0D: the handler only advances pc by 4 */
         return;
-    case 0x0E: /* JUMP_REL */
+    case 0x0E: /* JUMP_IF */
         _snprintf(buf, bufsz, "offset=%d → @0x%04X", rs16(data + 2),
                   (int)inst_off + (int)rs16(data + 2));
         return;
@@ -93,12 +91,12 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
         u8 slot = data[1];
         u8 typ = data[2];
         const char* tname = (typ < 12) ? g_scd_op28_names[typ] : "ZONE_UNK";
-        if (typ == 4 && len >= 44) { /* door zone */
+        if (typ == 0 && len >= 48) { /* door: destination at +0x1C (room) / +0x1D (stage) */
             s16 x0 = rs16(data+4), z0 = rs16(data+6);
             s16 x1 = rs16(data+8), z1 = rs16(data+10);
-            u8 dest_stage = data[12];
-            u8 dest_room = data[13];
-            _snprintf(buf, bufsz, "slot=%d, %s, rect=(%d,%d)-(%d,%d), dest=st%d/rm%d",
+            u8 dest_stage = data[0x1D];
+            u8 dest_room = data[0x1C];
+            _snprintf(buf, bufsz, "slot=%d, %s, rect=(%d,%d)-(%d,%d), dest=ST%X%02X",
                       slot, tname, x0, z0, x1, z1, dest_stage, dest_room);
         } else if (len >= 12) {
             s16 x0 = rs16(data+4), z0 = rs16(data+6);
@@ -119,17 +117,23 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
     case 0x35: /* POS_SET */
         _snprintf(buf, bufsz, "x=%d, y=%d, z=%d", rs16(data+2), rs16(data+4), rs16(data+6));
         return;
-    case 0x37: /* SND_PLAY */
-        _snprintf(buf, bufsz, "bank=%d, sound=%d, vol=%d", data[1], data[2], rs16(data+4));
+    case 0x2A: /* WORK_FIELD */
+        _snprintf(buf, bufsz, "field=%d, value=%d", data[2], rs16(data+4));
+        return;
+    case 0x36: /* WORK_POS */
+        _snprintf(buf, bufsz, "x=%d, y=%d, z=%d", rs16(data+2), rs16(data+4), rs16(data+6));
+        return;
+    case 0x37: /* WORK_ROT */
+        _snprintf(buf, bufsz, "rx=%d, ry=%d, rz=%d", rs16(data+2), rs16(data+4), rs16(data+6));
         return;
     case 0x3A: /* LIGHT_SET */
         _snprintf(buf, bufsz, "type=%d, x=%d, y=%d, z=%d, r=%d, g=%d, b=%d",
                   data[1], rs16(data+2), rs16(data+4), rs16(data+6),
                   data[8], data[9], data[10]);
         return;
-    case 0x42: /* EM_SET */
-        _snprintf(buf, bufsz, "type=%d, id=%d, x=%d, y=%d, z=%d",
-                  data[1], data[2], rs16(data+6), rs16(data+8), rs16(data+10));
+    case 0x42: /* OBJ_SET */
+        _snprintf(buf, bufsz, "id=%d, type=%d, x=%d, y=%d, z=%d",
+                  data[1], data[2], rs16(data+4), rs16(data+6), rs16(data+8));
         return;
     case 0x4C: { /* CAMERA: handler 0x428CD1 takes the eye at +2 and
                     the target at +18, each followed by its transition */
@@ -139,10 +143,16 @@ static void fmt_operands(char* buf, size_t bufsz, u8 op, const u8* data, int len
                   data[1], ex, ey, ez, tx, ty, tz, rs16(data+8), rs16(data+24));
         return;
     }
-    case 0x5B: { /* ITEM_SET */
+    case 0x59: /* CHAR_PLACE */
+        if (len >= 20) {
+            _snprintf(buf, bufsz, "category=%d, model=0x%08X, motion=0x%08X, index=%d",
+                      data[2], rd32(data+4), rd32(data+8), data[0x10]);
+        }
+        return;
+    case 0x5B: { /* EM_SET */
         if (len >= 16) {
-            _snprintf(buf, bufsz, "slot=%d, type=%d, item=%d, x=%d, y=%d, z=%d",
-                      data[1], data[2], rd16(data+4), rs16(data+8), rs16(data+10), rs16(data+12));
+            _snprintf(buf, bufsz, "slot=%d, type=%d, x=%d, y=%d, z=%d, model=0x%08X",
+                      data[1], data[2], rs16(data+4), rs16(data+6), rs16(data+8), rd32(data+12));
         }
         return;
     }
