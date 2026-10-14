@@ -3160,6 +3160,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             a.vram_x = g_viewer3d.tex_vram_x; a.vram_y = g_viewer3d.tex_vram_y;
             a.clut_x = g_viewer3d.clut_base_x; a.clut_y = g_viewer3d.clut_base_y;
             a.slice_map = g_viewer3d.slice_map;
+            a.solid8_slice = g_viewer3d.solid8_slice;
             if (is_room) {
                 /* name the root node after the DAT file */
                 char name[64] = "DC1_Room";

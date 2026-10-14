@@ -287,6 +287,7 @@ struct EmdExportAtlas {
     const u8* rgba;
     int width, height, slices, bpp, vram_x, vram_y, clut_x, clut_y;
     const int* slice_map;
+    const int* solid8_slice;  /* per CLUT row, slice for 8bpp faces flagged solid (-1 = slot 0); may be null */
 };
 bool export_emd_glb(const char* path, const EmdModel& model,
                     const EmdExportAtlas* atlas = 0, f32 fps = 30.0f);
