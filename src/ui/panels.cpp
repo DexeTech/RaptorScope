@@ -2117,7 +2117,8 @@ void ViewerPanel3D::resize(int w, int h) {
 }
 
 /* Atlas slice holding a face's CLUT: 2D sparse slice lookup,
-   slot 0 = 8bpp, slot rel+1 = 4bpp sub-palette. */
+   slot 0 = 8bpp, slot rel+1 = 4bpp sub-palette.  A solid 8bpp face uses
+   the row's solid8_slice when it has one. */
 static int face_atlas_slice(const MeshTri& t, int clut_base_y, int clut_base_x,
                             int total_v_slices)
 {
@@ -2136,6 +2137,8 @@ static int face_atlas_slice(const MeshTri& t, int clut_base_y, int clut_base_x,
         if (slice_idx < 0) slice_idx = g_viewer3d.slice_map[row * 65 + 0]; /* fallback: 8bpp */
     } else { /* 8bpp face → slot 0 */
         slice_idx = g_viewer3d.slice_map[row * 65 + 0];
+        if (t.solid && g_viewer3d.solid8_slice[row] >= 0)
+            slice_idx = g_viewer3d.solid8_slice[row];
     }
     if (slice_idx < 0) slice_idx = 0; /* ultimate fallback */
     return slice_idx;
