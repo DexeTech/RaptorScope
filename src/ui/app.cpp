@@ -1552,13 +1552,18 @@ static void upload_archive_texture()
     static DatArchive* s_cached_archive = 0;
     static int         s_cached_n_cluts = 0;
     static u16         s_cached_cluts[512];
+    static bool        s_cached_solid8[512], s_cached_mask8[512];
     bool same_cluts = (g_viewer3d.n_used_cluts == s_cached_n_cluts &&
-                       memcmp(s_cached_cluts, g_viewer3d.used_cluts, g_viewer3d.n_used_cluts * 2) == 0);
+                       memcmp(s_cached_cluts, g_viewer3d.used_cluts, g_viewer3d.n_used_cluts * 2) == 0 &&
+                       memcmp(s_cached_solid8, g_viewer3d.used_clut_solid8, g_viewer3d.n_used_cluts) == 0 &&
+                       memcmp(s_cached_mask8, g_viewer3d.used_clut_mask8, g_viewer3d.n_used_cluts) == 0);
     if (&ar == s_cached_archive && same_cluts && g_viewer3d.tex_w > 0)
         return;
     s_cached_archive = &ar;
     s_cached_n_cluts = g_viewer3d.n_used_cluts;
     memcpy(s_cached_cluts, g_viewer3d.used_cluts, g_viewer3d.n_used_cluts * 2);
+    memcpy(s_cached_solid8, g_viewer3d.used_clut_solid8, g_viewer3d.n_used_cluts);
+    memcpy(s_cached_mask8, g_viewer3d.used_clut_mask8, g_viewer3d.n_used_cluts);
 
     /* Collect texture and palette entries */
     struct TexInfo { int idx; int vram_x, vram_w, vram_h; };
@@ -1696,6 +1701,9 @@ static void upload_archive_texture()
        This prevents 4bpp sub=0 (CLUT X == base_x) from colliding with 8bpp. */
     int num_sub_pals = 1;
     int clut_base_x = 0;
+    /* Per row: slot 0 keeps 0x8000 opaque (only solid 8bpp faces use the row) */
+    bool slot0_solid[16] = {};
+    memset(g_viewer3d.solid8_slice, -1, sizeof(g_viewer3d.solid8_slice));
     if (n_pal > 0) {
         clut_base_x = pals[0].vram_x;
         int base_sub = clut_base_x / 16;
@@ -1704,6 +1712,7 @@ static void upload_archive_texture()
         int compact = 0;
         /* Always allocate 8bpp slice for row 0 */
         g_viewer3d.slice_map[0 * 65 + 0] = compact++;
+        bool row_solid[16] = {}, row_mask[16] = {};
         for (int ci = 0; ci < g_viewer3d.n_used_cluts; ci++) {
             u16 cl = g_viewer3d.used_cluts[ci];
             int cy = (cl >> 6) & 0x1FF;
@@ -1717,6 +1726,8 @@ static void upload_archive_texture()
             int key8 = row * 65 + 0;
             if (g_viewer3d.slice_map[key8] < 0)
                 g_viewer3d.slice_map[key8] = compact++;
+            if (g_viewer3d.used_clut_solid8[ci]) row_solid[row] = true;
+            if (g_viewer3d.used_clut_mask8[ci])  row_mask[row] = true;
 
             /* If any 4bpp face uses this CLUT, allocate 4bpp slice (slot rel+1) */
             if (g_viewer3d.used_clut_is4bpp[ci]) {
@@ -1724,6 +1735,14 @@ static void upload_archive_texture()
                 if (g_viewer3d.slice_map[key4] < 0)
                     g_viewer3d.slice_map[key4] = compact++;
             }
+        }
+        /* A row with both kinds of 8bpp face gets a second, solid slice.
+           These come last, so the GL height cap drops them first and the
+           faces fall back to slot 0. */
+        for (int row = 0; row < 16; row++) {
+            slot0_solid[row] = row_solid[row] && !row_mask[row];
+            if (row_solid[row] && row_mask[row])
+                g_viewer3d.solid8_slice[row] = compact++;
         }
         num_sub_pals = compact > 0 ? compact : 1;
     }
@@ -1746,6 +1765,9 @@ static void upload_archive_texture()
             for (int i = 0; i < 16 * 65; i++)
                 if (g_viewer3d.slice_map[i] >= num_sub_pals)
                     g_viewer3d.slice_map[i] = -1;
+            for (int i = 0; i < 16; i++)
+                if (g_viewer3d.solid8_slice[i] >= num_sub_pals)
+                    g_viewer3d.solid8_slice[i] = -1;
         }
     }
 
@@ -1829,13 +1851,15 @@ static void upload_archive_texture()
             if (pal_row_offset >= this_pal_rows)
                 pal_row_offset = this_pal_rows - 1;
 
-            for (int slot = 0; slot < 65; slot++) {
-                int map_key = row * 65 + slot;
-                int slice_idx = g_viewer3d.slice_map[map_key];
+            for (int slot = 0; slot < 66; slot++) {
+                /* slot 65 = the row's solid 8bpp slice, outside slice_map */
+                int slice_idx = (slot == 65) ? g_viewer3d.solid8_slice[row]
+                                             : g_viewer3d.slice_map[row * 65 + slot];
                 if (slice_idx < 0) continue;
 
                 /* slot 0 = 8bpp rendering, slot 1..64 = 4bpp with rel_sub = slot-1 */
-                bool is_8bpp_slot = (slot == 0);
+                bool is_8bpp_slot = (slot == 0 || slot == 65);
+                bool mask_8000 = (slot == 0 && !slot0_solid[row]);
                 int rel_sub = is_8bpp_slot ? 0 : slot - 1;
 
                 /* Classify 4bpp sub-palette as decal overlay vs opaque texture.
@@ -1880,8 +1904,10 @@ static void upload_archive_texture()
                                0x0000 already has alpha=0 from parse_palette.
                                0x8000 (STP black) at index 0 is also a mask —
                                semi-trans primitives like blood trails need it
-                               transparent so the floor shows through. */
-                            if (byte_val == 0 && c8.a > 0 && pal && pal->data) {
+                               transparent so the floor shows through.  On a
+                               face without the semi-transparency bit it is
+                               opaque black, so the solid slice keeps it. */
+                            if (mask_8000 && byte_val == 0 && c8.a > 0 && pal && pal->data) {
                                 size_t raw_off = (size_t)pal_row_offset * 512;
                                 if (raw_off + 2 <= pal->size) {
                                     u16 raw = rd_u16(pal->data + raw_off);
@@ -2226,6 +2252,8 @@ static void on_entry_select(int sel_param)
                     g_viewer3d.n_used_cluts = 0;
                     memset(g_viewer3d.slice_map, -1, sizeof(g_viewer3d.slice_map));
                     memset(g_viewer3d.used_clut_is4bpp, 0, sizeof(g_viewer3d.used_clut_is4bpp));
+                    memset(g_viewer3d.used_clut_solid8, 0, sizeof(g_viewer3d.used_clut_solid8));
+                    memset(g_viewer3d.used_clut_mask8, 0, sizeof(g_viewer3d.used_clut_mask8));
                     if (g_emd_model->mesh.tri_count > 0) {
                         int tp0 = (g_emd_model->mesh.tris[0].tpage >> 7) & 3;
                         g_viewer3d.desired_bpp = (tp0 == 0) ? 4 : (tp0 == 2) ? 16 : 8;
@@ -2248,6 +2276,8 @@ static void on_entry_select(int sel_param)
                             }
                             if (idx >= 0 && is4)
                                 g_viewer3d.used_clut_is4bpp[idx] = true;
+                            if (idx >= 0 && !is4)
+                                g_viewer3d.used_clut_mask8[idx] = true;
                         }
                     }
 
@@ -2323,6 +2353,8 @@ static void on_entry_select(int sel_param)
                     g_viewer3d.n_used_cluts = 0;
                     memset(g_viewer3d.slice_map, -1, sizeof(g_viewer3d.slice_map));
                     memset(g_viewer3d.used_clut_is4bpp, 0, sizeof(g_viewer3d.used_clut_is4bpp));
+                    memset(g_viewer3d.used_clut_solid8, 0, sizeof(g_viewer3d.used_clut_solid8));
+                    memset(g_viewer3d.used_clut_mask8, 0, sizeof(g_viewer3d.used_clut_mask8));
                     if (mesh.tri_count > 0) {
                         int tp0 = (mesh.tris[0].tpage >> 7) & 3;
                         g_viewer3d.desired_bpp = (tp0 == 0) ? 4 : (tp0 == 2) ? 16 : 8;
@@ -2346,6 +2378,9 @@ static void on_entry_select(int sel_param)
                             }
                             if (idx >= 0 && is4)
                                 g_viewer3d.used_clut_is4bpp[idx] = true;
+                            if (idx >= 0 && !is4)
+                                (mesh.tris[fi].solid ? g_viewer3d.used_clut_solid8
+                                                     : g_viewer3d.used_clut_mask8)[idx] = true;
                         }
                     }
 
@@ -3125,6 +3160,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             a.vram_x = g_viewer3d.tex_vram_x; a.vram_y = g_viewer3d.tex_vram_y;
             a.clut_x = g_viewer3d.clut_base_x; a.clut_y = g_viewer3d.clut_base_y;
             a.slice_map = g_viewer3d.slice_map;
+            a.solid8_slice = g_viewer3d.solid8_slice;
             if (is_room) {
                 /* name the root node after the DAT file */
                 char name[64] = "DC1_Room";
